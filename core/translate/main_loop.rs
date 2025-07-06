@@ -111,7 +111,6 @@ pub fn init_loop(
     aggregates: &mut [Aggregate],
     group_by: Option<&GroupBy>,
     mode: OperationMode,
-    where_clause: &[WhereTerm],
 ) -> Result<()> {
     assert!(
         t_ctx.meta_left_joins.len() == tables.joined_tables().len(),
@@ -333,20 +332,6 @@ pub fn init_loop(
                 }
             }
         }
-    }
-
-    for cond in where_clause
-        .iter()
-        .filter(|c| c.should_eval_before_loop(&[JoinOrderMember::default()]))
-    {
-        let jump_target = program.allocate_label();
-        let meta = ConditionMetadata {
-            jump_if_condition_is_true: false,
-            jump_target_when_true: jump_target,
-            jump_target_when_false: t_ctx.label_main_loop_end.unwrap(),
-        };
-        translate_condition_expr(program, tables, &cond.expr, meta, &t_ctx.resolver)?;
-        program.preassign_label_to_next_insn(jump_target);
     }
 
     Ok(())

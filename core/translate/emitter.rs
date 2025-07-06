@@ -7,7 +7,7 @@ use tracing::{instrument, Level};
 use turso_sqlite3_parser::ast::{self, Expr};
 
 use super::aggregation::emit_ungrouped_aggregation;
-use super::expr::translate_expr;
+use super::expr::{translate_condition_expr, translate_expr, ConditionMetadata};
 use super::group_by::{
     group_by_agg_phase, group_by_emit_row_phase, init_group_by, GroupByMetadata, GroupByRowSource,
 };
@@ -334,12 +334,32 @@ pub fn emit_query<'a>(
         &mut plan.aggregates,
         plan.group_by.as_ref(),
         OperationMode::SELECT,
-        &plan.where_clause,
     )?;
 
     if plan.is_simple_count() {
         emit_simple_count(program, t_ctx, plan)?;
         return Ok(t_ctx.reg_result_cols_start.unwrap());
+    }
+
+    for where_term in plan
+         .where_clause
+         .iter()
+         .filter(|wt| wt.should_eval_before_loop(&plan.join_order))
+    {
+        let jump_target_when_true = program.allocate_label();
+        let condition_metadata = ConditionMetadata {
+            jump_if_condition_is_true: false,
+            jump_target_when_false: after_main_loop_label,
+            jump_target_when_true,
+        };
+        translate_condition_expr(
+            program,
+            &plan.table_references,
+            &where_term.expr,
+            condition_metadata,
+            &t_ctx.resolver,
+        )?;
+        program.preassign_label_to_next_insn(jump_target_when_true);
     }
 
     // Set up main query execution loop
@@ -437,7 +457,6 @@ fn emit_program_for_delete(
         &mut [],
         None,
         OperationMode::DELETE,
-        &plan.where_clause,
     )?;
 
     // Set up main query execution loop
@@ -638,7 +657,6 @@ fn emit_program_for_update(
         &mut [],
         None,
         OperationMode::UPDATE,
-        &plan.where_clause,
     )?;
 
     // Prepare index cursors
@@ -736,6 +754,27 @@ fn emit_update_insns(
         },
     };
 
+    for cond in plan
+        .where_clause
+        .iter()
+        .filter(|c| c.should_eval_before_loop(&[JoinOrderMember::default()]))
+    {
+        let jump_target = program.allocate_label();
+        let meta = ConditionMetadata {
+            jump_if_condition_is_true: false,
+            jump_target_when_true: jump_target,
+            jump_target_when_false: t_ctx.label_main_loop_end.unwrap(),
+        };
+        translate_condition_expr(
+            program,
+            &plan.table_references,
+            &cond.expr,
+            meta,
+            &t_ctx.resolver,
+        )?;
+        program.preassign_label_to_next_insn(jump_target);
+    }
+
     let beg = program.alloc_registers(
         table_ref.table.columns().len()
             + if is_virtual {
@@ -802,6 +841,26 @@ fn emit_update_insns(
         });
     }
 
+    for cond in plan
+        .where_clause
+        .iter()
+        .filter(|c| c.should_eval_before_loop(&[JoinOrderMember::default()]))
+    {
+        let jump_target = program.allocate_label();
+        let meta = ConditionMetadata {
+            jump_if_condition_is_true: false,
+            jump_target_when_true: jump_target,
+            jump_target_when_false: loop_labels.next,
+        };
+        translate_condition_expr(
+            program,
+            &plan.table_references,
+            &cond.expr,
+            meta,
+            &t_ctx.resolver,
+        )?;
+        program.preassign_label_to_next_insn(jump_target);
+    }
     // we scan a column at a time, loading either the column's values, or the new value
     // from the Set expression, into registers so we can emit a MakeRecord and update the row.
     let start = if is_virtual { beg + 2 } else { beg + 1 };
