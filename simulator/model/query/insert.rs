@@ -2,7 +2,7 @@ use std::fmt::Display;
 
 use serde::{Deserialize, Serialize};
 
-use crate::{generation::Shadow, model::table::SimValue, SimulatorEnv};
+use crate::{generation::Shadow, model::table::{SimValue, Table}};
 
 use super::select::Select;
 
@@ -21,10 +21,10 @@ pub(crate) enum Insert {
 impl Shadow for Insert {
     type Result = anyhow::Result<Vec<Vec<SimValue>>>;
 
-    fn shadow(&self, env: &mut SimulatorEnv) -> Self::Result {
+    fn shadow(&self, tables: &mut Vec<Table>) -> Self::Result {
         match self {
             Insert::Values { table, values } => {
-                if let Some(t) = env.tables.iter_mut().find(|t| &t.name == table) {
+                if let Some(t) = tables.iter_mut().find(|t| &t.name == table) {
                     t.rows.extend(values.clone());
                 } else {
                     return Err(anyhow::anyhow!(
@@ -34,8 +34,8 @@ impl Shadow for Insert {
                 }
             }
             Insert::Select { table, select } => {
-                let rows = select.shadow(env)?;
-                if let Some(t) = env.tables.iter_mut().find(|t| &t.name == table) {
+                let rows = select.shadow(tables)?;
+                if let Some(t) = tables.iter_mut().find(|t| &t.name == table) {
                     t.rows.extend(rows);
                 } else {
                     return Err(anyhow::anyhow!(

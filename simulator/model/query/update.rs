@@ -2,7 +2,7 @@ use std::fmt::Display;
 
 use serde::{Deserialize, Serialize};
 
-use crate::{generation::Shadow, model::table::SimValue, SimulatorEnv};
+use crate::{generation::Shadow, model::table::{SimValue, Table}, SimulatorEnv};
 
 use super::predicate::Predicate;
 
@@ -16,8 +16,8 @@ pub(crate) struct Update {
 impl Shadow for Update {
     type Result = anyhow::Result<Vec<Vec<SimValue>>>;
 
-    fn shadow(&self, env: &mut SimulatorEnv) -> Self::Result {
-        let table = env.tables.iter_mut().find(|t| t.name == self.table);
+    fn shadow(&self, tables: &mut Vec<Table>) -> Self::Result {
+        let table = tables.iter_mut().find(|t| t.name == self.table);
 
         let table = if let Some(table) = table {
             table

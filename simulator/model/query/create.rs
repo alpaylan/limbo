@@ -16,9 +16,9 @@ pub(crate) struct Create {
 impl Shadow for Create {
     type Result = anyhow::Result<Vec<Vec<SimValue>>>;
 
-    fn shadow(&self, env: &mut SimulatorEnv) -> Self::Result {
-        if !env.tables.iter().any(|t| t.name == self.table.name) {
-            env.tables.push(self.table.clone());
+    fn shadow(&self, tables: &mut Vec<Table>) -> Self::Result {
+        if !tables.iter().any(|t| t.name == self.table.name) {
+            tables.push(self.table.clone());
             Ok(vec![])
         } else {
             Err(anyhow::anyhow!(

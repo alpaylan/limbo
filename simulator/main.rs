@@ -219,7 +219,7 @@ fn watch_mode(
                             let mut env = SimulatorEnv::new(seed, cli_opts, &paths.db);
                             plan.iter().for_each(|is| {
                                 is.iter().for_each(|i| {
-                                    i.shadow(&mut env);
+                                    let _ = i.shadow(&mut env.tables);
                                 });
                             });
                             let env = Arc::new(Mutex::new(env.clone_without_connections()));

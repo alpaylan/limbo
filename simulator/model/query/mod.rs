@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use turso_sqlite3_parser::to_sql_string::ToSqlContext;
 use update::Update;
 
-use crate::{generation::Shadow, model::table::SimValue, runner::env::SimulatorEnv};
+use crate::{generation::Shadow, model::table::{SimValue, Table}};
 
 pub mod create;
 pub mod create_index;
@@ -65,7 +65,7 @@ impl Query {
 impl Shadow for Query {
     type Result = anyhow::Result<Vec<Vec<SimValue>>>;
 
-    fn shadow(&self, env: &mut SimulatorEnv) -> Self::Result {
+    fn shadow(&self, env: &mut Vec<Table>) -> Self::Result {
         match self {
             Query::Create(create) => create.shadow(env),
             Query::Insert(insert) => insert.shadow(env),
@@ -93,7 +93,7 @@ impl Display for Query {
 }
 
 /// Used to print sql strings that already have all the context it needs
-struct EmptyContext;
+pub(crate) struct EmptyContext;
 
 impl ToSqlContext for EmptyContext {
     fn get_column_name(

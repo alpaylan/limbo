@@ -1,5 +1,6 @@
 use std::fmt::Display;
 
+use regex_syntax::ast::print;
 use serde::{Deserialize, Serialize};
 use turso_sqlite3_parser::{ast, to_sql_string::ToSqlString};
 

@@ -3,7 +3,7 @@ use std::{iter::Sum, ops::SubAssign};
 use anarchist_readable_name_generator_lib::readable_name_custom;
 use rand::{distributions::uniform::SampleUniform, Rng};
 
-use crate::runner::env::SimulatorEnv;
+use crate::model::table::Table;
 
 mod expr;
 pub mod plan;
@@ -50,7 +50,7 @@ pub trait ArbitraryFromMaybe<T> {
 /// might return a vector of rows that were inserted into the table.
 pub(crate) trait Shadow {
     type Result;
-    fn shadow(&self, env: &mut SimulatorEnv) -> Self::Result;
+    fn shadow(&self, tables: &mut Vec<Table>) -> Self::Result;
 }
 
 /// Frequency is a helper function for composing different generators with different frequency

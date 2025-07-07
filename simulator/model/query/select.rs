@@ -12,7 +12,6 @@ use crate::{
         query::EmptyContext,
         table::{SimValue, Table},
     },
-    SimulatorEnv,
 };
 
 use super::predicate::Predicate;
@@ -213,8 +212,8 @@ pub struct JoinTable {
 }
 
 impl JoinTable {
-    fn into_table(self) -> Table {
-        Table {
+    pub(crate) fn into_table(self) -> Table {
+        let t = Table {
             name: "".to_string(),
             columns: self
                 .tables
@@ -222,21 +221,28 @@ impl JoinTable {
                 .flat_map(|t| {
                     t.columns.iter().map(|c| {
                         let mut c = c.clone();
-                        c.name = format!("{}.<{}", t.name, c.name);
+                        c.name = format!("{}.{}", t.name, c.name);
                         c
                     })
                 })
                 .collect(),
             rows: self.rows,
+        };
+        for row in &t.rows {
+            assert_eq!(
+                row.len(),
+                t.columns.len(),
+                "Row length does not match column length after join"
+            );
         }
+        t
     }
 }
 
 impl Shadow for FromClause {
     type Result = anyhow::Result<JoinTable>;
-    fn shadow(&self, env: &mut SimulatorEnv) -> Self::Result {
-        let first_table = env
-            .tables
+    fn shadow(&self, tables: &mut Vec<Table>) -> Self::Result {
+        let first_table = tables
             .iter()
             .find(|t| t.name == self.table)
             .context("Table not found")?;
@@ -247,8 +253,7 @@ impl Shadow for FromClause {
         };
 
         for join in &self.joins {
-            let joined_table = env
-                .tables
+            let joined_table = tables
                 .iter()
                 .find(|t| t.name == join.table)
                 .context("Joined table not found")?;
@@ -265,8 +270,8 @@ impl Shadow for FromClause {
                         .cloned()
                         .collect::<Vec<_>>();
                     // take a cartesian product of the rows
-                    let mut all_row_pairs =
-                        first_table.rows.iter().cartesian_product(join_rows.iter());
+                    let all_row_pairs =
+                        join_table.rows.clone().into_iter().cartesian_product(join_rows.iter());
 
                     for (row1, row2) in all_row_pairs {
                         let row = row1.iter().chain(row2.iter()).cloned().collect::<Vec<_>>();
@@ -289,9 +294,17 @@ impl Shadow for FromClause {
 impl Shadow for SelectInner {
     type Result = anyhow::Result<JoinTable>;
 
-    fn shadow(&self, env: &mut SimulatorEnv) -> Self::Result {
+    fn shadow(&self, env: &mut Vec<Table>) -> Self::Result {
         let mut join_table = self.from.shadow(env)?;
         let as_table = join_table.clone().into_table();
+        for row in &mut join_table.rows {
+            assert_eq!(
+                row.len(),
+                as_table.columns.len(),
+                "Row length does not match column length after join"
+            );
+        }
+
         join_table
             .rows
             .retain(|row| self.where_clause.test(row, &as_table));
@@ -308,7 +321,7 @@ impl Shadow for SelectInner {
 impl Shadow for Select {
     type Result = anyhow::Result<Vec<Vec<SimValue>>>;
 
-    fn shadow(&self, env: &mut SimulatorEnv) -> Self::Result {
+    fn shadow(&self, env: &mut Vec<Table>) -> Self::Result {
         let first_result = self.body.select.shadow(env)?;
 
         let mut rows = first_result.into_table().rows;
@@ -317,7 +330,14 @@ impl Shadow for Select {
             let compound_results = compound.select.shadow(env)?;
 
             match compound.operator {
-                CompoundOperator::Union => todo!(),
+                CompoundOperator::Union => {
+                    // Union means we need to combine the results, removing duplicates
+                    let mut new_rows = compound_results.into_table().rows;
+                    new_rows.extend(rows.clone());
+                    new_rows.sort_unstable();
+                    new_rows.dedup();
+                    rows = new_rows;
+                }
                 CompoundOperator::UnionAll => {
                     // Union all means we just concatenate the results
                     rows.extend(compound_results.rows.into_iter());

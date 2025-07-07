@@ -16,7 +16,7 @@ use crate::{
     generation::Shadow,
     model::{
         query::{update::Update, Create, CreateIndex, Delete, Drop, Insert, Query, Select},
-        table::SimValue,
+        table::{SimValue, Table},
     },
     runner::{env::SimConnection, io::SimulatorIO},
     SimulatorEnv,
@@ -113,17 +113,17 @@ pub(crate) enum Interactions {
 impl Shadow for Interactions {
     type Result = ();
 
-    fn shadow(&self, env: &mut SimulatorEnv) {
+    fn shadow(&self, tables: &mut Vec<Table>) {
         match self {
             Interactions::Property(property) => {
-                let initial_tables = env.tables.clone();
+                let initial_tables = tables.clone();
                 let mut is_error = false;
                 for interaction in property.interactions() {
                     match interaction {
                         Interaction::Query(query)
                         | Interaction::FsyncQuery(query)
                         | Interaction::FaultyQuery(query) => {
-                            is_error = is_error || query.shadow(env).is_err();
+                            is_error = is_error || query.shadow(tables).is_err();
                         }
                         Interaction::Assertion(_) => {}
                         Interaction::Assumption(_) => {}
@@ -131,13 +131,13 @@ impl Shadow for Interactions {
                     }
                     if is_error {
                         // If any interaction fails, we reset the tables to the initial state
-                        env.tables = initial_tables.clone();
+                        *tables = initial_tables.clone();
                         break;
                     }
                 }
             }
             Interactions::Query(query) => {
-                query.shadow(env);
+                query.shadow(tables);
             }
             Interactions::Fault(_) => {}
         }
@@ -400,7 +400,7 @@ impl ArbitraryFrom<&mut SimulatorEnv> for InteractionPlan {
                 num_interactions
             );
             let interactions = Interactions::arbitrary_from(rng, (env, plan.stats()));
-            interactions.shadow(env);
+            interactions.shadow(&mut env.tables);
             // println!(
             //     "Generated interactions: {}",
             //     interactions
@@ -431,7 +431,7 @@ impl ArbitraryFrom<&mut SimulatorEnv> for InteractionPlan {
 
 impl Shadow for Interaction {
     type Result = anyhow::Result<Vec<Vec<SimValue>>>;
-    fn shadow(&self, env: &mut SimulatorEnv) -> Self::Result {
+    fn shadow(&self, env: &mut Vec<Table>) -> Self::Result {
         match self {
             Self::Query(query) => query.shadow(env),
             Self::FsyncQuery(query) => {
@@ -722,7 +722,7 @@ fn random_create<R: rand::Rng>(rng: &mut R, _env: &SimulatorEnv) -> Interactions
 }
 
 fn random_read<R: rand::Rng>(rng: &mut R, env: &SimulatorEnv) -> Interactions {
-    Interactions::Query(Query::Select(Select::arbitrary_from(rng, env)))
+    Interactions::Query(Query::Select(Select::arbitrary_from(rng, &env.tables)))
 }
 
 fn random_write<R: rand::Rng>(rng: &mut R, env: &SimulatorEnv) -> Interactions {

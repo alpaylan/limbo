@@ -129,7 +129,7 @@ fn execute_plan(
         tracing::debug!("connection {} already connected", connection_index);
         match execute_interaction(env, connection_index, interaction, &mut state.stack) {
             Ok(next_execution) => {
-                interaction.shadow(env);
+                interaction.shadow(&mut env.tables);
                 tracing::debug!("connection {} processed", connection_index);
                 // Move to the next interaction or property
                 match next_execution {
@@ -190,7 +190,7 @@ pub(crate) fn execute_interaction(
                 SimConnection::SQLiteConnection(_) => unreachable!(),
                 SimConnection::Disconnected => unreachable!(),
             };
-
+            tracing::debug!(?interaction);
             let results = interaction.execute_query(conn, &env.io);
             tracing::debug!(?results);
             stack.push(results);

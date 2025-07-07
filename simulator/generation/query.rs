@@ -1,10 +1,14 @@
-use crate::generation::{Arbitrary, ArbitraryFrom};
+use crate::generation::{Arbitrary, ArbitraryFrom, Shadow};
 use crate::model::query::predicate::Predicate;
-use crate::model::query::select::{Distinctness, ResultColumn};
+use crate::model::query::select::{
+    CompoundOperator, CompoundSelect, Distinctness, FromClause, JoinTable, JoinType, JoinedTable,
+    ResultColumn, SelectBody, SelectInner,
+};
 use crate::model::query::update::Update;
 use crate::model::query::{Create, Delete, Drop, Insert, Query, Select};
 use crate::model::table::{SimValue, Table};
 use crate::SimulatorEnv;
+use itertools::Itertools;
 use rand::Rng;
 
 use super::property::Remaining;
@@ -18,16 +22,125 @@ impl Arbitrary for Create {
     }
 }
 
-impl ArbitraryFrom<&SimulatorEnv> for Select {
-    fn arbitrary_from<R: Rng>(rng: &mut R, env: &SimulatorEnv) -> Self {
-        let table = pick(&env.tables, rng);
-        Self::single(
-            table.name.clone(),
-            vec![ResultColumn::Star],
-            Predicate::arbitrary_from(rng, table),
-            Some(rng.gen_range(0..=1000)),
-            Distinctness::All,
-        )
+impl ArbitraryFrom<&Vec<Table>> for FromClause {
+    fn arbitrary_from<R: Rng>(rng: &mut R, tables: &Vec<Table>) -> Self {
+        let query_size = (rng.gen_range(0.0..=15.0_f32).log2().ceil() as usize).saturating_sub(2);
+
+        let mut tables = tables.clone();
+        let mut table = pick(&tables, rng).clone();
+
+        tables.retain(|t| t.name != table.name);
+
+        let name = table.name.clone();
+
+        let joins: Vec<_> = (0..query_size)
+            .filter_map(|_| {
+                if tables.is_empty() {
+                    return None;
+                }
+                let join_table = pick(&tables, rng).clone();
+                tables.retain(|t| t.name != join_table.name);
+                table = JoinTable {
+                    tables: vec![table.clone(), join_table.clone()],
+                    rows: table
+                        .rows
+                        .iter()
+                        .cartesian_product(join_table.rows.iter())
+                        .map(|(t_row, j_row)| {
+                            let mut row = t_row.clone();
+                            row.extend(j_row.clone());
+                            row
+                        })
+                        .collect(),
+                }
+                .into_table();
+                for row in &mut table.rows {
+                    assert_eq!(
+                        row.len(),
+                        table.columns.len(),
+                        "Row length does not match column length after join"
+                    );
+                }
+
+                let predicate = Predicate::arbitrary_from(rng, &table);
+                Some(JoinedTable {
+                    table: join_table.name.clone(),
+                    join_type: JoinType::Inner,
+                    on: predicate,
+                })
+            })
+            .collect();
+        FromClause { table: name, joins }
+    }
+}
+
+impl ArbitraryFrom<&Vec<Table>> for SelectInner {
+    fn arbitrary_from<R: Rng>(rng: &mut R, tables: &Vec<Table>) -> Self {
+        let from = FromClause::arbitrary_from(rng, tables);
+        let mut tables = tables.clone();
+        // todo: this is a temporary hack because env is not separated from the tables
+        let join_table = from
+            .shadow(&mut tables)
+            .expect("Failed to shadow FromClause")
+            .into_table();
+
+        SelectInner {
+            distinctness: Distinctness::arbitrary(rng),
+            columns: vec![ResultColumn::Star],
+            from,
+            where_clause: Predicate::arbitrary_from(rng, &join_table),
+        }
+    }
+}
+
+impl Arbitrary for Distinctness {
+    fn arbitrary<R: Rng>(rng: &mut R) -> Self {
+        match rng.gen_range(0..=5) {
+            0..4 => Distinctness::All,
+            _ => Distinctness::Distinct,
+        }
+    }
+}
+impl Arbitrary for CompoundOperator {
+    fn arbitrary<R: Rng>(rng: &mut R) -> Self {
+        match rng.gen_range(0..=1) {
+            0 => CompoundOperator::Union,
+            1 => CompoundOperator::UnionAll,
+            _ => unreachable!(),
+        }
+    }
+}
+
+impl ArbitraryFrom<&Vec<Table>> for Select {
+    fn arbitrary_from<R: Rng>(rng: &mut R, tables: &Vec<Table>) -> Self {
+        let query_size = (rng.gen_range(0.0..=15.0_f32).log2().ceil() as usize).saturating_sub(2);
+
+        let table = pick(tables, rng);
+
+        let num_selects = rng.gen_range(0..=query_size);
+        let first = SelectInner::arbitrary_from(rng, tables);
+
+        let rest: Vec<SelectInner> = (0..num_selects)
+            .map(|_| {
+                let mut select = first.clone();
+                select.where_clause = Predicate::arbitrary_from(rng, table);
+                select
+            })
+            .collect();
+
+        Self {
+            body: SelectBody {
+                select: Box::new(first),
+                compounds: rest
+                    .into_iter()
+                    .map(|s| CompoundSelect {
+                        operator: CompoundOperator::arbitrary(rng),
+                        select: Box::new(s),
+                    })
+                    .collect(),
+            },
+            limit: None,
+        }
     }
 }
 
@@ -57,10 +170,7 @@ impl ArbitraryFrom<&SimulatorEnv> for Insert {
             let row = pick(&select_table.rows, rng);
             let predicate = Predicate::arbitrary_from(rng, (select_table, row));
             // Pick another table to insert into
-            let select = Select::simple(
-                select_table.name.clone(),
-                predicate,
-            );
+            let select = Select::simple(select_table.name.clone(), predicate);
             let table = pick(&env.tables, rng);
             Some(Insert::Select {
                 table: table.name.clone(),
@@ -110,7 +220,7 @@ impl ArbitraryFrom<(&SimulatorEnv, &Remaining)> for Query {
                 ),
                 (
                     remaining.read,
-                    Box::new(|rng| Self::Select(Select::arbitrary_from(rng, env))),
+                    Box::new(|rng| Self::Select(Select::arbitrary_from(rng, &env.tables))),
                 ),
                 (
                     remaining.write,
@@ -147,6 +257,111 @@ impl ArbitraryFrom<&SimulatorEnv> for Update {
             table: table.name.clone(),
             set_values,
             predicate: Predicate::arbitrary_from(rng, table),
+        }
+    }
+}
+
+#[cfg(test)]
+mod query_generation_tests {
+    use rand::RngCore;
+    use turso_core::Value;
+    use turso_sqlite3_parser::to_sql_string::ToSqlString;
+
+    use super::*;
+    use crate::model::query::predicate::Predicate;
+    use crate::model::query::EmptyContext;
+    use crate::model::table::{Column, ColumnType};
+    use crate::SimulatorEnv;
+
+    #[test]
+    fn test_select_query_generation() {
+        let mut rng = rand::thread_rng();
+        // CREATE TABLE users (id INTEGER, name TEXT);
+        // INSERT INTO users (id, name) VALUES (1, 'Alice'), (2, 'Bob');
+        // CREATE TABLE orders (order_id INTEGER, user_id INTEGER);
+        // INSERT INTO orders (order_id, user_id) VALUES (1, 1), (2, 2);
+
+        let tables = vec![
+            Table {
+                name: "users".to_string(),
+                columns: vec![
+                    Column {
+                        name: "id".to_string(),
+                        column_type: ColumnType::Integer,
+                        primary: false,
+                        unique: false,
+                    },
+                    Column {
+                        name: "name".to_string(),
+                        column_type: ColumnType::Text,
+                        primary: false,
+                        unique: false,
+                    },
+                ],
+                rows: vec![
+                    vec![
+                        SimValue(Value::Integer(1)),
+                        SimValue(Value::Text("Alice".into())),
+                    ],
+                    vec![
+                        SimValue(Value::Integer(2)),
+                        SimValue(Value::Text("Bob".into())),
+                    ],
+                ],
+            },
+            Table {
+                name: "orders".to_string(),
+                columns: vec![
+                    Column {
+                        name: "order_id".to_string(),
+                        column_type: ColumnType::Integer,
+                        primary: false,
+                        unique: false,
+                    },
+                    Column {
+                        name: "user_id".to_string(),
+                        column_type: ColumnType::Integer,
+                        primary: false,
+                        unique: false,
+                    },
+                ],
+                rows: vec![
+                    vec![SimValue(Value::Integer(1)), SimValue(Value::Integer(1))],
+                    vec![SimValue(Value::Integer(2)), SimValue(Value::Integer(2))],
+                ],
+            },
+            Table {
+                name: "products".to_string(),
+                columns: vec![
+                    Column {
+                        name: "product_id".to_string(),
+                        column_type: ColumnType::Integer,
+                        primary: true,
+                        unique: true,
+                    },
+                    Column {
+                        name: "product_name".to_string(),
+                        column_type: ColumnType::Text,
+                        primary: false,
+                        unique: false,
+                    },
+                ],
+                rows: vec![
+                    vec![
+                        SimValue(Value::Integer(1)),
+                        SimValue(Value::Text("Widget".into())),
+                    ],
+                    vec![
+                        SimValue(Value::Integer(2)),
+                        SimValue(Value::Text("Gadget".into())),
+                    ],
+                ],
+            },
+        ];
+        for _ in 0..100 {
+            let query = Select::arbitrary_from(&mut rng, &tables);
+            println!("{}", query.to_sql_ast().to_sql_string(&EmptyContext {}));
+            // println!("{:?}", query.to_sql_ast());
         }
     }
 }
