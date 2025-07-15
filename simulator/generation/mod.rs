@@ -145,7 +145,7 @@ pub(crate) fn pick_n_unique<R: Rng>(
 pub(crate) fn gen_random_text<T: Rng>(rng: &mut T) -> String {
     let big_text = rng.gen_ratio(1, 1000);
     if big_text {
-        let max_size: u64 = 2 * 1024 * 1024 * 1024;
+        let max_size: u64 = 2 * 1024 * 1024;
         //let max_size: u64 = 2 * 1024;
         let size = rng.gen_range(1024..max_size);
         let mut name = String::with_capacity(size as usize);
