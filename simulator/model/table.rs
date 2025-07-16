@@ -21,6 +21,16 @@ pub(crate) struct Table {
     pub(crate) columns: Vec<Column>,
 }
 
+impl Table {
+    pub fn anonymous(rows: Vec<Vec<SimValue>>) -> Self {
+        Self {
+            rows,
+            name: "".to_string(),
+            columns: vec![],
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct Column {
     pub(crate) name: String,

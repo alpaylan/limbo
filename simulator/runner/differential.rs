@@ -250,8 +250,47 @@ fn execute_plan(
                                 (Ok(limbo_values), Ok(rusqlite_values)) => {
                                     if limbo_values != rusqlite_values {
                                         tracing::error!("returned values from limbo and rusqlite results do not match");
+                                        let diff = limbo_values
+                                            .iter()
+                                            .zip(rusqlite_values.iter())
+                                            .enumerate()
+                                            .filter(|(_, (l, r))| l != r)
+                                            .collect::<Vec<_>>();
+
+                                        let diff = diff
+                                            .iter()
+                                            .flat_map(|(i, (l, r))| {
+                                                let mut diffs = vec![];
+                                                for (j, (l, r)) in
+                                                    l.iter().zip(r.iter()).enumerate()
+                                                {
+                                                    if l != r {
+                                                        tracing::debug!(
+                                                            "difference at index {}, {}: {} != {}",
+                                                            i,
+                                                            j,
+                                                            l.to_string(),
+                                                            r.to_string()
+                                                        );
+                                                        diffs
+                                                            .push(((i, j), (l.clone(), r.clone())));
+                                                    }
+                                                }
+                                                diffs
+                                            })
+                                            .collect::<Vec<_>>();
                                         tracing::debug!("limbo values {:?}", limbo_values);
                                         tracing::debug!("rusqlite values {:?}", rusqlite_values);
+                                        tracing::debug!(
+                                            "differences: {}",
+                                            diff.iter()
+                                                .map(|((i, j), (l, r))| format!(
+                                                    "\t({}, {}): ({}) != ({})",
+                                                    i, j, l, r
+                                                ))
+                                                .collect::<Vec<_>>()
+                                                .join("\n")
+                                        );
                                         return Err(turso_core::LimboError::InternalError(
                                             "returned values from limbo and rusqlite results do not match".into(),
                                         ));

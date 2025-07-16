@@ -55,6 +55,21 @@ impl Select {
         )
     }
 
+    pub fn expr(expr: Predicate) -> Self {
+        Select {
+            body: SelectBody {
+                select: Box::new(SelectInner {
+                    distinctness: Distinctness::All,
+                    columns: vec![ResultColumn::Expr(expr)],
+                    from: None,
+                    where_clause: Predicate::true_(),
+                }),
+                compounds: Vec::new(),
+            },
+            limit: None,
+        }
+    }
+
     pub fn single(
         table: String,
         result_columns: Vec<ResultColumn>,
@@ -67,10 +82,10 @@ impl Select {
                 select: Box::new(SelectInner {
                     distinctness: distinct,
                     columns: result_columns,
-                    from: FromClause {
+                    from: Some(FromClause {
                         table,
                         joins: Vec::new(),
-                    },
+                    }),
                     where_clause,
                 }),
                 compounds: Vec::new(),
@@ -92,13 +107,25 @@ impl Select {
     }
 
     pub(crate) fn dependencies(&self) -> HashSet<String> {
+        if self.body.select.from.is_none() {
+            return HashSet::new();
+        }
+        let from = self.body.select.from.as_ref().unwrap();
         let mut tables = HashSet::new();
-        tables.insert(self.body.select.from.table.clone());
+        tables.insert(from.table.clone());
 
-        tables.extend(self.body.select.from.dependencies());
+        tables.extend(from.dependencies());
 
         for compound in &self.body.compounds {
-            tables.extend(compound.select.from.dependencies().into_iter());
+            tables.extend(
+                compound
+                    .select
+                    .from
+                    .as_ref()
+                    .map(|f| f.dependencies())
+                    .unwrap_or(vec![])
+                    .into_iter(),
+            );
         }
 
         tables
@@ -120,7 +147,7 @@ pub struct SelectInner {
     /// columns
     pub columns: Vec<ResultColumn>,
     /// `FROM` clause
-    pub from: FromClause,
+    pub from: Option<FromClause>,
     /// `WHERE` clause
     pub where_clause: Predicate,
 }
@@ -245,13 +272,6 @@ impl JoinTable {
                 .collect(),
             rows: self.rows,
         };
-        for row in &t.rows {
-            assert_eq!(
-                row.len(),
-                t.columns.len(),
-                "Row length does not match column length after join"
-            );
-        }
         t
     }
 }
@@ -317,26 +337,65 @@ impl Shadow for SelectInner {
     type Result = anyhow::Result<JoinTable>;
 
     fn shadow(&self, env: &mut SimulatorTables) -> Self::Result {
-        let mut join_table = self.from.shadow(env)?;
-        let as_table = join_table.clone().into_table();
-        for row in &mut join_table.rows {
-            assert_eq!(
-                row.len(),
-                as_table.columns.len(),
-                "Row length does not match column length after join"
-            );
+        if let Some(from) = &self.from {
+            let mut join_table = from.shadow(env)?;
+            let as_table = join_table.clone().into_table();
+            for row in &mut join_table.rows {
+                assert_eq!(
+                    row.len(),
+                    as_table.columns.len(),
+                    "Row length does not match column length after join"
+                );
+            }
+
+            join_table
+                .rows
+                .retain(|row| self.where_clause.test(row, &as_table));
+
+            if self.distinctness == Distinctness::Distinct {
+                join_table.rows.sort_unstable();
+                join_table.rows.dedup();
+            }
+
+            Ok(join_table)
+        } else {
+            assert!(self
+                .columns
+                .iter()
+                .all(|col| matches!(col, ResultColumn::Expr(_))));
+
+            // If `WHERE` is false, just return an empty table
+            if !self.where_clause.test(&[], &Table::anonymous(vec![])) {
+                return Ok(JoinTable {
+                    tables: Vec::new(),
+                    rows: Vec::new(),
+                });
+            }
+
+            // Compute the results of the column expressions and make a row
+            let mut row = Vec::new();
+            for col in &self.columns {
+                match col {
+                    ResultColumn::Expr(expr) => {
+                        let value = expr.eval(&[], &Table::anonymous(vec![]));
+                        if let Some(value) = value {
+                            row.push(value);
+                        } else {
+                            return Err(anyhow::anyhow!(
+                                "Failed to evaluate expression in free select ({})",
+                                expr.0.to_sql_string(&EmptyContext {})
+                            ));
+                        }
+                    }
+                    _ => unreachable!("Only expressions are allowed in free selects"),
+                }
+            }
+
+            Ok(JoinTable {
+                tables: Vec::new(),
+                rows: vec![row],
+            })
         }
-
-        join_table
-            .rows
-            .retain(|row| self.where_clause.test(row, &as_table));
-
-        if self.distinctness == Distinctness::Distinct {
-            join_table.rows.sort_unstable();
-            join_table.rows.dedup();
-        }
-
-        Ok(join_table)
     }
 }
 
@@ -397,7 +456,7 @@ impl Select {
                             }
                         })
                         .collect(),
-                    from: Some(self.body.select.from.to_sql_ast()),
+                    from: self.body.select.from.as_ref().map(|f| f.to_sql_ast()),
                     where_clause: Some(self.body.select.where_clause.0.clone()),
                     group_by: None,
                     window_clause: None,
@@ -428,7 +487,7 @@ impl Select {
                                         ),
                                     })
                                     .collect(),
-                                from: Some(compound.select.from.to_sql_ast()),
+                                from: compound.select.from.as_ref().map(|f| f.to_sql_ast()),
                                 where_clause: Some(compound.select.where_clause.0.clone()),
                                 group_by: None,
                                 window_clause: None,

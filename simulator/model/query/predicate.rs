@@ -77,6 +77,10 @@ impl Predicate {
         Self(expr)
     }
 
+    pub(crate) fn eval(&self, row: &[SimValue], table: &Table) -> Option<SimValue> {
+        expr_to_value(&self.0, row, table)
+    }
+
     pub(crate) fn test(&self, row: &[SimValue], table: &Table) -> bool {
         let value = expr_to_value(&self.0, row, table);
         value.is_some_and(|value| value.as_bool())

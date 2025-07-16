@@ -1,4 +1,4 @@
-use crate::generation::{Arbitrary, ArbitraryFrom, Shadow};
+use crate::generation::{Arbitrary, ArbitraryFrom, ArbitrarySizedFrom, Shadow};
 use crate::model::query::predicate::Predicate;
 use crate::model::query::select::{
     CompoundOperator, CompoundSelect, Distinctness, FromClause, JoinTable, JoinType, JoinedTable,
@@ -10,6 +10,7 @@ use crate::model::table::{SimValue, Table};
 use crate::SimulatorEnv;
 use itertools::Itertools;
 use rand::Rng;
+use turso_sqlite3_parser::ast::Expr;
 
 use super::property::Remaining;
 use super::{backtrack, frequency, pick};
@@ -91,7 +92,7 @@ impl ArbitraryFrom<&SimulatorEnv> for SelectInner {
                 Distinctness::All
             },
             columns: vec![ResultColumn::Star],
-            from,
+            from: Some(from),
             where_clause: Predicate::arbitrary_from(rng, &join_table),
         }
     }
@@ -112,6 +113,19 @@ impl Arbitrary for CompoundOperator {
             1 => CompoundOperator::UnionAll,
             _ => unreachable!(),
         }
+    }
+}
+
+/// SelectFree is a wrapper around Select that allows for arbitrary generation
+/// of selects without requiring a specific environment, which is useful for generating
+/// arbitrary expressions without referring to the tables.
+pub(crate) struct SelectFree(pub(crate) Select);
+
+impl ArbitraryFrom<&SimulatorEnv> for SelectFree {
+    fn arbitrary_from<R: Rng>(rng: &mut R, env: &SimulatorEnv) -> Self {
+        let expr = Predicate(Expr::arbitrary_sized_from(rng, env, 8));
+        let select = Select::expr(expr);
+        Self(select)
     }
 }
 

@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use turso_core::{Connection, Result, StepResult};
 
 use crate::{
-    generation::Shadow,
+    generation::{query::SelectFree, Shadow},
     model::{
         query::{update::Update, Create, CreateIndex, Delete, Drop, Insert, Query, Select},
         table::SimValue,
@@ -750,6 +750,10 @@ fn random_read<R: rand::Rng>(rng: &mut R, env: &SimulatorEnv) -> Interactions {
     Interactions::Query(Query::Select(Select::arbitrary_from(rng, env)))
 }
 
+fn random_expr<R: rand::Rng>(rng: &mut R, env: &SimulatorEnv) -> Interactions {
+    Interactions::Query(Query::Select(SelectFree::arbitrary_from(rng, env).0))
+}
+
 fn random_write<R: rand::Rng>(rng: &mut R, env: &SimulatorEnv) -> Interactions {
     Interactions::Query(Query::Insert(Insert::arbitrary_from(rng, env)))
 }
@@ -802,6 +806,10 @@ impl ArbitraryFrom<(&SimulatorEnv, InteractionStats)> for Interactions {
                 (
                     remaining_.read,
                     Box::new(|rng: &mut R| random_read(rng, env)),
+                ),
+                (
+                    remaining_.read / 3.0,
+                    Box::new(|rng: &mut R| random_expr(rng, env)),
                 ),
                 (
                     remaining_.write,

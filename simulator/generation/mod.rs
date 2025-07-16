@@ -23,6 +23,16 @@ pub trait Arbitrary {
     fn arbitrary<R: Rng>(rng: &mut R) -> Self;
 }
 
+/// ArbitrarySized trait for generating random values of a specific size
+/// An implementation of arbitrary_sized is assumed to be a uniform sampling of
+/// the possible values of the type, with a bias towards smaller values for
+/// practicality, but with the additional constraint that the generated value
+/// must fit in the given size. This is useful for generating values that are
+/// constrained by a specific size, such as integers or strings.
+pub trait ArbitrarySized {
+    fn arbitrary_sized<R: Rng>(rng: &mut R, size: usize) -> Self;
+}
+
 /// ArbitraryFrom trait for generating random values from a given value
 /// ArbitraryFrom allows for constructing relations, where the generated
 /// value is dependent on the given value. These relations could be constraints
@@ -30,6 +40,18 @@ pub trait Arbitrary {
 /// or a predicate satisfying a given table row.
 pub trait ArbitraryFrom<T> {
     fn arbitrary_from<R: Rng>(rng: &mut R, t: T) -> Self;
+}
+
+/// ArbitrarySizedFrom trait for generating random values from a given value
+/// ArbitrarySizedFrom allows for constructing relations, where the generated
+/// value is dependent on the given value and a size constraint. These relations
+/// could be constraints such as generating an integer within an interval,
+/// or a value that fits in a table, or a predicate satisfying a given table row,
+/// but with the additional constraint that the generated value must fit in the given size.
+/// This is useful for generating values that are constrained by a specific size,
+/// such as integers or strings, while still being dependent on the given value.
+pub trait ArbitrarySizedFrom<T> {
+    fn arbitrary_sized_from<R: Rng>(rng: &mut R, t: T, size: usize) -> Self;
 }
 
 /// ArbitraryFromMaybe trait for fallibally generating random values from a given value

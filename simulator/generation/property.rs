@@ -984,6 +984,15 @@ fn property_delete_select<R: rand::Rng>(
                     continue;
                 }
             }
+            Query::Insert(Insert::Select {
+                table: t,
+                select: _,
+            }) => {
+                // A row that holds for the predicate will not be inserted.
+                if t == &table.name {
+                    continue;
+                }
+            }
             Query::Create(Create { table: t }) => {
                 // There will be no errors in the middle interactions.
                 // - Creating the same table is an error
