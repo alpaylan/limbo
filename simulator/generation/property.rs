@@ -993,6 +993,12 @@ fn property_delete_select<R: rand::Rng>(
                     continue;
                 }
             }
+            Query::Update(Update { table: t, .. }) => {
+                // A row that holds for the predicate will not be updated.
+                if t == &table.name {
+                    continue;
+                }
+            }
             Query::Create(Create { table: t }) => {
                 // There will be no errors in the middle interactions.
                 // - Creating the same table is an error
