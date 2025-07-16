@@ -21,7 +21,7 @@ impl Arbitrary for Table {
         let columns = loop {
             let large_table = rng.gen_bool(0.1);
             let column_size = if large_table {
-                rng.gen_range(64..125) // todo: make this higher (128+)
+                rng.gen_range(64..128) // todo: make this higher (128+)
             } else {
                 rng.gen_range(1..=10)
             };
