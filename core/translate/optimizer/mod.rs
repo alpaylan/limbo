@@ -7,10 +7,7 @@ use cost::Cost;
 use join::{compute_best_join_order, BestJoinOrderResult};
 use lift_common_subexpressions::lift_common_subexpressions_from_binary_or_terms;
 use order::{compute_order_target, plan_satisfies_order_target, EliminatesSortBy};
-use turso_sqlite3_parser::{
-    ast::{self, Expr, SortOrder},
-    to_sql_string::ToSqlString as _,
-};
+use turso_sqlite3_parser::ast::{self, fmt::ToTokens as _, Expr, SortOrder};
 
 use crate::{
     parameters::PARAM_PREFIX,
@@ -51,7 +48,11 @@ pub fn optimize_plan(plan: &mut Plan, schema: &Schema) -> Result<()> {
         }
     }
     // When debug tracing is enabled, print the optimized plan as a SQL string for debugging
-    tracing::debug!(plan_sql = plan.to_sql_string(&crate::translate::display::PlanContext(&[])));
+    tracing::debug!(
+        plan_sql = plan
+            .format_with_context(&crate::translate::display::PlanContext(&[]))
+            .unwrap()
+    );
     Ok(())
 }
 
@@ -243,11 +244,11 @@ fn optimize_table_access(
             let try_to_build_ephemeral_index = if schema.indexes_enabled() {
                 let is_leftmost_table = i == 0;
                 let uses_index = access_method.index.is_some();
-                let source_table_is_from_clause_subquery = matches!(
+                let source_table_does_not_support_search = matches!(
                     &joined_tables[table_idx].table,
-                    Table::FromClauseSubquery(_)
+                    Table::FromClauseSubquery(_) | Table::Virtual(_)
                 );
-                !is_leftmost_table && !uses_index && !source_table_is_from_clause_subquery
+                !is_leftmost_table && !uses_index && !source_table_does_not_support_search
             } else {
                 false
             };

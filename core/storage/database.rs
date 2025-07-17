@@ -33,7 +33,7 @@ unsafe impl Sync for DatabaseFile {}
 
 #[cfg(feature = "fs")]
 impl DatabaseStorage for DatabaseFile {
-    #[instrument(skip_all, level = Level::INFO)]
+    #[instrument(skip_all, level = Level::DEBUG)]
     fn read_page(&self, page_idx: usize, c: Completion) -> Result<()> {
         let r = c.as_read();
         let size = r.buf().len();
@@ -42,11 +42,11 @@ impl DatabaseStorage for DatabaseFile {
             return Err(LimboError::NotADB);
         }
         let pos = (page_idx - 1) * size;
-        self.file.pread(pos, c)?;
+        self.file.pread(pos, c.into())?;
         Ok(())
     }
 
-    #[instrument(skip_all, level = Level::INFO)]
+    #[instrument(skip_all, level = Level::DEBUG)]
     fn write_page(
         &self,
         page_idx: usize,
@@ -59,17 +59,17 @@ impl DatabaseStorage for DatabaseFile {
         assert!(buffer_size <= 65536);
         assert_eq!(buffer_size & (buffer_size - 1), 0);
         let pos = (page_idx - 1) * buffer_size;
-        self.file.pwrite(pos, buffer, c)?;
+        self.file.pwrite(pos, buffer, c.into())?;
         Ok(())
     }
 
-    #[instrument(skip_all, level = Level::INFO)]
+    #[instrument(skip_all, level = Level::DEBUG)]
     fn sync(&self, c: Completion) -> Result<()> {
-        let _ = self.file.sync(c)?;
+        let _ = self.file.sync(c.into())?;
         Ok(())
     }
 
-    #[instrument(skip_all, level = Level::INFO)]
+    #[instrument(skip_all, level = Level::DEBUG)]
     fn size(&self) -> Result<u64> {
         self.file.size()
     }
@@ -90,7 +90,7 @@ unsafe impl Send for FileMemoryStorage {}
 unsafe impl Sync for FileMemoryStorage {}
 
 impl DatabaseStorage for FileMemoryStorage {
-    #[instrument(skip_all, level = Level::INFO)]
+    #[instrument(skip_all, level = Level::DEBUG)]
     fn read_page(&self, page_idx: usize, c: Completion) -> Result<()> {
         let r = match c.completion_type {
             CompletionType::Read(ref r) => r,
@@ -102,11 +102,11 @@ impl DatabaseStorage for FileMemoryStorage {
             return Err(LimboError::NotADB);
         }
         let pos = (page_idx - 1) * size;
-        self.file.pread(pos, c)?;
+        self.file.pread(pos, c.into())?;
         Ok(())
     }
 
-    #[instrument(skip_all, level = Level::INFO)]
+    #[instrument(skip_all, level = Level::DEBUG)]
     fn write_page(
         &self,
         page_idx: usize,
@@ -118,17 +118,17 @@ impl DatabaseStorage for FileMemoryStorage {
         assert!(buffer_size <= 65536);
         assert_eq!(buffer_size & (buffer_size - 1), 0);
         let pos = (page_idx - 1) * buffer_size;
-        self.file.pwrite(pos, buffer, c)?;
+        self.file.pwrite(pos, buffer, c.into())?;
         Ok(())
     }
 
-    #[instrument(skip_all, level = Level::INFO)]
+    #[instrument(skip_all, level = Level::DEBUG)]
     fn sync(&self, c: Completion) -> Result<()> {
-        let _ = self.file.sync(c)?;
+        let _ = self.file.sync(c.into())?;
         Ok(())
     }
 
-    #[instrument(skip_all, level = Level::INFO)]
+    #[instrument(skip_all, level = Level::DEBUG)]
     fn size(&self) -> Result<u64> {
         self.file.size()
     }

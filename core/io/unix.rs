@@ -219,7 +219,7 @@ impl IO for UnixIO {
         Ok(unix_file)
     }
 
-    #[instrument(err, skip_all, level = Level::INFO)]
+    #[instrument(err, skip_all, level = Level::TRACE)]
     fn run_once(&self) -> Result<()> {
         if self.callbacks.is_empty() {
             return Ok(());
@@ -334,20 +334,19 @@ impl File for UnixFile<'_> {
         Ok(())
     }
 
-    #[instrument(err, skip_all, level = Level::INFO)]
-    fn pread(&self, pos: usize, c: Completion) -> Result<Arc<Completion>> {
+    #[instrument(err, skip_all, level = Level::TRACE)]
+    fn pread(&self, pos: usize, c: Arc<Completion>) -> Result<Arc<Completion>> {
         let file = self.file.borrow();
         let result = {
             let r = c.as_read();
             let mut buf = r.buf_mut();
             rustix::io::pread(file.as_fd(), buf.as_mut_slice(), pos as u64)
         };
-        let c = Arc::new(c);
         match result {
             Ok(n) => {
                 trace!("pread n: {}", n);
                 // Read succeeded immediately
-                c.complete(0);
+                c.complete(n as i32);
                 Ok(c)
             }
             Err(Errno::AGAIN) => {
@@ -368,19 +367,18 @@ impl File for UnixFile<'_> {
         }
     }
 
-    #[instrument(err, skip_all, level = Level::INFO)]
+    #[instrument(err, skip_all, level = Level::TRACE)]
     fn pwrite(
         &self,
         pos: usize,
         buffer: Arc<RefCell<crate::Buffer>>,
-        c: Completion,
+        c: Arc<Completion>,
     ) -> Result<Arc<Completion>> {
         let file = self.file.borrow();
         let result = {
             let buf = buffer.borrow();
             rustix::io::pwrite(file.as_fd(), buf.as_slice(), pos as u64)
         };
-        let c = Arc::new(c);
         match result {
             Ok(n) => {
                 trace!("pwrite n: {}", n);
@@ -404,11 +402,10 @@ impl File for UnixFile<'_> {
         }
     }
 
-    #[instrument(err, skip_all, level = Level::INFO)]
-    fn sync(&self, c: Completion) -> Result<Arc<Completion>> {
+    #[instrument(err, skip_all, level = Level::TRACE)]
+    fn sync(&self, c: Arc<Completion>) -> Result<Arc<Completion>> {
         let file = self.file.borrow();
         let result = fs::fsync(file.as_fd());
-        let c = Arc::new(c);
         match result {
             Ok(()) => {
                 trace!("fsync");
@@ -419,7 +416,7 @@ impl File for UnixFile<'_> {
         }
     }
 
-    #[instrument(err, skip_all, level = Level::INFO)]
+    #[instrument(err, skip_all, level = Level::TRACE)]
     fn size(&self) -> Result<u64> {
         let file = self.file.borrow();
         Ok(file.metadata()?.len())

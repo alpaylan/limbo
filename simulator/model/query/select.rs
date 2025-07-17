@@ -4,7 +4,7 @@ use anyhow::Context;
 pub use ast::Distinctness;
 use itertools::Itertools;
 use serde::{Deserialize, Serialize};
-use turso_sqlite3_parser::{ast, to_sql_string::ToSqlString};
+use turso_sqlite3_parser::ast::{self, fmt::ToTokens};
 
 use crate::{
     generation::Shadow,
@@ -383,7 +383,7 @@ impl Shadow for SelectInner {
                         } else {
                             return Err(anyhow::anyhow!(
                                 "Failed to evaluate expression in free select ({})",
-                                expr.0.to_sql_string(&EmptyContext {})
+                                expr.0.format_with_context(&EmptyContext {}).unwrap()
                             ));
                         }
                     }
@@ -508,7 +508,7 @@ impl Select {
 }
 impl Display for Select {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.to_sql_ast().to_sql_string(&EmptyContext {}))
+        self.to_sql_ast().to_fmt_with_context(f, &EmptyContext {})
     }
 }
 

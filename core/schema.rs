@@ -2,10 +2,10 @@ use crate::result::LimboResult;
 use crate::storage::btree::BTreeCursor;
 use crate::translate::collate::CollationSeq;
 use crate::translate::plan::SelectPlan;
-use crate::types::CursorResult;
+use crate::types::IOResult;
 use crate::util::{module_args_from_sql, module_name_from_sql, UnparsedFromSqlIndex};
 use crate::{util::normalize_ident, Result};
-use crate::{LimboError, MvCursor, Pager, SymbolTable, VirtualTable};
+use crate::{LimboError, MvCursor, Pager, RefValue, SymbolTable, VirtualTable};
 use core::fmt;
 use fallible_iterator::FallibleIterator;
 use std::cell::RefCell;
@@ -43,6 +43,9 @@ impl Schema {
             SCHEMA_TABLE_NAME.to_string(),
             Arc::new(Table::BTree(sqlite_schema_table().into())),
         );
+        for function in VirtualTable::builtin_functions() {
+            tables.insert(function.name.to_owned(), Arc::new(Table::Virtual(function)));
+        }
         Self {
             tables,
             indexes,
@@ -148,46 +151,64 @@ impl Schema {
         pager: Rc<Pager>,
         syms: &SymbolTable,
     ) -> Result<()> {
-        let mut cursor = BTreeCursor::new_table(mv_cursor, pager.clone(), 1);
+        let mut cursor = BTreeCursor::new_table(mv_cursor, pager.clone(), 1, 10);
 
         let mut from_sql_indexes = Vec::with_capacity(10);
         let mut automatic_indices: HashMap<String, Vec<(String, usize)>> =
             HashMap::with_capacity(10);
 
-        match pager.begin_read_tx()? {
-            CursorResult::Ok(v) => {
-                if matches!(v, LimboResult::Busy) {
-                    return Err(LimboError::Busy);
+        loop {
+            match pager.begin_read_tx()? {
+                IOResult::Done(v) => {
+                    if matches!(v, LimboResult::Busy) {
+                        return Err(LimboError::Busy);
+                    }
+                    break;
                 }
+                IOResult::IO => pager.io.run_once()?,
             }
-            CursorResult::IO => pager.io.run_once()?,
         }
 
-        match cursor.rewind()? {
-            CursorResult::Ok(v) => v,
-            CursorResult::IO => pager.io.run_once()?,
-        };
+        while let IOResult::IO = cursor.rewind()? {
+            pager.io.run_once()?
+        }
 
         loop {
             let Some(row) = (loop {
                 match cursor.record()? {
-                    CursorResult::Ok(v) => break v,
-                    CursorResult::IO => pager.io.run_once()?,
+                    IOResult::Done(v) => break v,
+                    IOResult::IO => pager.io.run_once()?,
                 }
             }) else {
                 break;
             };
 
-            let ty = row.get::<&str>(0)?;
-            match ty {
+            let mut record_cursor = cursor.record_cursor.borrow_mut();
+            let ty_value = record_cursor.get_value(&row, 0)?;
+            let RefValue::Text(ty) = ty_value else {
+                return Err(LimboError::ConversionError("Expected text value".into()));
+            };
+            match ty.as_str() {
                 "table" => {
-                    let root_page = row.get::<i64>(3)?;
-                    let sql = row.get::<&str>(4)?;
+                    let root_page_value = record_cursor.get_value(&row, 3)?;
+                    let RefValue::Integer(root_page) = root_page_value else {
+                        return Err(LimboError::ConversionError("Expected integer value".into()));
+                    };
+                    let sql_value = record_cursor.get_value(&row, 4)?;
+                    let RefValue::Text(sql_text) = sql_value else {
+                        return Err(LimboError::ConversionError("Expected text value".into()));
+                    };
+                    let sql = sql_text.as_str();
                     let create_virtual = "create virtual";
                     if root_page == 0
                         && sql[0..create_virtual.len()].eq_ignore_ascii_case(create_virtual)
                     {
-                        let name: &str = row.get::<&str>(1)?;
+                        let name_value = record_cursor.get_value(&row, 1)?;
+                        let RefValue::Text(name_text) = name_value else {
+                            return Err(LimboError::ConversionError("Expected text value".into()));
+                        };
+                        let name = name_text.as_str();
+
                         // a virtual table is found in the sqlite_schema, but it's no
                         // longer in the in-memory schema. We need to recreate it if
                         // the module is loaded in the symbol table.
@@ -210,41 +231,65 @@ impl Schema {
                     self.add_btree_table(Rc::new(table));
                 }
                 "index" => {
-                    let root_page = row.get::<i64>(3)?;
-                    match row.get::<&str>(4) {
-                        Ok(sql) => {
+                    let root_page_value = record_cursor.get_value(&row, 3)?;
+                    let RefValue::Integer(root_page) = root_page_value else {
+                        return Err(LimboError::ConversionError("Expected integer value".into()));
+                    };
+                    match record_cursor.get_value(&row, 4) {
+                        Ok(RefValue::Text(sql_text)) => {
+                            let table_name_value = record_cursor.get_value(&row, 2)?;
+                            let RefValue::Text(table_name_text) = table_name_value else {
+                                return Err(LimboError::ConversionError(
+                                    "Expected text value".into(),
+                                ));
+                            };
+
                             from_sql_indexes.push(UnparsedFromSqlIndex {
-                                table_name: row.get::<&str>(2)?.to_string(),
+                                table_name: table_name_text.as_str().to_string(),
                                 root_page: root_page as usize,
-                                sql: sql.to_string(),
+                                sql: sql_text.as_str().to_string(),
                             });
                         }
                         _ => {
-                            // Automatic index on primary key and/or unique constraint, e.g.
-                            // table|foo|foo|2|CREATE TABLE foo (a text PRIMARY KEY, b)
-                            // index|sqlite_autoindex_foo_1|foo|3|
-                            let index_name = row.get::<&str>(1)?.to_string();
-                            let table_name = row.get::<&str>(2)?.to_string();
-                            let root_page = row.get::<i64>(3)?;
-                            match automatic_indices.entry(table_name) {
+                            let index_name_value = record_cursor.get_value(&row, 1)?;
+                            let RefValue::Text(index_name_text) = index_name_value else {
+                                return Err(LimboError::ConversionError(
+                                    "Expected text value".into(),
+                                ));
+                            };
+
+                            let table_name_value = record_cursor.get_value(&row, 2)?;
+                            let RefValue::Text(table_name_text) = table_name_value else {
+                                return Err(LimboError::ConversionError(
+                                    "Expected text value".into(),
+                                ));
+                            };
+
+                            match automatic_indices.entry(table_name_text.as_str().to_string()) {
                                 Entry::Vacant(e) => {
-                                    e.insert(vec![(index_name, root_page as usize)]);
+                                    e.insert(vec![(
+                                        index_name_text.as_str().to_string(),
+                                        root_page as usize,
+                                    )]);
                                 }
                                 Entry::Occupied(mut e) => {
-                                    e.get_mut().push((index_name, root_page as usize));
+                                    e.get_mut().push((
+                                        index_name_text.as_str().to_string(),
+                                        root_page as usize,
+                                    ));
                                 }
-                            };
+                            }
                         }
                     }
                 }
                 _ => {}
             };
-
+            drop(record_cursor);
             drop(row);
 
-            if matches!(cursor.next()?, CursorResult::IO) {
+            while let IOResult::IO = cursor.next()? {
                 pager.io.run_once()?;
-            };
+            }
         }
 
         pager.end_read_tx()?;
@@ -667,6 +712,7 @@ fn create_table(
                     default,
                     unique,
                     collation,
+                    hidden: false,
                 });
             }
             if options.contains(TableOptions::WITHOUT_ROWID) {
@@ -738,6 +784,7 @@ pub struct Column {
     pub default: Option<Expr>,
     pub unique: bool,
     pub collation: Option<CollationSeq>,
+    pub hidden: bool,
 }
 
 impl Column {
@@ -816,6 +863,7 @@ impl From<ColumnDefinition> for Column {
             is_rowid_alias: primary_key && matches!(ty, Type::Integer),
             unique,
             collation,
+            hidden: false,
         }
     }
 }
@@ -1031,6 +1079,7 @@ pub fn sqlite_schema_table() -> BTreeTable {
                 default: None,
                 unique: false,
                 collation: None,
+                hidden: false,
             },
             Column {
                 name: Some("name".to_string()),
@@ -1042,6 +1091,7 @@ pub fn sqlite_schema_table() -> BTreeTable {
                 default: None,
                 unique: false,
                 collation: None,
+                hidden: false,
             },
             Column {
                 name: Some("tbl_name".to_string()),
@@ -1053,6 +1103,7 @@ pub fn sqlite_schema_table() -> BTreeTable {
                 default: None,
                 unique: false,
                 collation: None,
+                hidden: false,
             },
             Column {
                 name: Some("rootpage".to_string()),
@@ -1064,6 +1115,7 @@ pub fn sqlite_schema_table() -> BTreeTable {
                 default: None,
                 unique: false,
                 collation: None,
+                hidden: false,
             },
             Column {
                 name: Some("sql".to_string()),
@@ -1075,6 +1127,7 @@ pub fn sqlite_schema_table() -> BTreeTable {
                 default: None,
                 unique: false,
                 collation: None,
+                hidden: false,
             },
         ],
         unique_sets: None,
@@ -1688,6 +1741,7 @@ mod tests {
                 default: None,
                 unique: false,
                 collation: None,
+                hidden: false,
             }],
             unique_sets: None,
         };

@@ -5,7 +5,9 @@ use tracing::{debug, trace};
 
 use super::pager::PageRef;
 
-const DEFAULT_PAGE_CACHE_SIZE_IN_PAGES: usize = 2000;
+/// FIXME: https://github.com/tursodatabase/turso/issues/1661
+const DEFAULT_PAGE_CACHE_SIZE_IN_PAGES_MAKE_ME_SMALLER_ONCE_WAL_SPILL_IS_IMPLEMENTED: usize =
+    100000;
 
 #[derive(Debug, Eq, Hash, PartialEq, Clone)]
 pub struct PageCacheKey {
@@ -47,6 +49,7 @@ pub enum CacheError {
     InternalError(String),
     Locked,
     Dirty { pgno: usize },
+    Pinned { pgno: usize },
     ActiveRefs,
     Full,
     KeyExists,
@@ -134,6 +137,7 @@ impl DumbLruPageCache {
         }
 
         let ptr = *self.map.borrow().get(&key).unwrap();
+
         // Try to detach from LRU list first, can fail
         self.detach(ptr, clean_page)?;
         let ptr = self.map.borrow_mut().remove(&key).unwrap();
@@ -177,10 +181,11 @@ impl DumbLruPageCache {
         }
     }
 
-    fn detach(
+    fn _detach(
         &mut self,
         mut entry: NonNull<PageCacheEntry>,
         clean_page: bool,
+        allow_detach_pinned: bool,
     ) -> Result<(), CacheError> {
         let entry_mut = unsafe { entry.as_mut() };
         if entry_mut.page.is_locked() {
@@ -188,6 +193,11 @@ impl DumbLruPageCache {
         }
         if entry_mut.page.is_dirty() {
             return Err(CacheError::Dirty {
+                pgno: entry_mut.page.get().id,
+            });
+        }
+        if entry_mut.page.is_pinned() && !allow_detach_pinned {
+            return Err(CacheError::Pinned {
                 pgno: entry_mut.page.get().id,
             });
         }
@@ -199,6 +209,22 @@ impl DumbLruPageCache {
         }
         self.unlink(entry);
         Ok(())
+    }
+
+    fn detach(
+        &mut self,
+        entry: NonNull<PageCacheEntry>,
+        clean_page: bool,
+    ) -> Result<(), CacheError> {
+        self._detach(entry, clean_page, false)
+    }
+
+    fn detach_even_if_pinned(
+        &mut self,
+        entry: NonNull<PageCacheEntry>,
+        clean_page: bool,
+    ) -> Result<(), CacheError> {
+        self._detach(entry, clean_page, true)
     }
 
     fn unlink(&mut self, mut entry: NonNull<PageCacheEntry>) {
@@ -276,7 +302,8 @@ impl DumbLruPageCache {
         while need_to_evict > 0 && current_opt.is_some() {
             let current = current_opt.unwrap();
             let entry = unsafe { current.as_ref() };
-            current_opt = entry.prev; // Pick prev before modifying entry
+            // Pick prev before modifying entry
+            current_opt = entry.prev;
             match self.delete(entry.key.clone()) {
                 Err(_) => {}
                 Ok(_) => need_to_evict -= 1,
@@ -296,7 +323,7 @@ impl DumbLruPageCache {
                 self.map.borrow_mut().remove(&current_entry.as_ref().key);
             }
             let next = unsafe { current_entry.as_ref().next };
-            self.detach(current_entry, true)?;
+            self.detach_even_if_pinned(current_entry, true)?;
             unsafe {
                 assert!(!current_entry.as_ref().page.is_dirty());
             }
@@ -480,7 +507,9 @@ impl DumbLruPageCache {
 
 impl Default for DumbLruPageCache {
     fn default() -> Self {
-        DumbLruPageCache::new(DEFAULT_PAGE_CACHE_SIZE_IN_PAGES)
+        DumbLruPageCache::new(
+            DEFAULT_PAGE_CACHE_SIZE_IN_PAGES_MAKE_ME_SMALLER_ONCE_WAL_SPILL_IS_IMPLEMENTED,
+        )
     }
 }
 

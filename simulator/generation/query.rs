@@ -190,7 +190,7 @@ impl ArbitraryFrom<&SimulatorEnv> for Insert {
             })
         };
 
-        let gen_select = |rng: &mut R| {
+        let _gen_select = |rng: &mut R| {
             // Find a non-empty table
             let select_table = env.tables.iter().find(|t| !t.rows.is_empty())?;
             let row = pick(&select_table.rows, rng);
@@ -204,12 +204,9 @@ impl ArbitraryFrom<&SimulatorEnv> for Insert {
             })
         };
 
+        // TODO: Add back gen_select when https://github.com/tursodatabase/turso/issues/2129 is fixed.
         // Backtrack here cannot return None
-        backtrack(
-            vec![(1, Box::new(gen_values)), (1, Box::new(gen_select))],
-            rng,
-        )
-        .unwrap()
+        backtrack(vec![(1, Box::new(gen_values))], rng).unwrap()
     }
 }
 

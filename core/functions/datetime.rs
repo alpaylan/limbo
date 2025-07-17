@@ -349,19 +349,21 @@ fn to_julian_day_exact(dt: &NaiveDateTime) -> f64 {
     jd_days + jd_fraction
 }
 
-pub fn exec_unixepoch(time_value: &Value) -> Result<String> {
+pub fn exec_unixepoch(time_value: &Value) -> Result<Value> {
     let dt = parse_naive_date_time(time_value);
     match dt {
-        Some(dt) => Ok(get_unixepoch_from_naive_datetime(dt)),
-        None => Ok(String::new()),
+        Some(dt) if !is_leap_second(&dt) => {
+            Ok(Value::Integer(get_unixepoch_from_naive_datetime(dt)))
+        }
+        _ => Ok(Value::Null),
     }
 }
 
-fn get_unixepoch_from_naive_datetime(value: NaiveDateTime) -> String {
+fn get_unixepoch_from_naive_datetime(value: NaiveDateTime) -> i64 {
     if is_leap_second(&value) {
-        return String::new();
+        return 0;
     }
-    value.and_utc().timestamp().to_string()
+    value.and_utc().timestamp()
 }
 
 fn parse_naive_date_time(time_value: &Value) -> Option<NaiveDateTime> {

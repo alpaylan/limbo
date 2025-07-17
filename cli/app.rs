@@ -16,7 +16,7 @@ use comfy_table::{Attribute, Cell, CellAlignment, ContentArrangement, Row, Table
 use rustyline::{error::ReadlineError, history::DefaultHistory, Editor};
 use std::{
     fmt,
-    io::{self, BufRead as _, Write},
+    io::{self, BufRead as _, IsTerminal, Write},
     path::PathBuf,
     sync::{
         atomic::{AtomicUsize, Ordering},
@@ -24,7 +24,7 @@ use std::{
     },
     time::{Duration, Instant},
 };
-use tracing::level_filters::LevelFilter;
+
 use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 use turso_core::{Connection, Database, LimboError, OpenFlags, Statement, StepResult, Value};
@@ -111,7 +111,7 @@ macro_rules! query_internal {
 }
 
 impl Limbo {
-    pub fn new() -> anyhow::Result<Self> {
+    pub fn new() -> anyhow::Result<(Self, WorkerGuard)> {
         let opts = Opts::parse();
         let db_file = opts
             .database
@@ -164,8 +164,9 @@ impl Limbo {
             rl: None,
             config: Some(config),
         };
+        let guard = app.init_tracing()?;
         app.first_run(sql, quiet)?;
-        Ok(app)
+        Ok((app, guard))
     }
 
     pub fn with_config(mut self, config: Config) -> Self {
@@ -891,7 +892,10 @@ impl Limbo {
                     false,
                 )
             } else {
-                (tracing_appender::non_blocking(std::io::stderr()), true)
+                (
+                    tracing_appender::non_blocking(std::io::stderr()),
+                    IsTerminal::is_terminal(&std::io::stderr()),
+                )
             };
         // Disable rustyline traces
         if let Err(e) = tracing_subscriber::registry()
@@ -902,12 +906,7 @@ impl Limbo {
                     .with_thread_ids(true)
                     .with_ansi(should_emit_ansi),
             )
-            .with(
-                EnvFilter::builder()
-                    .with_default_directive(LevelFilter::OFF.into())
-                    .from_env_lossy()
-                    .add_directive("rustyline=off".parse().unwrap()),
-            )
+            .with(EnvFilter::from_default_env().add_directive("rustyline=off".parse().unwrap()))
             .try_init()
         {
             println!("Unable to setup tracing appender: {e:?}");

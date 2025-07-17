@@ -11,6 +11,10 @@ export interface OpenDatabaseOptions {
 export interface PragmaOptions {
   simple: boolean
 }
+export interface RunResult {
+  changes: number
+  lastInsertRowid: number
+}
 export declare class Database {
   memory: boolean
   readonly: boolean
@@ -31,7 +35,7 @@ export declare class Database {
 export declare class Statement {
   source: string
   get(args?: Array<unknown> | undefined | null): unknown
-  run(args?: Array<unknown> | undefined | null): unknown
+  run(args?: Array<unknown> | undefined | null): RunResult
   iterate(args?: Array<unknown> | undefined | null): IteratorStatement
   all(args?: Array<unknown> | undefined | null): unknown
   pluck(pluck?: boolean | undefined | null): void

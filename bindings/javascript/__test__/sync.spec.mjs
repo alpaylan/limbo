@@ -36,7 +36,7 @@ dualTest.onlySqlitePasses("Statement.prepare() error", async (t) => {
   });
 });
 
-dualTest.onlySqlitePasses("Statement.run() returning rows", async (t) => {
+dualTest.both("Statement.run() returning rows", async (t) => {
   const db = t.context.db;
 
   const stmt = db.prepare("SELECT 1");
@@ -44,7 +44,7 @@ dualTest.onlySqlitePasses("Statement.run() returning rows", async (t) => {
   t.is(info.changes, 0);
 });
 
-dualTest.onlySqlitePasses("Statement.run() [positional]", async (t) => {
+dualTest.both("Statement.run() [positional]", async (t) => {
   const db = t.context.db;
 
   const stmt = db.prepare("INSERT INTO users(name, email) VALUES (?, ?)");
@@ -58,7 +58,7 @@ dualTest.onlySqlitePasses("Statement.run() [positional]", async (t) => {
   t.is(stmt2.get().email, "carol@example.net");
 });
 
-dualTest.onlySqlitePasses("Statement.run() [named]", async (t) => {
+dualTest.both("Statement.run() [named]", async (t) => {
   const db = t.context.db;
 
   const stmt = db.prepare("INSERT INTO users(name, email) VALUES (@name, @email);");
@@ -185,27 +185,61 @@ dualTest.both("Statement.all() [pluck]", async (t) => {
   t.deepEqual(stmt.pluck().all(), expected);
 });
 
-dualTest.onlySqlitePasses("Statement.all() [default safe integers]", async (t) => {
-  const db = t.context.db;
-  db.defaultSafeIntegers();
-  const stmt = db.prepare("SELECT * FROM users");
-  const expected = [
-    [1n, "Alice", "alice@example.org"],
-    [2n, "Bob", "bob@example.com"],
-  ];
-  t.deepEqual(stmt.raw().all(), expected);
-});
+dualTest.both(
+  "Statement.raw() [passing false should disable raw mode]",
+  async (t) => {
+    const db = t.context.db;
 
-dualTest.onlySqlitePasses("Statement.all() [statement safe integers]", async (t) => {
-  const db = t.context.db;
-  const stmt = db.prepare("SELECT * FROM users");
-  stmt.safeIntegers();
-  const expected = [
-    [1n, "Alice", "alice@example.org"],
-    [2n, "Bob", "bob@example.com"],
-  ];
-  t.deepEqual(stmt.raw().all(), expected);
-});
+    const stmt = db.prepare("SELECT * FROM users");
+    const expected = [
+      { id: 1, name: "Alice", email: "alice@example.org" },
+      { id: 2, name: "Bob", email: "bob@example.com" },
+    ];
+    t.deepEqual(stmt.raw(false).all(), expected);
+  },
+);
+
+dualTest.both(
+  "Statement.pluck() [passing false should disable pluck mode]",
+  async (t) => {
+    const db = t.context.db;
+
+    const stmt = db.prepare("SELECT * FROM users");
+    const expected = [
+      { id: 1, name: "Alice", email: "alice@example.org" },
+      { id: 2, name: "Bob", email: "bob@example.com" },
+    ];
+    t.deepEqual(stmt.pluck(false).all(), expected);
+  },
+);
+
+dualTest.onlySqlitePasses(
+  "Statement.all() [default safe integers]",
+  async (t) => {
+    const db = t.context.db;
+    db.defaultSafeIntegers();
+    const stmt = db.prepare("SELECT * FROM users");
+    const expected = [
+      [1n, "Alice", "alice@example.org"],
+      [2n, "Bob", "bob@example.com"],
+    ];
+    t.deepEqual(stmt.raw().all(), expected);
+  },
+);
+
+dualTest.onlySqlitePasses(
+  "Statement.all() [statement safe integers]",
+  async (t) => {
+    const db = t.context.db;
+    const stmt = db.prepare("SELECT * FROM users");
+    stmt.safeIntegers();
+    const expected = [
+      [1n, "Alice", "alice@example.org"],
+      [2n, "Bob", "bob@example.com"],
+    ];
+    t.deepEqual(stmt.raw().all(), expected);
+  },
+);
 
 dualTest.onlySqlitePasses("Statement.raw() [failure]", async (t) => {
   const db = t.context.db;

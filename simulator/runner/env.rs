@@ -99,6 +99,8 @@ impl SimulatorEnv {
                 self.opts.seed,
                 self.opts.page_size,
                 self.opts.latency_probability,
+                self.opts.min_tick,
+                self.opts.max_tick,
             )
             .unwrap(),
         );
@@ -245,10 +247,20 @@ impl SimulatorEnv {
             latency_probability: cli_opts.latency_probability,
             experimental_mvcc: cli_opts.experimental_mvcc,
             experimental_indexes: cli_opts.experimental_indexes,
+            min_tick: cli_opts.min_tick,
+            max_tick: cli_opts.max_tick,
         };
 
-        let io =
-            Arc::new(SimulatorIO::new(seed, opts.page_size, cli_opts.latency_probability).unwrap());
+        let io = Arc::new(
+            SimulatorIO::new(
+                seed,
+                opts.page_size,
+                cli_opts.latency_probability,
+                cli_opts.min_tick,
+                cli_opts.max_tick,
+            )
+            .unwrap(),
+        );
 
         // Remove existing database file if it exists
         let db_path = paths.db(&simulation_type, &SimulationPhase::Test);
@@ -407,6 +419,8 @@ pub(crate) struct SimulatorOpts {
     pub(crate) latency_probability: usize,
     pub(crate) experimental_mvcc: bool,
     pub(crate) experimental_indexes: bool,
+    pub min_tick: u64,
+    pub max_tick: u64,
 }
 
 #[derive(Debug, Clone)]

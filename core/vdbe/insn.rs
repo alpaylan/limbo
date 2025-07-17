@@ -800,7 +800,7 @@ pub enum Insn {
     Copy {
         src_reg: usize,
         dst_reg: usize,
-        amount: usize, // 0 amount means we include src_reg, dst_reg..=dst_reg+amount = src_reg..=src_reg+amount
+        extra_amount: usize, // 0 extra_amount means we include src_reg, dst_reg..=dst_reg+amount = src_reg..=src_reg+amount
     },
 
     /// Allocate a new b-tree.

@@ -26,8 +26,7 @@ pub static HOME_DIR: LazyLock<PathBuf> =
 pub static HISTORY_FILE: LazyLock<PathBuf> = LazyLock::new(|| HOME_DIR.join(".limbo_history"));
 
 fn main() -> anyhow::Result<()> {
-    let mut app = app::Limbo::new()?;
-    let _guard = app.init_tracing()?;
+    let (mut app, _guard) = app::Limbo::new()?;
 
     if std::io::IsTerminal::is_terminal(&std::io::stdin()) {
         let mut rl = Editor::with_config(rustyline_config())?;

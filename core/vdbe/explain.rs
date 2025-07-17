@@ -1230,12 +1230,12 @@ pub fn insn_to_str(
             Insn::Copy {
                 src_reg,
                 dst_reg,
-                amount,
+                extra_amount,
             } => (
                 "Copy",
                 *src_reg as i32,
                 *dst_reg as i32,
-                *amount as i32,
+                *extra_amount as i32,
                 Value::build_text(""),
                 0,
                 format!("r[{dst_reg}]=r[{src_reg}]"),

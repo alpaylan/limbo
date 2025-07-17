@@ -60,10 +60,8 @@ use crate::storage::btree::{payload_overflow_threshold_max, payload_overflow_thr
 use crate::storage::buffer_pool::BufferPool;
 use crate::storage::database::DatabaseStorage;
 use crate::storage::pager::Pager;
-use crate::types::{
-    ImmutableRecord, RawSlice, RefValue, SerialType, SerialTypeKind, TextRef, TextSubtype,
-};
-use crate::{File, Result, WalFileShared};
+use crate::types::{RawSlice, RefValue, SerialType, SerialTypeKind, TextRef, TextSubtype};
+use crate::{turso_assert, File, Result, WalFileShared};
 use std::cell::{RefCell, UnsafeCell};
 use std::collections::HashMap;
 use std::mem::MaybeUninit;
@@ -85,10 +83,10 @@ pub const MIN_PAGE_CACHE_SIZE: usize = 10;
 pub const MIN_PAGE_SIZE: u32 = 512;
 
 /// The maximum page size in bytes.
-const MAX_PAGE_SIZE: u32 = 65536;
+pub const MAX_PAGE_SIZE: u32 = 65536;
 
 /// The default page size in bytes.
-pub const DEFAULT_PAGE_SIZE: u16 = 4096;
+pub const DEFAULT_PAGE_SIZE: u32 = 4096;
 
 pub const DATABASE_HEADER_PAGE_ID: usize = 1;
 
@@ -253,7 +251,7 @@ impl Default for DatabaseHeader {
     fn default() -> Self {
         Self {
             magic: *b"SQLite format 3\0",
-            page_size: DEFAULT_PAGE_SIZE,
+            page_size: DEFAULT_PAGE_SIZE as u16,
             write_version: 2,
             read_version: 2,
             reserved_space: 0,
@@ -281,7 +279,7 @@ impl Default for DatabaseHeader {
 
 impl DatabaseHeader {
     pub fn update_page_size(&mut self, size: u32) {
-        if !(MIN_PAGE_SIZE..=MAX_PAGE_SIZE).contains(&size) || (size & (size - 1) != 0) {
+        if !is_valid_page_size(size) {
             return;
         }
 
@@ -299,6 +297,10 @@ impl DatabaseHeader {
             self.page_size as u32
         }
     }
+}
+
+pub fn is_valid_page_size(size: u32) -> bool {
+    (MIN_PAGE_SIZE..=MAX_PAGE_SIZE).contains(&size) && (size & (size - 1)) == 0
 }
 
 pub fn write_header_to_buf(buf: &mut [u8], header: &DatabaseHeader) {
@@ -719,7 +721,7 @@ impl PageContent {
     }
 }
 
-#[instrument(skip_all, level = Level::INFO)]
+#[instrument(skip_all, level = Level::DEBUG)]
 pub fn begin_read_page(
     db_file: Arc<dyn DatabaseStorage>,
     buffer_pool: Arc<BufferPool>,
@@ -734,7 +736,12 @@ pub fn begin_read_page(
     });
     #[allow(clippy::arc_with_non_send_sync)]
     let buf = Arc::new(RefCell::new(Buffer::new(buf, drop_fn)));
-    let complete = Box::new(move |buf: Arc<RefCell<Buffer>>| {
+    let complete = Box::new(move |buf: Arc<RefCell<Buffer>>, bytes_read: i32| {
+        let buf_len = buf.borrow().len();
+        turso_assert!(
+            bytes_read == buf_len as i32,
+            "read({bytes_read}) != expected({buf_len})"
+        );
         let page = page.clone();
         if finish_read_page(page_idx, buf, page.clone()).is_err() {
             page.set_error();
@@ -745,12 +752,13 @@ pub fn begin_read_page(
     Ok(())
 }
 
+#[instrument(skip_all, level = Level::INFO)]
 pub fn finish_read_page(
     page_idx: usize,
     buffer_ref: Arc<RefCell<Buffer>>,
     page: PageRef,
 ) -> Result<()> {
-    tracing::trace!("finish_read_btree_page(page_idx = {})", page_idx);
+    tracing::trace!(page_idx);
     let pos = if page_idx == DATABASE_HEADER_PAGE_ID {
         DATABASE_HEADER_SIZE
     } else {
@@ -766,7 +774,7 @@ pub fn finish_read_page(
     Ok(())
 }
 
-#[instrument(skip_all, level = Level::INFO)]
+#[instrument(skip_all, level = Level::DEBUG)]
 pub fn begin_write_btree_page(
     pager: &Pager,
     page: &PageRef,
@@ -795,9 +803,10 @@ pub fn begin_write_btree_page(
             *clone_counter.borrow_mut() -= 1;
 
             page_finish.clear_dirty();
-            if bytes_written < buf_len as i32 {
-                tracing::error!("wrote({bytes_written}) less than expected({buf_len})");
-            }
+            turso_assert!(
+                bytes_written == buf_len as i32,
+                "wrote({bytes_written}) != expected({buf_len})"
+            );
         })
     };
     let c = Completion::new(CompletionType::Write(WriteCompletion::new(write_complete)));
@@ -809,7 +818,7 @@ pub fn begin_write_btree_page(
     res
 }
 
-#[instrument(skip_all, level = Level::INFO)]
+#[instrument(skip_all, level = Level::DEBUG)]
 pub fn begin_sync(db_file: Arc<dyn DatabaseStorage>, syncing: Rc<RefCell<bool>>) -> Result<()> {
     assert!(!*syncing.borrow());
     *syncing.borrow_mut() = true;
@@ -971,6 +980,7 @@ fn read_payload(unread: &'static [u8], payload_size: usize) -> (&'static [u8], O
 }
 
 #[inline(always)]
+#[allow(dead_code)]
 pub fn validate_serial_type(value: u64) -> Result<()> {
     if !SerialType::u64_is_valid_serial_type(value) {
         crate::bail_corrupt_error!("Invalid serial type: {}", value);
@@ -1051,50 +1061,6 @@ impl<T: Default + Copy, const N: usize> Iterator for SmallVecIter<'_, T, N> {
         self.pos += 1;
         Some(next)
     }
-}
-
-pub fn read_record(payload: &[u8], reuse_immutable: &mut ImmutableRecord) -> Result<()> {
-    // Let's clear previous use
-    reuse_immutable.invalidate();
-    // Copy payload to ImmutableRecord in order to make RefValue that point to this new buffer.
-    // By reusing this immutable record we make it less allocation expensive.
-    reuse_immutable.start_serialization(payload);
-
-    let mut pos = 0;
-    let (header_size, nr) = read_varint(payload)?;
-    assert!((header_size as usize) >= nr);
-    let mut header_size = (header_size as usize) - nr;
-    pos += nr;
-
-    let mut serial_types = SmallVec::<u64, 64>::new();
-    while header_size > 0 {
-        let (serial_type, nr) = read_varint(&reuse_immutable.get_payload()[pos..])?;
-        validate_serial_type(serial_type)?;
-        serial_types.push(serial_type);
-        pos += nr;
-        assert!(header_size >= nr);
-        header_size -= nr;
-    }
-
-    for &serial_type in &serial_types.data[..serial_types.len.min(serial_types.data.len())] {
-        let (value, n) = read_value(&reuse_immutable.get_payload()[pos..], unsafe {
-            serial_type.assume_init().try_into()?
-        })?;
-        pos += n;
-        reuse_immutable.add_value(value);
-    }
-    if let Some(extra) = serial_types.extra_data.as_ref() {
-        for serial_type in extra {
-            let (value, n) = read_value(
-                &reuse_immutable.get_payload()[pos..],
-                (*serial_type).try_into()?,
-            )?;
-            pos += n;
-            reuse_immutable.add_value(value);
-        }
-    }
-
-    Ok(())
 }
 
 /// Reads a value that might reference the buffer it is reading from. Be sure to store RefValue with the buffer
@@ -1205,20 +1171,73 @@ pub fn read_value(buf: &[u8], serial_type: SerialType) -> Result<(RefValue, usiz
                     content_size
                 );
             }
-            let slice = if content_size == 0 {
-                RawSlice::new(std::ptr::null(), 0)
-            } else {
-                let ptr = &buf[0] as *const u8;
-                RawSlice::new(ptr, content_size)
-            };
+
             Ok((
-                RefValue::Text(TextRef {
-                    value: slice,
-                    subtype: TextSubtype::Text,
-                }),
+                RefValue::Text(TextRef::create_from(
+                    &buf[..content_size],
+                    TextSubtype::Text,
+                )),
                 content_size,
             ))
         }
+    }
+}
+
+#[inline(always)]
+pub fn read_integer(buf: &[u8], serial_type: u8) -> Result<i64> {
+    match serial_type {
+        1 => {
+            if buf.is_empty() {
+                crate::bail_corrupt_error!("Invalid 1-byte int");
+            }
+            Ok(buf[0] as i8 as i64)
+        }
+        2 => {
+            if buf.len() < 2 {
+                crate::bail_corrupt_error!("Invalid 2-byte int");
+            }
+            Ok(i16::from_be_bytes([buf[0], buf[1]]) as i64)
+        }
+        3 => {
+            if buf.len() < 3 {
+                crate::bail_corrupt_error!("Invalid 3-byte int");
+            }
+            let sign_extension = if buf[0] <= 0x7F { 0 } else { 0xFF };
+            Ok(i32::from_be_bytes([sign_extension, buf[0], buf[1], buf[2]]) as i64)
+        }
+        4 => {
+            if buf.len() < 4 {
+                crate::bail_corrupt_error!("Invalid 4-byte int");
+            }
+            Ok(i32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]) as i64)
+        }
+        5 => {
+            if buf.len() < 6 {
+                crate::bail_corrupt_error!("Invalid 6-byte int");
+            }
+            let sign_extension = if buf[0] <= 0x7F { 0 } else { 0xFF };
+            Ok(i64::from_be_bytes([
+                sign_extension,
+                sign_extension,
+                buf[0],
+                buf[1],
+                buf[2],
+                buf[3],
+                buf[4],
+                buf[5],
+            ]))
+        }
+        6 => {
+            if buf.len() < 8 {
+                crate::bail_corrupt_error!("Invalid 8-byte int");
+            }
+            Ok(i64::from_be_bytes([
+                buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7],
+            ]))
+        }
+        8 => Ok(0),
+        9 => Ok(1),
+        _ => crate::bail_corrupt_error!("Invalid serial type for integer"),
     }
 }
 
@@ -1317,9 +1336,14 @@ pub fn read_entire_wal_dumb(file: &Arc<dyn File>) -> Result<Arc<UnsafeCell<WalFi
     }));
     let wal_file_shared_for_completion = wal_file_shared_ret.clone();
 
-    let complete: Box<Complete> = Box::new(move |buf: Arc<RefCell<Buffer>>| {
+    let complete: Box<Complete> = Box::new(move |buf: Arc<RefCell<Buffer>>, bytes_read: i32| {
         let buf = buf.borrow();
         let buf_slice = buf.as_slice();
+        turso_assert!(
+            bytes_read == buf_slice.len() as i32,
+            "read({bytes_read}) != expected({})",
+            buf_slice.len()
+        );
         let mut header_locked = header.lock();
         // Read header
         header_locked.magic =
@@ -1467,7 +1491,7 @@ pub fn read_entire_wal_dumb(file: &Arc<dyn File>) -> Result<Arc<UnsafeCell<WalFi
         buf_for_pread,
         complete,
     )));
-    file.pread(0, c)?;
+    file.pread(0, c.into())?;
 
     Ok(wal_file_shared_ret)
 }
@@ -1476,7 +1500,7 @@ pub fn begin_read_wal_frame(
     io: &Arc<dyn File>,
     offset: usize,
     buffer_pool: Arc<BufferPool>,
-    complete: Box<dyn Fn(Arc<RefCell<Buffer>>)>,
+    complete: Box<dyn Fn(Arc<RefCell<Buffer>>, i32)>,
 ) -> Result<Arc<Completion>> {
     tracing::trace!("begin_read_wal_frame(offset={})", offset);
     let buf = buffer_pool.get();
@@ -1487,11 +1511,11 @@ pub fn begin_read_wal_frame(
     let buf = Arc::new(RefCell::new(Buffer::new(buf, drop_fn)));
     #[allow(clippy::arc_with_non_send_sync)]
     let c = Completion::new(CompletionType::Read(ReadCompletion::new(buf, complete)));
-    let c = io.pread(offset, c)?;
+    let c = io.pread(offset, c.into())?;
     Ok(c)
 }
 
-#[instrument(err,skip(io, page, write_counter, wal_header, checksums), level = Level::INFO)]
+#[instrument(err,skip(io, page, write_counter, wal_header, checksums), level = Level::DEBUG)]
 #[allow(clippy::too_many_arguments)]
 pub fn begin_write_wal_frame(
     io: &Arc<dyn File>,
@@ -1573,14 +1597,15 @@ pub fn begin_write_wal_frame(
             *clone_counter.borrow_mut() -= 1;
 
             page_finish.clear_dirty();
-            if bytes_written < buf_len as i32 {
-                tracing::error!("wrote({bytes_written}) less than expected({buf_len})");
-            }
+            turso_assert!(
+                bytes_written == buf_len as i32,
+                "wrote({bytes_written}) != expected({buf_len})"
+            );
         })
     };
     #[allow(clippy::arc_with_non_send_sync)]
     let c = Completion::new(CompletionType::Write(WriteCompletion::new(write_complete)));
-    let res = io.pwrite(offset, buffer.clone(), c);
+    let res = io.pwrite(offset, buffer.clone(), c.into());
     if res.is_err() {
         // If we do not reduce the counter here on error, we incur an infinite loop when cacheflushing
         *write_counter.borrow_mut() -= 1;
@@ -1595,7 +1620,7 @@ pub fn begin_write_wal_header(io: &Arc<dyn File>, header: &WalHeader) -> Result<
     let buffer = {
         let drop_fn = Rc::new(|_buf| {});
 
-        let mut buffer = Buffer::allocate(512, drop_fn);
+        let mut buffer = Buffer::allocate(WAL_HEADER_SIZE, drop_fn);
         let buf = buffer.as_mut_slice();
 
         buf[0..4].copy_from_slice(&header.magic.to_be_bytes());
@@ -1613,16 +1638,15 @@ pub fn begin_write_wal_header(io: &Arc<dyn File>, header: &WalHeader) -> Result<
 
     let write_complete = {
         Box::new(move |bytes_written: i32| {
-            if bytes_written < WAL_HEADER_SIZE as i32 {
-                tracing::error!(
-                    "wal header wrote({bytes_written}) less than expected({WAL_HEADER_SIZE})"
-                );
-            }
+            turso_assert!(
+                bytes_written == WAL_HEADER_SIZE as i32,
+                "wal header wrote({bytes_written}) != expected({WAL_HEADER_SIZE})"
+            );
         })
     };
     #[allow(clippy::arc_with_non_send_sync)]
     let c = Completion::new(CompletionType::Write(WriteCompletion::new(write_complete)));
-    io.pwrite(0, buffer.clone(), c)?;
+    io.pwrite(0, buffer.clone(), c.into())?;
     Ok(())
 }
 

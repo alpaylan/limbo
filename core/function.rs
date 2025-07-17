@@ -156,6 +156,7 @@ pub enum VectorFunc {
     Vector64,
     VectorExtract,
     VectorDistanceCos,
+    VectorDistanceEuclidean,
 }
 
 impl VectorFunc {
@@ -172,6 +173,8 @@ impl Display for VectorFunc {
             Self::Vector64 => "vector64".to_string(),
             Self::VectorExtract => "vector_extract".to_string(),
             Self::VectorDistanceCos => "vector_distance_cos".to_string(),
+            // We use `distance_l2` to reduce user input
+            Self::VectorDistanceEuclidean => "vector_distance_l2".to_string(),
         };
         write!(f, "{str}")
     }
@@ -318,6 +321,8 @@ pub enum ScalarFunc {
     Likely,
     TimeDiff,
     Likelihood,
+    TableColumnsJsonArray,
+    BinRecordJsonObject,
 }
 
 impl ScalarFunc {
@@ -375,6 +380,8 @@ impl ScalarFunc {
             ScalarFunc::Likely => true,
             ScalarFunc::TimeDiff => false,
             ScalarFunc::Likelihood => true,
+            ScalarFunc::TableColumnsJsonArray => true, // while columns of the table can change with DDL statements, within single query plan it's static
+            ScalarFunc::BinRecordJsonObject => true,
         }
     }
 }
@@ -434,6 +441,8 @@ impl Display for ScalarFunc {
             Self::Likely => "likely".to_string(),
             Self::TimeDiff => "timediff".to_string(),
             Self::Likelihood => "likelihood".to_string(),
+            Self::TableColumnsJsonArray => "table_columns_json_array".to_string(),
+            Self::BinRecordJsonObject => "bin_record_json_object".to_string(),
         };
         write!(f, "{str}")
     }
@@ -777,6 +786,8 @@ impl Func {
             "unhex" => Ok(Self::Scalar(ScalarFunc::Unhex)),
             "zeroblob" => Ok(Self::Scalar(ScalarFunc::ZeroBlob)),
             "soundex" => Ok(Self::Scalar(ScalarFunc::Soundex)),
+            "table_columns_json_array" => Ok(Self::Scalar(ScalarFunc::TableColumnsJsonArray)),
+            "bin_record_json_object" => Ok(Self::Scalar(ScalarFunc::BinRecordJsonObject)),
             "acos" => Ok(Self::Math(MathFunc::Acos)),
             "acosh" => Ok(Self::Math(MathFunc::Acosh)),
             "asin" => Ok(Self::Math(MathFunc::Asin)),
@@ -815,6 +826,7 @@ impl Func {
             "vector64" => Ok(Self::Vector(VectorFunc::Vector64)),
             "vector_extract" => Ok(Self::Vector(VectorFunc::VectorExtract)),
             "vector_distance_cos" => Ok(Self::Vector(VectorFunc::VectorDistanceCos)),
+            "vector_distance_l2" => Ok(Self::Vector(VectorFunc::VectorDistanceEuclidean)),
             _ => crate::bail_parse_error!("no such function: {}", name),
         }
     }

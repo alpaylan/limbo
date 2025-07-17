@@ -218,10 +218,10 @@ impl Display for InteractionPlan {
                         match interaction {
                             Interaction::Query(query) => writeln!(f, "{query};")?,
                             Interaction::Assumption(assumption) => {
-                                writeln!(f, "-- ASSUME {};", assumption.message)?
+                                writeln!(f, "-- ASSUME {};", assumption.name)?
                             }
                             Interaction::Assertion(assertion) => {
-                                writeln!(f, "-- ASSERT {};", assertion.message)?
+                                writeln!(f, "-- ASSERT {};", assertion.name)?
                             }
                             Interaction::Fault(fault) => writeln!(f, "-- FAULT '{fault}';")?,
                             Interaction::FsyncQuery(query) => {
@@ -298,8 +298,8 @@ impl Display for Interaction {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Query(query) => write!(f, "{query}"),
-            Self::Assumption(assumption) => write!(f, "ASSUME {}", assumption.message),
-            Self::Assertion(assertion) => write!(f, "ASSERT {}", assertion.message),
+            Self::Assumption(assumption) => write!(f, "ASSUME {}", assumption.name),
+            Self::Assertion(assertion) => write!(f, "ASSERT {}", assertion.name),
             Self::Fault(fault) => write!(f, "FAULT '{fault}'"),
             Self::FsyncQuery(query) => write!(f, "{query}"),
             Self::FaultyQuery(query) => write!(f, "{query}; -- FAULTY QUERY"),
@@ -307,7 +307,7 @@ impl Display for Interaction {
     }
 }
 
-type AssertionFunc = dyn Fn(&Vec<ResultSet>, &mut SimulatorEnv) -> Result<bool>;
+type AssertionFunc = dyn Fn(&Vec<ResultSet>, &mut SimulatorEnv) -> Result<Result<(), String>>;
 
 enum AssertionAST {
     Pick(),
@@ -315,13 +315,13 @@ enum AssertionAST {
 
 pub(crate) struct Assertion {
     pub(crate) func: Box<AssertionFunc>,
-    pub(crate) message: String,
+    pub(crate) name: String, // For display purposes in the plan
 }
 
 impl Debug for Assertion {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Assertion")
-            .field("message", &self.message)
+            .field("name", &self.name)
             .finish()
     }
 }
@@ -496,13 +496,14 @@ impl Interaction {
             Self::Assertion(assertion) => {
                 let result = assertion.func.as_ref()(stack, env);
                 match result {
-                    Ok(true) => Ok(()),
-                    Ok(false) => Err(turso_core::LimboError::InternalError(
-                        assertion.message.clone(),
-                    )),
+                    Ok(Ok(())) => Ok(()),
+                    Ok(Err(message)) => Err(turso_core::LimboError::InternalError(format!(
+                        "Assertion '{}' failed: {}",
+                        assertion.name, message
+                    ))),
                     Err(err) => Err(turso_core::LimboError::InternalError(format!(
-                        "{}. Inner error: {}",
-                        assertion.message, err
+                        "Assertion '{}' execution error: {}",
+                        assertion.name, err
                     ))),
                 }
             }
@@ -521,13 +522,14 @@ impl Interaction {
             Self::Assumption(assumption) => {
                 let result = assumption.func.as_ref()(stack, env);
                 match result {
-                    Ok(true) => Ok(()),
-                    Ok(false) => Err(turso_core::LimboError::InternalError(
-                        assumption.message.clone(),
-                    )),
+                    Ok(Ok(())) => Ok(()),
+                    Ok(Err(message)) => Err(turso_core::LimboError::InternalError(format!(
+                        "Assumption '{}' failed: {}",
+                        assumption.name, message
+                    ))),
                     Err(err) => Err(turso_core::LimboError::InternalError(format!(
-                        "{}. Inner error: {}",
-                        assumption.message, err
+                        "Assumption '{}' execution error: {}",
+                        assumption.name, err
                     ))),
                 }
             }
