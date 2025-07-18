@@ -93,11 +93,11 @@ def main():
         commit_txt = os.path.join(issue_dir, 'commit.txt')
         try:
             commit = open(commit_txt, 'r', encoding='utf-8').read().strip()
+            known_msgs = commit_map.get(commit, [])
         except FileNotFoundError:
             print(f"⚠️  Warning: no commit.txt for issue {issue}, skipping")
-            continue
+            known_msgs = issue_map.get(issue, [])
 
-        known_msgs = commit_map.get(commit, [])
 
         # initialize counts
         counts = {
@@ -110,7 +110,7 @@ def main():
         # iterate all run-* subdirectories
         for entry in os.listdir(issue_dir):
             run_dir = os.path.join(issue_dir, entry)
-            if not os.path.isdir(run_dir) or not entry.startswith('run_'): # alp change to 'iter-' 
+            if not os.path.isdir(run_dir) or not entry.startswith('iter-'): # alp change to 'iter-' 
                 continue
 
             stdout_f    = os.path.join(run_dir, 'stdout.txt')
