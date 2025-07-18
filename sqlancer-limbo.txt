@@ -1,0 +1,254 @@
+Issue 2047:
+TP_known: 53, TP_unknown: 0, FP: 47, Neg: 0
+Known counts: {'update c0 = c0': 39, 'commit transaction': 9, 'like on non-text': 2, 'optimize no rewrite': 2, 'id rewrite as col': 1}
+Issue 2024:
+TP_known: 50, TP_unknown: 0, FP: 50, Neg: 0
+Known counts: {'update c0 = c0': 42, 'commit transaction': 4, 'like on non-text': 1, 'optimize no rewrite': 1, 'id rewrite as col': 2}
+Issue 1734:
+TP_known: 56, TP_unknown: 0, FP: 44, Neg: 0
+Known counts: {'update c0 = c0': 44, 'commit transaction': 8, 'like on non-text': 1, 'optimize no rewrite': 2, 'id rewrite as col': 1}
+Issue 924:
+TP_known: 32, TP_unknown: 0, FP: 68, Neg: 0
+Known counts: {'update c0 = c0': 13, 'invalid float': 19}
+Issue 1815:
+TP_known: 55, TP_unknown: 1, FP: 44, Neg: 0
+Known counts: {'update c0 = c0': 40, 'commit transaction': 13, 'like on non-text': 1, 'optimize no rewrite': 1}
+Issue 2026:
+TP_known: 51, TP_unknown: 0, FP: 49, Neg: 0
+Known counts: {'update c0 = c0': 39, 'commit transaction': 9, 'like on non-text': 1, 'id rewrite as col': 2}
+Issue 2075:
+TP_known: 52, TP_unknown: 0, FP: 48, Neg: 0
+Known counts: {'update c0 = c0': 41, 'commit transaction': 9, 'optimize no rewrite': 2}
+Issue 2088:
+TP_known: 51, TP_unknown: 0, FP: 49, Neg: 0
+Known counts: {'update c0 = c0': 43, 'commit transaction': 8}
+Issue 1203:
+TP_known: 50, TP_unknown: 0, FP: 50, Neg: 0
+Known counts: {'update c0 = c0': 26, 'commit transaction': 1, 'invalid float': 23}
+Issue 2074:
+TP_known: 50, TP_unknown: 0, FP: 50, Neg: 0
+Known counts: {'update c0 = c0': 34, 'commit transaction': 16}
+Issue 2106:
+TP_known: 53, TP_unknown: 1, FP: 46, Neg: 0
+Known counts: {'update c0 = c0': 40, 'commit transaction': 11, 'like on non-text': 2}
+Issue 1709:
+TP_known: 63, TP_unknown: 0, FP: 37, Neg: 0
+Known counts: {'update c0 = c0': 52, 'commit transaction': 9, 'like on non-text': 1, 'id rewrite as col': 1}
+Issue 1731:
+TP_known: 54, TP_unknown: 0, FP: 46, Neg: 0
+Known counts: {'update c0 = c0': 45, 'commit transaction': 6, 'optimize no rewrite': 3}
+Issue 1991:
+TP_known: 60, TP_unknown: 0, FP: 40, Neg: 0
+Known counts: {'update c0 = c0': 48, 'commit transaction': 10, 'like on non-text': 1, 'optimize no rewrite': 1}
+Issue 1737:
+TP_known: 51, TP_unknown: 0, FP: 49, Neg: 0
+Known counts: {'update c0 = c0': 40, 'commit transaction': 7, 'like on non-text': 1, 'optimize no rewrite': 1, 'id rewrite as col': 2}
+Issue 1040:
+TP_known: 22, TP_unknown: 0, FP: 78, Neg: 0
+Known counts: {'update c0 = c0': 9, 'commit transaction': 2, 'invalid float': 11}
+Issue 1629:
+TP_known: 46, TP_unknown: 0, FP: 54, Neg: 0
+Known counts: {'update c0 = c0': 34, 'commit transaction': 11, 'optimize no rewrite': 1}
+Issue 1818:
+TP_known: 51, TP_unknown: 0, FP: 49, Neg: 0
+Known counts: {'update c0 = c0': 37, 'commit transaction': 10, 'like on non-text': 2, 'optimize no rewrite': 2}
+
+Unknown issues:
+
+Manual inspections needed:
+Issue 1815, run iter-64
+Log: -- Time: 2025/07/17 14:07:28
+-- Database: database0
+-- Database version: 
+-- seed value: 1752775648261
+CREATE TABLE IF NOT EXISTS  t0 (c0 TEXT NOT NULL , c1 INT , c2 TEXT );
+CREATE TABLE IF NOT EXISTS t1 (c0 TEXT );
+CREATE TABLE IF NOT EXISTS  t2 (c0 REAL NOT NULL , c1 INT NOT NULL , c2 REAL );
+INSERT INTO t1(c0) VALUES ('1417318209');
+INSERT INTO t1 VALUES (0.18270199688575206), (0.18270199688575206), (x'');
+
+INSERT INTO t0(c2, c0) VALUES ('edi]', 0.14076170741785665), ('\N', x'848b33f4'), ('0.14076170741785665', x'');
+
+stdout: CREATE TABLE IF NOT EXISTS  t0 (c0 TEXT NOT NULL , c1 INT , c2 TEXT );
+CREATE TABLE IF NOT EXISTS t1 (c0 TEXT );
+CREATE TABLE IF NOT EXISTS  t2 (c0 REAL NOT NULL , c1 INT NOT NULL , c2 REAL );
+INSERT INTO t1(c0) VALUES ('1417318209');
+INSERT INTO t1 VALUES (0.18270199688575206), (0.18270199688575206), (x'');
+INSERT INTO t0(c2, c0) VALUES ('edi]', 0.14076170741785665), ('\N', x'848b33f4'), ('0.14076170741785665', x'');
+something bad happened
+
+stderr: java.lang.AssertionError: INSERT INTO t0(c2, c0) VALUES ('edi]', 0.14076170741785665), ('\N', x'848b33f4'), ('0.14076170741785665', x'');
+	at sqlancer.common.query.SQLQueryAdapter.checkException(SQLQueryAdapter.java:124)
+	at sqlancer.common.query.SQLQueryAdapter.execute(SQLQueryAdapter.java:106)
+	at sqlancer.Main$QueryManager.execute(Main.java:394)
+	at sqlancer.GlobalState.executeStatement(GlobalState.java:108)
+	at sqlancer.StatementExecutor.executeStatements(StatementExecutor.java:70)
+	at sqlancer.limbo.LimboProvider.generateDatabase(LimboProvider.java:159)
+	at sqlancer.limbo.LimboProvider.generateDatabase(LimboProvider.java:1)
+	at sqlancer.ProviderAdapter.generateAndTestDatabase(ProviderAdapter.java:56)
+	at sqlancer.Main$DBMSExecutor.run(Main.java:507)
+	at sqlancer.Main$2.run(Main.java:814)
+	at sqlancer.Main$2.runThread(Main.java:781)
+	at sqlancer.Main$2.run(Main.java:768)
+	at java.base/java.util.concurrent.ThreadPoolExecutor.runWorker(ThreadPoolExecutor.java:1144)
+	at java.base/java.util.concurrent.ThreadPoolExecutor$Worker.run(ThreadPoolExecutor.java:642)
+	at java.base/java.lang.Thread.run(Thread.java:1589)
+Caused by: java.sql.SQLException: step() returned invalid result: LimboStepResult{stepResultName=ERROR, result=null}
+	at tech.turso.core.LimboResultSet.next(LimboResultSet.java:90)
+	at tech.turso.core.LimboStatement.execute(LimboStatement.java:45)
+	at tech.turso.jdbc4.JDBC4Statement.lambda$execute$1(JDBC4Statement.java:175)
+	at tech.turso.jdbc4.JDBC4Statement.withConnectionTimeout(JDBC4Statement.java:371)
+	at tech.turso.jdbc4.JDBC4Statement.execute(JDBC4Statement.java:169)
+	at sqlancer.common.query.SQLQueryAdapter.execute(SQLQueryAdapter.java:100)
+	... 13 more
+--java.lang.AssertionError: INSERT INTO t0(c2, c0) VALUES ('edi]', 0.14076170741785665), ('\N', x'848b33f4'), ('0.14076170741785665', x'');
+--	at sqlancer.common.query.SQLQueryAdapter.checkException(SQLQueryAdapter.java:124)
+--	at sqlancer.common.query.SQLQueryAdapter.execute(SQLQueryAdapter.java:106)
+--	at sqlancer.Main$QueryManager.execute(Main.java:394)
+--	at sqlancer.GlobalState.executeStatement(GlobalState.java:108)
+--	at sqlancer.StatementExecutor.executeStatements(StatementExecutor.java:70)
+--	at sqlancer.limbo.LimboProvider.generateDatabase(LimboProvider.java:159)
+--	at sqlancer.limbo.LimboProvider.generateDatabase(LimboProvider.java:1)
+--	at sqlancer.ProviderAdapter.generateAndTestDatabase(ProviderAdapter.java:56)
+--	at sqlancer.Main$DBMSExecutor.run(Main.java:507)
+--	at sqlancer.Main$2.run(Main.java:814)
+--	at sqlancer.Main$2.runThread(Main.java:781)
+--	at sqlancer.Main$2.run(Main.java:768)
+--	at java.base/java.util.concurrent.ThreadPoolExecutor.runWorker(ThreadPoolExecutor.java:1144)
+--	at java.base/java.util.concurrent.ThreadPoolExecutor$Worker.run(ThreadPoolExecutor.java:642)
+--	at java.base/java.lang.Thread.run(Thread.java:1589)
+--Caused by: java.sql.SQLException: step() returned invalid result: LimboStepResult{stepResultName=ERROR, result=null}
+--	at tech.turso.core.LimboResultSet.next(LimboResultSet.java:90)
+--	at tech.turso.core.LimboStatement.execute(LimboStatement.java:45)
+--	at tech.turso.jdbc4.JDBC4Statement.lambda$execute$1(JDBC4Statement.java:175)
+--	at tech.turso.jdbc4.JDBC4Statement.withConnectionTimeout(JDBC4Statement.java:371)
+--	at tech.turso.jdbc4.JDBC4Statement.execute(JDBC4Statement.java:169)
+--	at sqlancer.common.query.SQLQueryAdapter.execute(SQLQueryAdapter.java:100)
+--	... 13 more
+--
+-- Time: 2025/07/17 14:07:28
+-- Database: database0
+-- Database version: 
+-- seed value: 1752775648261
+CREATE TABLE IF NOT EXISTS  t0 (c0 TEXT NOT NULL , c1 INT , c2 TEXT );
+CREATE TABLE IF NOT EXISTS t1 (c0 TEXT );
+CREATE TABLE IF NOT EXISTS  t2 (c0 REAL NOT NULL , c1 INT NOT NULL , c2 REAL );
+INSERT INTO t1(c0) VALUES ('1417318209');
+INSERT INTO t1 VALUES (0.18270199688575206), (0.18270199688575206), (x'');
+
+
+Run `./target/debug/tursodb < log.txt` to inspect manually.
+Issue 2106, run iter-13
+Log: -- Time: 2025/07/17 14:39:10
+-- Database: database0
+-- Database version: 
+-- seed value: 1752777550194
+CREATE TABLE IF NOT EXISTS t0 (c0 BLOB );
+CREATE TABLE IF NOT EXISTS t1 (c0 INTEGER );
+INSERT INTO t0 VALUES (0.174739462008348), (0.2905963829475091), (0.174739462008348);
+UPDATE t1 SET c0='-711559684';
+UPDATE t0 SET (c0)=('1366714048');
+UPDATE t1 SET c0=x'', c0='丏曀';
+CREATE TABLE IF NOT EXISTS t2 (c0 INTEGER NOT NULL , c1 REAL , c2 INT );
+INSERT INTO t1 VALUES (x'43a9'), (NULL), (NULL);
+UPDATE t2 SET c0='861359631';
+UPDATE t0 SET (c0)=(0.13174106120093187);
+CREATE TABLE IF NOT EXISTS t3 (c0 REAL , c1 INT , c2 TEXT );
+INSERT INTO t3(c1, c2) VALUES (0xffffffffd024e00e, '-2047932549');
+UPDATE t3 SET c1=NULL;
+INSERT INTO t2(c0) VALUES ('-2047932549');
+UPDATE t0 SET (c0)=(x'') WHERE IFNULL(DISTINCT ((t0.c0)||('')), t0.c0 COLLATE RTRIM);
+
+INSERT INTO t2(c2, c0) VALUES (0x65bfbbda, x'a73d'), (-711559684, '861359631'), (0x24d51db2, x'');
+
+stdout: CREATE TABLE IF NOT EXISTS t0 (c0 BLOB );
+CREATE TABLE IF NOT EXISTS t1 (c0 INTEGER );
+INSERT INTO t0 VALUES (0.174739462008348), (0.2905963829475091), (0.174739462008348);
+UPDATE t1 SET c0='-711559684';
+UPDATE t0 SET (c0)=('1366714048');
+UPDATE t1 SET c0=x'', c0='丏曀';
+CREATE TABLE IF NOT EXISTS t2 (c0 INTEGER NOT NULL , c1 REAL , c2 INT );
+INSERT INTO t1 VALUES (x'43a9'), (NULL), (NULL);
+UPDATE t2 SET c0='861359631';
+UPDATE t0 SET (c0)=(0.13174106120093187);
+CREATE TABLE IF NOT EXISTS t3 (c0 REAL , c1 INT , c2 TEXT );
+INSERT INTO t3(c1, c2) VALUES (0xffffffffd024e00e, '-2047932549');
+UPDATE t3 SET c1=NULL;
+INSERT INTO t2(c0) VALUES ('-2047932549');
+UPDATE t0 SET (c0)=(x'') WHERE IFNULL(DISTINCT ((t0.c0)||('')), t0.c0 COLLATE RTRIM);
+INSERT INTO t2(c2, c0) VALUES (0x65bfbbda, x'a73d'), (-711559684, '861359631'), (0x24d51db2, x'');
+something bad happened
+
+stderr: java.lang.AssertionError: INSERT INTO t2(c2, c0) VALUES (0x65bfbbda, x'a73d'), (-711559684, '861359631'), (0x24d51db2, x'');
+	at sqlancer.common.query.SQLQueryAdapter.checkException(SQLQueryAdapter.java:124)
+	at sqlancer.common.query.SQLQueryAdapter.execute(SQLQueryAdapter.java:106)
+	at sqlancer.Main$QueryManager.execute(Main.java:394)
+	at sqlancer.GlobalState.executeStatement(GlobalState.java:108)
+	at sqlancer.StatementExecutor.executeStatements(StatementExecutor.java:70)
+	at sqlancer.limbo.LimboProvider.generateDatabase(LimboProvider.java:159)
+	at sqlancer.limbo.LimboProvider.generateDatabase(LimboProvider.java:1)
+	at sqlancer.ProviderAdapter.generateAndTestDatabase(ProviderAdapter.java:56)
+	at sqlancer.Main$DBMSExecutor.run(Main.java:507)
+	at sqlancer.Main$2.run(Main.java:814)
+	at sqlancer.Main$2.runThread(Main.java:781)
+	at sqlancer.Main$2.run(Main.java:768)
+	at java.base/java.util.concurrent.ThreadPoolExecutor.runWorker(ThreadPoolExecutor.java:1144)
+	at java.base/java.util.concurrent.ThreadPoolExecutor$Worker.run(ThreadPoolExecutor.java:642)
+	at java.base/java.lang.Thread.run(Thread.java:1589)
+Caused by: java.sql.SQLException: step() returned invalid result: tursoStepResult{stepResultName=ERROR, result=null}
+	at tech.turso.core.TursoResultSet.next(TursoResultSet.java:90)
+	at tech.turso.core.TursoStatement.execute(TursoStatement.java:46)
+	at tech.turso.jdbc4.JDBC4Statement.lambda$execute$1(JDBC4Statement.java:176)
+	at tech.turso.jdbc4.JDBC4Statement.withConnectionTimeout(JDBC4Statement.java:372)
+	at tech.turso.jdbc4.JDBC4Statement.execute(JDBC4Statement.java:170)
+	at sqlancer.common.query.SQLQueryAdapter.execute(SQLQueryAdapter.java:100)
+	... 13 more
+--java.lang.AssertionError: INSERT INTO t2(c2, c0) VALUES (0x65bfbbda, x'a73d'), (-711559684, '861359631'), (0x24d51db2, x'');
+--	at sqlancer.common.query.SQLQueryAdapter.checkException(SQLQueryAdapter.java:124)
+--	at sqlancer.common.query.SQLQueryAdapter.execute(SQLQueryAdapter.java:106)
+--	at sqlancer.Main$QueryManager.execute(Main.java:394)
+--	at sqlancer.GlobalState.executeStatement(GlobalState.java:108)
+--	at sqlancer.StatementExecutor.executeStatements(StatementExecutor.java:70)
+--	at sqlancer.limbo.LimboProvider.generateDatabase(LimboProvider.java:159)
+--	at sqlancer.limbo.LimboProvider.generateDatabase(LimboProvider.java:1)
+--	at sqlancer.ProviderAdapter.generateAndTestDatabase(ProviderAdapter.java:56)
+--	at sqlancer.Main$DBMSExecutor.run(Main.java:507)
+--	at sqlancer.Main$2.run(Main.java:814)
+--	at sqlancer.Main$2.runThread(Main.java:781)
+--	at sqlancer.Main$2.run(Main.java:768)
+--	at java.base/java.util.concurrent.ThreadPoolExecutor.runWorker(ThreadPoolExecutor.java:1144)
+--	at java.base/java.util.concurrent.ThreadPoolExecutor$Worker.run(ThreadPoolExecutor.java:642)
+--	at java.base/java.lang.Thread.run(Thread.java:1589)
+--Caused by: java.sql.SQLException: step() returned invalid result: tursoStepResult{stepResultName=ERROR, result=null}
+--	at tech.turso.core.TursoResultSet.next(TursoResultSet.java:90)
+--	at tech.turso.core.TursoStatement.execute(TursoStatement.java:46)
+--	at tech.turso.jdbc4.JDBC4Statement.lambda$execute$1(JDBC4Statement.java:176)
+--	at tech.turso.jdbc4.JDBC4Statement.withConnectionTimeout(JDBC4Statement.java:372)
+--	at tech.turso.jdbc4.JDBC4Statement.execute(JDBC4Statement.java:170)
+--	at sqlancer.common.query.SQLQueryAdapter.execute(SQLQueryAdapter.java:100)
+--	... 13 more
+--
+-- Time: 2025/07/17 14:39:10
+-- Database: database0
+-- Database version: 
+-- seed value: 1752777550194
+CREATE TABLE IF NOT EXISTS t0 (c0 BLOB );
+CREATE TABLE IF NOT EXISTS t1 (c0 INTEGER );
+INSERT INTO t0 VALUES (0.174739462008348), (0.2905963829475091), (0.174739462008348);
+UPDATE t1 SET c0='-711559684';
+UPDATE t0 SET (c0)=('1366714048');
+UPDATE t1 SET c0=x'', c0='丏曀';
+CREATE TABLE IF NOT EXISTS t2 (c0 INTEGER NOT NULL , c1 REAL , c2 INT );
+INSERT INTO t1 VALUES (x'43a9'), (NULL), (NULL);
+UPDATE t2 SET c0='861359631';
+UPDATE t0 SET (c0)=(0.13174106120093187);
+CREATE TABLE IF NOT EXISTS t3 (c0 REAL , c1 INT , c2 TEXT );
+INSERT INTO t3(c1, c2) VALUES (0xffffffffd024e00e, '-2047932549');
+UPDATE t3 SET c1=NULL;
+INSERT INTO t2(c0) VALUES ('-2047932549');
+UPDATE t0 SET (c0)=(x'') WHERE IFNULL(DISTINCT ((t0.c0)||('')), t0.c0 COLLATE RTRIM);
+
+
+Run `./target/debug/tursodb < log.txt` to inspect manually.
+
+Manual inspections total 2

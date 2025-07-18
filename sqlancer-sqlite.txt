@@ -1,0 +1,75 @@
+Issue 924:
+TP_known: 8, TP_unknown: 0, FP: 92, Neg: 0
+Known counts: {'update c0 = c0': 8}
+
+Issue 1040:
+TP_known: 10, TP_unknown: 0, FP: 90, Neg: 0
+Known counts: {'update c0 = c0': 2, 'commit transaction': 8}
+
+Issue 1203:
+TP_known: 17, TP_unknown: 0, FP: 83, Neg: 0
+Known counts: {'update c0 = c0': 2, 'commit transaction': 15}
+
+Issue 1629:
+TP_known: 9, TP_unknown: 0, FP: 91, Neg: 0
+Known counts: {'update c0 = c0': 4, 'commit transaction': 5}
+
+Issue 1709:
+TP_known: 20, TP_unknown: 0, FP: 80, Neg: 0
+Known counts: {'update c0 = c0': 6, 'commit transaction': 14}
+
+Issue 1731:
+TP_known: 10, TP_unknown: 0, FP: 90, Neg: 0
+Known counts: {'update c0 = c0': 1, 'commit transaction': 9}
+
+Issue 1737:
+TP_known: 14, TP_unknown: 0, FP: 86, Neg: 0
+Known counts: {'update c0 = c0': 7, 'commit transaction': 7}
+
+
+Issue 1734:
+TP_known: 15, TP_unknown: 0, FP: 85, Neg: 0
+Known counts: {'update c0 = c0': 3, 'commit transaction': 12}
+Issue 1815:
+TP_known: 14, TP_unknown: 0, FP: 86, Neg: 0
+Known counts: {'update c0 = c0': 3, 'commit transaction': 11}
+
+Issue 1818:
+TP_known: 6, TP_unknown: 0, FP: 94, Neg: 0
+Known counts: {'update c0 = c0': 2, 'commit transaction': 4}
+
+Issue 1975:
+TP_known: 23, TP_unknown: 0, FP: 77, Neg: 0
+Known counts: {'update c0 = c0': 3, 'commit transaction': 20}
+
+Issue 1991:
+TP_known: 24, TP_unknown: 0, FP: 76, Neg: 0
+Known counts: {'update c0 = c0': 3, 'commit transaction': 21}
+
+Issue 2024:
+TP_known: 27, TP_unknown: 0, FP: 73, Neg: 0
+Known counts: {'update c0 = c0': 7, 'commit transaction': 20}
+
+Issue 2026:
+TP_known: 18, TP_unknown: 0, FP: 82, Neg: 0
+Known counts: {'update c0 = c0': 4, 'commit transaction': 14}
+
+Issue 2047:
+TP_known: 17, TP_unknown: 0, FP: 83, Neg: 0
+Known counts: {'update c0 = c0': 6, 'commit transaction': 11}
+
+Issue 2074:
+TP_known: 18, TP_unknown: 0, FP: 82, Neg: 0
+Known counts: {'update c0 = c0': 3, 'commit transaction': 15}
+
+Issue 2075:
+TP_known: 21, TP_unknown: 0, FP: 79, Neg: 0
+Known counts: {'update c0 = c0': 2, 'commit transaction': 19}
+
+Issue 2088:
+TP_known: 18, TP_unknown: 0, FP: 82, Neg: 0
+Known counts: {'update c0 = c0': 1, 'commit transaction': 17}
+
+Issue 2106:
+TP_known: 15, TP_unknown: 0, FP: 85, Neg: 0
+Known counts: {'update c0 = c0': 2, 'commit transaction': 13}

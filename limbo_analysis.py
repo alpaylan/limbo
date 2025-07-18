@@ -194,7 +194,7 @@ if __name__ == "__main__":
             for (name, checker) in classified_bugs:
                 if checker(result):
                     if name == "invalid step":
-                        print(f"⚠️  Warning: {name} for issue {issue}, run `./target/debug/tursodb < ../sqlancer/results/limbo/{issue}/{i}/log.txt`")
+                        # print(f"⚠️  Warning: {name} for issue {issue}, run `./target/debug/tursodb < ../sqlancer/results/limbo/{issue}/{i}/log.txt`")
                         # print(f"stderr: {result['stderr']}")
                         log = build_log(result)
                         try:
@@ -207,7 +207,7 @@ if __name__ == "__main__":
                             bins["TP_unknown"].append(i)
                         except Exception as e:
                             bins["FP"].append(i)
-                            print(f"Error occurred while executing SQL script: {e}")
+                            # print(f"Error occurred while executing SQL script: {e}")
                     else:
                         bins["TP_known"].append(i)
                         known_counts[name] += 1
