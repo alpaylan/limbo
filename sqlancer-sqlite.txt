@@ -73,3 +73,7 @@ Known counts: {'update c0 = c0': 1, 'commit transaction': 17}
 Issue 2106:
 TP_known: 15, TP_unknown: 0, FP: 85, Neg: 0
 Known counts: {'update c0 = c0': 2, 'commit transaction': 13}
+
+Issue 2116:
+TP_known: 16, TP_unknown: 0, FP: 84, Neg: 0
+Known counts: {'update c0 = c0': 2, 'commit transaction': 14}
