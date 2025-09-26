@@ -50,6 +50,8 @@ echo "Starting TPC-H query timing comparison..."
 echo "The script might ask you to enter the password for sudo, in order to clear system caches."
 clear_caches
 
+exit_code=0
+
 for query_file in $(ls "$QUERIES_DIR"/*.sql | sort -V); do
     if [ -f "$query_file" ]; then
         query_name=$(basename "$query_file")
@@ -66,7 +68,7 @@ for query_file in $(ls "$QUERIES_DIR"/*.sql | sort -V); do
         # Clear caches before Limbo run
         clear_caches
         # Run Limbo
-        limbo_output=$( { time -p "$LIMBO_BIN" "$DB_FILE" --experimental-indexes --quiet --output-mode list "$(cat $query_file)" 2>&1; } 2>&1)
+        limbo_output=$( { time -p "$LIMBO_BIN" "$DB_FILE" --quiet --output-mode list "$(cat $query_file)" 2>&1; } 2>&1)
         limbo_non_time_lines=$(echo "$limbo_output" | grep -v -e "^real" -e "^user" -e "^sys")
         limbo_real_time=$(echo "$limbo_output" | grep "^real" | awk '{print $2}')
         echo "Running $query_name with SQLite3..." >&2
@@ -85,6 +87,7 @@ for query_file in $(ls "$QUERIES_DIR"/*.sql | sort -V); do
         if [ -n "$output_diff" ]; then
             echo "Output difference:"
             echo "$output_diff"
+            exit_code=1
         else
             echo "No output difference"
         fi
@@ -96,3 +99,8 @@ done
 
 echo "-----------------------------------------------------------"
 echo "TPC-H query timing comparison completed." 
+
+if [ $exit_code -ne 0 ]; then
+    echo "Error: Output differences found"
+    exit $exit_code
+fi

@@ -5,7 +5,7 @@ source $testdir/tester.tcl
 
 # Basic single row delete test
 do_execsql_test_on_specific_db {:memory:} delete-single-1 {
-    CREATE TABLE t1(x INTEGER PRIMARY KEY);
+    CREATE TABLE t1 (x INTEGER PRIMARY KEY);
     INSERT INTO t1 VALUES (1);
     INSERT INTO t1 VALUES (2);
     INSERT INTO t1 VALUES (3);
@@ -15,7 +15,7 @@ do_execsql_test_on_specific_db {:memory:} delete-single-1 {
 
 # Test alternating delete-insert pattern to stress freelist
 do_execsql_test_on_specific_db {:memory:} delete-insert-alternate-1 {
-    CREATE TABLE t4(x INTEGER PRIMARY KEY);
+    CREATE TABLE t4 (x INTEGER PRIMARY KEY);
     INSERT INTO t4 VALUES (1);
     INSERT INTO t4 VALUES (2);
     INSERT INTO t4 VALUES (3);
@@ -28,7 +28,7 @@ do_execsql_test_on_specific_db {:memory:} delete-insert-alternate-1 {
 
 # Test deleting from both ends
 do_execsql_test_on_specific_db {:memory:} delete-ends-1 {
-    CREATE TABLE t5(x INTEGER PRIMARY KEY);
+    CREATE TABLE t5 (x INTEGER PRIMARY KEY);
     INSERT INTO t5 VALUES (1);
     INSERT INTO t5 VALUES (2);
     INSERT INTO t5 VALUES (3);
@@ -42,7 +42,7 @@ do_execsql_test_on_specific_db {:memory:} delete-ends-1 {
 
 # Test delete-insert cycles with value reuse
 do_execsql_test_on_specific_db {:memory:} delete-reuse-1 {
-    CREATE TABLE t6(x INTEGER PRIMARY KEY);
+    CREATE TABLE t6 (x INTEGER PRIMARY KEY);
     INSERT INTO t6 VALUES (1);
     INSERT INTO t6 VALUES (2);
     INSERT INTO t6 VALUES (3);
@@ -52,16 +52,14 @@ do_execsql_test_on_specific_db {:memory:} delete-reuse-1 {
 } {1 2 3}
 
 # Test delete works when there are indexes
-if {[info exists ::env(SQLITE_EXEC)] && $::env(SQLITE_EXEC) eq "scripts/limbo-sqlite3-index-experimental"} {
-    do_execsql_test_on_specific_db {:memory:} delete-all-with-indexes-1 {
-        CREATE TABLE t(a PRIMARY KEY);
-        CREATE INDEX tasc ON t(a);
-        CREATE INDEX tdesc ON t(a DESC);
-        INSERT INTO t VALUES (randomblob(1000));
-        DELETE FROM t;
-        SELECT * FROM t;
-    } {}
-}
+do_execsql_test_on_specific_db {:memory:} delete-all-with-indexes-1 {
+    CREATE TABLE t (a PRIMARY KEY);
+    CREATE INDEX tasc ON t(a);
+    CREATE INDEX tdesc ON t(a DESC);
+    INSERT INTO t VALUES (randomblob(1000));
+    DELETE FROM t;
+    SELECT * FROM t;
+} {}
 
 do_execsql_test_on_specific_db {:memory:} delete_where_falsy {
     CREATE TABLE resourceful_schurz (diplomatic_kaplan BLOB);
@@ -78,3 +76,11 @@ passionate_robin
 faithful_thomas
 vibrant_miroslav
 sparkling_gray}
+
+do_execsql_test_on_specific_db {:memory:} doubly-qualified-delete {
+   create table test(col);
+   insert into test(col) values (1);
+   insert into test(col) values (2);
+   delete from test where main.test.col = 2;
+   select col from test;
+} {1}

@@ -1,15 +1,11 @@
-use turso_sqlite3_parser::ast::Name;
+use turso_parser::ast::Name;
 
 use crate::{
-    schema::Schema,
-    translate::emitter::TransactionMode,
     vdbe::{builder::ProgramBuilder, insn::Insn},
-    Result, SymbolTable,
+    Result,
 };
 
 pub fn translate_rollback(
-    _schema: &Schema,
-    _syms: &SymbolTable,
     mut program: ProgramBuilder,
     txn_name: Option<Name>,
     savepoint_name: Option<Name>,
@@ -22,6 +18,6 @@ pub fn translate_rollback(
         auto_commit: true,
         rollback: true,
     });
-    program.epilogue_maybe_rollback(TransactionMode::None, true);
+    program.rollback();
     Ok(program)
 }

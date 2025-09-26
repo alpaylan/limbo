@@ -24,8 +24,8 @@ use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::sync::Arc;
 use turso_ext::{
-    register_extension, Connection, ConstraintInfo, IndexInfo, OrderByInfo, ResultCode, VTabCursor,
-    VTabKind, VTabModule, VTabModuleDerive, VTable, Value,
+    register_extension, Connection, ResultCode, VTabCursor, VTabKind, VTabModule, VTabModuleDerive,
+    VTable, Value,
 };
 
 register_extension! {
@@ -108,6 +108,7 @@ impl VTabModule for CsvVTabModule {
     type Table = CsvTable;
     const VTAB_KIND: VTabKind = VTabKind::VirtualTable;
     const NAME: &'static str = "csv";
+    const READONLY: bool = true;
 
     fn create(args: &[Value]) -> Result<(String, Self::Table), ResultCode> {
         if args.is_empty() {
@@ -209,7 +210,7 @@ impl VTabModule for CsvVTabModule {
         }
 
         if schema.is_none() {
-            let mut sql = String::from("CREATE TABLE x(");
+            let mut sql = String::from("CREATE TABLE x (");
             for (i, col) in columns.iter().enumerate() {
                 sql.push('"');
                 sql.push_str(col);
@@ -261,29 +262,6 @@ impl VTable for CsvTable {
         match self.new_reader() {
             Ok(reader) => Ok(CsvCursor::new(reader, self)),
             Err(_) => Err(ResultCode::Error),
-        }
-    }
-
-    fn update(&mut self, _rowid: i64, _args: &[Value]) -> Result<(), Self::Error> {
-        Err(ResultCode::ReadOnly)
-    }
-
-    fn insert(&mut self, _args: &[Value]) -> Result<i64, Self::Error> {
-        Err(ResultCode::ReadOnly)
-    }
-
-    fn delete(&mut self, _rowid: i64) -> Result<(), Self::Error> {
-        Err(ResultCode::ReadOnly)
-    }
-
-    fn best_index(_constraints: &[ConstraintInfo], _order_by: &[OrderByInfo]) -> IndexInfo {
-        // Only a forward full table scan is supported.
-        IndexInfo {
-            idx_num: -1,
-            idx_str: None,
-            order_by_consumed: false,
-            estimated_cost: 1_000_000.,
-            ..Default::default()
         }
     }
 }
@@ -541,7 +519,7 @@ mod tests {
         let cursor = table.open(None).unwrap();
         let rows = read_rows(cursor, 2);
         assert!(rows.is_empty());
-        assert_eq!(schema, "CREATE TABLE x(\"c0\" TEXT)");
+        assert_eq!(schema, "CREATE TABLE x (\"c0\" TEXT)");
     }
 
     #[test]
@@ -550,7 +528,7 @@ mod tests {
         let cursor = table.open(None).unwrap();
         let rows = read_rows(cursor, 2);
         assert!(rows.is_empty());
-        assert_eq!(schema, "CREATE TABLE x(\"c0\" TEXT)");
+        assert_eq!(schema, "CREATE TABLE x (\"c0\" TEXT)");
     }
 
     #[test]
@@ -564,7 +542,7 @@ mod tests {
         let cursor = table.open(None).unwrap();
         let rows = read_rows(cursor, 2);
         assert!(rows.is_empty());
-        assert_eq!(schema, "CREATE TABLE x(\"(NULL)\" TEXT)");
+        assert_eq!(schema, "CREATE TABLE x (\"(NULL)\" TEXT)");
     }
 
     #[test]
@@ -573,7 +551,7 @@ mod tests {
         let cursor = table.open(None).unwrap();
         let rows = read_rows(cursor, 2);
         assert!(rows.is_empty());
-        assert_eq!(schema, "CREATE TABLE x(\"(NULL)\" TEXT)");
+        assert_eq!(schema, "CREATE TABLE x (\"(NULL)\" TEXT)");
     }
 
     #[test]
@@ -609,7 +587,7 @@ mod tests {
         let table = new_table(vec![
             &format!("filename={}", file.path().to_string_lossy()),
             "header=false",
-            "schema=CREATE TABLE x(id INT, name TEXT)",
+            "schema=CREATE TABLE x (id INT, name TEXT)",
         ]);
         let cursor = table.open(None).unwrap();
         let rows = read_rows(cursor, 2);
@@ -637,8 +615,8 @@ mod tests {
     #[test]
     fn test_more_than_one_schema_argument() {
         let result = try_new_table(vec![
-            "schema=CREATE TABLE x(id INT, name TEXT)",
-            "schema=CREATE TABLE x(key INT, value TEXT)",
+            "schema=CREATE TABLE x (id INT, name TEXT)",
+            "schema=CREATE TABLE x (key INT, value TEXT)",
         ]);
         assert!(matches!(result, Err(ResultCode::InvalidArgs)));
     }
@@ -731,9 +709,9 @@ mod tests {
     fn test_unparsable_argument() {
         let unparsable_arguments = [
             "header",
-            "schema='CREATE TABLE x(id INT, name TEXT)",
-            "schema=\"CREATE TABLE x(id INT, name TEXT)",
-            "schema=\"CREATE TABLE x(id INT, name TEXT)'",
+            "schema='CREATE TABLE x (id INT, name TEXT)",
+            "schema=\"CREATE TABLE x (id INT, name TEXT)",
+            "schema=\"CREATE TABLE x (id INT, name TEXT)'",
         ];
 
         for &val in &unparsable_arguments {
@@ -825,7 +803,7 @@ mod tests {
             &format!("filename={}", file.path().to_string_lossy()),
             "header=false",
             "columns=1",
-            "schema='CREATE TABLE x(id INT, name TEXT)'",
+            "schema='CREATE TABLE x (id INT, name TEXT)'",
         ]);
         let cursor = table.open(None).unwrap();
         let rows = read_rows(cursor, 2);
@@ -839,7 +817,7 @@ mod tests {
             &format!("filename={}", file.path().to_string_lossy()),
             "header=false",
             "columns=5",
-            "schema='CREATE TABLE x(id INT, name TEXT)'",
+            "schema='CREATE TABLE x (id INT, name TEXT)'",
         ]);
         let cursor = table.open(None).unwrap();
         let rows = read_rows(cursor, 2);
@@ -871,7 +849,7 @@ mod tests {
         );
         assert_eq!(
             schema,
-            "CREATE TABLE x(\"id\" TEXT, \"first\"\"name\" TEXT)"
+            "CREATE TABLE x (\"id\" TEXT, \"first\"\"name\" TEXT)"
         );
     }
 }

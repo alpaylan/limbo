@@ -43,7 +43,6 @@ Turso aims to be fully compatible with SQLite, with opt-in features not supporte
 * ⛔️ Concurrent access from multiple processes is not supported.
 * ⛔️ Savepoints are not supported.
 * ⛔️ Triggers are not supported.
-* ⛔️ Views are not supported.
 * ⛔️ Vacuum is not supported.
 
 ## SQLite query language
@@ -54,30 +53,30 @@ Turso aims to be fully compatible with SQLite, with opt-in features not supporte
 |---------------------------|---------|-----------------------------------------------------------------------------------|
 | ALTER TABLE               | Yes     |                                                                                   |
 | ANALYZE                   | No      |                                                                                   |
-| ATTACH DATABASE           | No      |                                                                                   |
+| ATTACH DATABASE           | Partial | Only for reads. All modifications will currently fail to find the table           |
 | BEGIN TRANSACTION         | Partial | Transaction names are not supported.                                              |
 | COMMIT TRANSACTION        | Partial | Transaction names are not supported.                                              |
-| CREATE INDEX              | Partial | Disabled by default.                                                              |
+| CREATE INDEX              | Partial | Only for columns (not arbitrary expressions)                                      |
 | CREATE TABLE              | Partial |                                                                                   |
-| CREATE TABLE ... STRICT   | Yes     |                                                                                   |
+| CREATE TABLE ... STRICT   | Partial | Strict schema mode is experimental.                                               |
 | CREATE TRIGGER            | No      |                                                                                   |
-| CREATE VIEW               | No      |                                                                                   |
+| CREATE VIEW               | Yes     |                                                                                   |
 | CREATE VIRTUAL TABLE      | Yes     |                                                                                   |
 | DELETE                    | Yes     |                                                                                   |
-| DETACH DATABASE           | No      |                                                                                   |
+| DETACH DATABASE           | Yes     |                                                                                   |
 | DROP INDEX                | Partial | Disabled by default.                                                              |
 | DROP TABLE                | Yes     |                                                                                   |
 | DROP TRIGGER              | No      |                                                                                   |
-| DROP VIEW                 | No      |                                                                                   |
+| DROP VIEW                 | Yes     |                                                                                   |
 | END TRANSACTION           | Partial | Alias for `COMMIT TRANSACTION`                                                    |
 | EXPLAIN                   | Yes     |                                                                                   |
 | INDEXED BY                | No      |                                                                                   |
-| INSERT                    | Partial |                                                                                   |
-| ON CONFLICT clause        | No      |                                                                                   |
+| INSERT                    | Yes     |                                                                                   |
+| ON CONFLICT clause        | Yes     |                                                                                   |
 | REINDEX                   | No      |                                                                                   |
 | RELEASE SAVEPOINT         | No      |                                                                                   |
 | REPLACE                   | No      |                                                                                   |
-| RETURNING clause          | No      |                                                                                   |
+| RETURNING clause          | Partial | DELETE is missing                                                                 |
 | ROLLBACK TRANSACTION      | Yes     |                                                                                   |
 | SAVEPOINT                 | No      |                                                                                   |
 | SELECT                    | Yes     |                                                                                   |
@@ -94,7 +93,6 @@ Turso aims to be fully compatible with SQLite, with opt-in features not supporte
 | SELECT ... JOIN USING     | Yes     |                                                                                   |
 | SELECT ... NATURAL JOIN   | Yes     |                                                                                   |
 | UPDATE                    | Yes     |                                                                                   |
-| UPSERT                    | No      |                                                                                   |
 | VACUUM                    | No      |                                                                                   |
 | WITH clause               | Partial | No RECURSIVE, no MATERIALIZED, only SELECT supported in CTEs                      |
 
@@ -104,7 +102,7 @@ Turso aims to be fully compatible with SQLite, with opt-in features not supporte
 | Statement                        | Status     | Comment                                      |
 |----------------------------------|------------|----------------------------------------------|
 | PRAGMA analysis_limit            | No         |                                              |
-| PRAGMA application_id            | No         |                                              |
+| PRAGMA application_id            | Yes        |                                              |
 | PRAGMA auto_vacuum               | No         |                                              |
 | PRAGMA automatic_index           | No         |                                              |
 | PRAGMA busy_timeout              | No         |                                              |
@@ -119,15 +117,15 @@ Turso aims to be fully compatible with SQLite, with opt-in features not supporte
 | PRAGMA count_changes             | Not Needed | deprecated in SQLite                         |
 | PRAGMA data_store_directory      | Not Needed | deprecated in SQLite                         |
 | PRAGMA data_version              | No         |                                              |
-| PRAGMA database_list             | No         |                                              |
+| PRAGMA database_list             | Yes        |                                              |
 | PRAGMA default_cache_size        | Not Needed | deprecated in SQLite                         |
 | PRAGMA defer_foreign_keys        | No         |                                              |
 | PRAGMA empty_result_callbacks    | Not Needed | deprecated in SQLite                         |
-| PRAGMA encoding                  | No         |                                              |
+| PRAGMA encoding                  | Yes        |                                              |
 | PRAGMA foreign_key_check         | No         |                                              |
 | PRAGMA foreign_key_list          | No         |                                              |
 | PRAGMA foreign_keys              | No         |                                              |
-| PRAGMA freelist_count            | No         |                                              |
+| PRAGMA freelist_count            | Yes        |                                              |
 | PRAGMA full_column_names         | Not Needed | deprecated in SQLite                         |
 | PRAGMA fullsync                  | No         |                                              |
 | PRAGMA function_list             | No         |                                              |
@@ -141,28 +139,28 @@ Turso aims to be fully compatible with SQLite, with opt-in features not supporte
 | PRAGMA journal_mode              | Yes        |                                              |
 | PRAGMA journal_size_limit        | No         |                                              |
 | PRAGMA legacy_alter_table        | No         |                                              |
-| PRAGMA legacy_file_format         | Yes        |                                              |
+| PRAGMA legacy_file_format        | Yes        |                                              |
 | PRAGMA locking_mode              | No         |                                              |
-| PRAGMA max_page_count            | No         |                                              |
+| PRAGMA max_page_count            | Yes        |                                              |
 | PRAGMA mmap_size                 | No         |                                              |
 | PRAGMA module_list               | No         |                                              |
 | PRAGMA optimize                  | No         |                                              |
 | PRAGMA page_count                | Yes        |                                              |
-| PRAGMA page_size                 | No         |                                              |
+| PRAGMA page_size                 | Yes        |                                              |
 | PRAGMA parser_trace              | No         |                                              |
 | PRAGMA pragma_list               | Yes        |                                              |
-| PRAGMA query_only                | No         |                                              |
+| PRAGMA query_only                | Yes        |                                              |
 | PRAGMA quick_check               | No         |                                              |
 | PRAGMA read_uncommitted          | No         |                                              |
 | PRAGMA recursive_triggers        | No         |                                              |
 | PRAGMA reverse_unordered_selects | No         |                                              |
-| PRAGMA schema_version            | No         |                                              |
+| PRAGMA schema_version            | Yes        | For writes, emulate defensive mode (always noop)|
 | PRAGMA secure_delete             | No         |                                              |
 | PRAGMA short_column_names        | Not Needed | deprecated in SQLite                         |
 | PRAGMA shrink_memory             | No         |                                              |
 | PRAGMA soft_heap_limit           | No         |                                              |
 | PRAGMA stats                     | No         | Used for testing in SQLite                   |
-| PRAGMA synchronous               | No         |                                              |
+| PRAGMA synchronous               | Partial    | `OFF` and `FULL` supported                   |
 | PRAGMA table_info                | Yes        |                                              |
 | PRAGMA table_list                | No         |                                              |
 | PRAGMA table_xinfo               | No         |                                              |
@@ -266,7 +264,7 @@ Feature support of [sqlite expr syntax](https://www.sqlite.org/lang_expr.html).
 | unhex(X)                     | Yes     |                                                      |
 | unhex(X,Y)                   | Yes     |                                                      |
 | unicode(X)                   | Yes     |                                                      |
-| unlikely(X)                  | No      |                                                      |
+| unlikely(X)                  | Yes     |                                                      |
 | upper(X)                     | Yes     |                                                      |
 | zeroblob(N)                  | Yes     |                                                      |
 
@@ -345,7 +343,7 @@ Modifiers:
 | TimeOffset     | Yes	 |                                 |
 | DateOffset	 | Yes   |                                 |
 | DateTimeOffset | Yes   |                                 |
-| Ceiling	     | No    |                                 |
+| Ceiling	     | Yes   |                                 |
 | Floor          | No    |                                 |
 | StartOfMonth	 | Yes	 |                                 |
 | StartOfYear	 | Yes	 |                                 |
@@ -395,10 +393,10 @@ Modifiers:
 | jsonb_group_array(value)           | Yes     |                                                                                                                                              |
 | json_group_object(label,value)     | Yes     |                                                                                                                                              |
 | jsonb_group_object(name,value)     | Yes     |                                                                                                                                              |
-| json_each(json)                    |         |                                                                                                                                              |
-| json_each(json,path)               |         |                                                                                                                                              |
-| json_tree(json)                    |         |                                                                                                                                              |
-| json_tree(json,path)               |         |                                                                                                                                              |
+| json_each(json)                    | Yes     |                                                                                                                                              |
+| json_each(json,path)               | Yes     |                                                                                                                                              |
+| json_tree(json)                    | Partial | see commented-out tests in json.test                                                                                                         |
+| json_tree(json,path)               | Partial | see commented-out tests in json.test                                                                                                         |
 
 ## SQLite C API
 
@@ -416,11 +414,11 @@ Modifiers:
 | Opcode         | Status | Comment |
 |----------------|--------|---------|
 | Add            | Yes    |         |
-| AddImm         | No     |         |
-| Affinity       | No     |         |
+| AddImm         | Yes    |         |
+| Affinity       | Yes    |         |
 | AggFinal       | Yes    |         |
 | AggStep        | Yes    |         |
-| AggStep        | Yes    |         |
+| AggValue       | Yes    |         |
 | And            | Yes    |         |
 | AutoCommit     | Yes    |         |
 | BitAnd         | Yes    |         |
@@ -428,24 +426,23 @@ Modifiers:
 | BitOr          | Yes    |         |
 | Blob           | Yes    |         |
 | BeginSubrtn    | Yes    |         |
-| Checkpoint     | No     |         |
+| Cast           | Yes    |         |
+| Checkpoint     | Yes    |         |
 | Clear          | No     |         |
-| Close          | No     |         |
-| CollSeq        | No     |         |
+| Close          | Yes    |         |
+| CollSeq        | Yes    |         |
 | Column         | Yes    |         |
 | Compare        | Yes    |         |
 | Concat         | Yes    |         |
 | Copy           | Yes    |         |
-| Count          | No     |         |
+| Count          | Yes    |         |
 | CreateBTree    | Partial| no temp databases |
-| CreateTable    | No     |         |
-| CreateTable    | No     |         |
 | DecrJumpZero   | Yes    |         |
-| Delete         | No     |         |
-| Destroy        | No     |         |
+| Delete         | Yes    |         |
+| Destroy        | Yes    |         |
 | Divide         | Yes    |         |
-| DropIndex      | No     |         |
-| DropTable      | No     |         |
+| DropIndex      | Yes    |         |
+| DropTable      | Yes    |         |
 | DropTrigger    | No     |         |
 | EndCoroutine   | Yes    |         |
 | Eq             | Yes    |         |
@@ -453,20 +450,20 @@ Modifiers:
 | Explain        | No     |         |
 | FkCounter      | No     |         |
 | FkIfZero       | No     |         |
-| Found          | No     |         |
+| Found          | Yes    |         |
 | Function       | Yes    |         |
 | Ge             | Yes    |         |
 | Gosub          | Yes    |         |
 | Goto           | Yes    |         |
 | Gt             | Yes    |         |
 | Halt           | Yes    |         |
-| HaltIfNull     | No     |         |
-| IdxDelete      | No     |         |
+| HaltIfNull     | Yes    |         |
+| IdxDelete      | Yes    |         |
 | IdxGE          | Yes    |         |
-| IdxInsert      | Yes     |         |
+| IdxInsert      | Yes    |         |
 | IdxLE          | Yes    |         |
 | IdxLT          | Yes    |         |
-| IdxRowid       | No     |         |
+| IdxRowid       | Yes    |         |
 | If             | Yes    |         |
 | IfNeg          | No     |         |
 | IfNot          | Yes    |         |
@@ -475,23 +472,22 @@ Modifiers:
 | IncrVacuum     | No     |         |
 | Init           | Yes    |         |
 | InitCoroutine  | Yes    |         |
-| Insert         | Yes     |         |
-| InsertInt      | No     |         |
-| Int64          | No     |         |
+| Insert         | Yes    |         |
+| Int64          | Yes    |         |
 | Integer        | Yes    |         |
-| IntegrityCk    | No     |         |
+| IntegrityCk    | Yes    |         |
 | IsNull         | Yes    |         |
 | IsUnique       | No     |         |
-| JournalMode    | No     |         |
+| JournalMode    | Yes    |         |
 | Jump           | Yes    |         |
-| Last           | No     |         |
+| Last           | Yes    |         |
 | Le             | Yes    |         |
 | LoadAnalysis   | No     |         |
 | Lt             | Yes    |         |
 | MakeRecord     | Yes    |         |
-| MaxPgcnt       | No     |         |
-| MemMax         | No     |         |
-| Move           | No     |         |
+| MaxPgcnt       | Yes    |         |
+| MemMax         | Yes     |         |
+| Move           | Yes    |         |
 | Multiply       | Yes    |         |
 | MustBeInt      | Yes    |         |
 | Ne             | Yes    |         |
@@ -500,12 +496,13 @@ Modifiers:
 | Noop           | Yes     |         |
 | Not            | Yes    |         |
 | NotExists      | Yes    |         |
-| NotFound       | No     |         |
+| NotFound       | Yes    |         |
 | NotNull        | Yes    |         |
 | Null           | Yes    |         |
 | NullRow        | Yes    |         |
 | Once           | Yes     |         |
 | OpenAutoindex  | Yes     |         |
+| OpenDup        | Yes     |         |
 | OpenEphemeral  | Yes     |         |
 | OpenPseudo     | Yes    |         |
 | OpenRead       | Yes    |         |
@@ -513,7 +510,7 @@ Modifiers:
 | Or             | Yes    |         |
 | Pagecount      | Partial| no temp databases |
 | Param          | No     |         |
-| ParseSchema    | No     |         |
+| ParseSchema    | Yes    |         |
 | Permutation    | No     |         |
 | Prev           | Yes     |         |
 | Program        | No     |         |
@@ -522,10 +519,11 @@ Modifiers:
 | RealAffinity   | Yes    |         |
 | Remainder      | Yes    |         |
 | ResetCount     | No     |         |
+| ResetSorter    | Partial| sorter cursors are not supported yet; only ephemeral tables are |
 | ResultRow      | Yes    |         |
 | Return         | Yes    |         |
 | Rewind         | Yes    |         |
-| RowData        | No     |         |
+| RowData        | Yes     |         |
 | RowId          | Yes    |         |
 | RowKey         | No     |         |
 | RowSetAdd      | No     |         |
@@ -537,12 +535,13 @@ Modifiers:
 | Seek           | No     |         |
 | SeekGe         | Yes    |         |
 | SeekGt         | Yes    |         |
-| SeekLe         | No     |         |
-| SeekLt         | No     |         |
+| SeekLe         | Yes    |         |
+| SeekLt         | Yes    |         |
 | SeekRowid      | Yes    |         |
 | SeekEnd        | Yes    |         |
-| Sequence       | No     |         |
-| SetCookie      | No     |         |
+| Sequence       | Yes    |         |
+| SequenceTest   | Yes    |         |
+| SetCookie      | Yes    |         |
 | ShiftLeft      | Yes    |         |
 | ShiftRight     | Yes    |         |
 | SoftNull       | Yes    |         |
@@ -553,15 +552,10 @@ Modifiers:
 | SorterNext     | Yes    |         |
 | SorterOpen     | Yes    |         |
 | SorterSort     | Yes    |         |
-| String         | No     |         |
+| String         | NotNeeded | SQLite uses String for sized strings and String8 for null-terminated. All our strings are sized |
 | String8        | Yes    |         |
 | Subtract       | Yes    |         |
 | TableLock      | No     |         |
-| ToBlob         | No     |         |
-| ToInt          | No     |         |
-| ToNumeric      | No     |         |
-| ToReal         | No     |         |
-| ToText         | No     |         |
 | Trace          | No     |         |
 | Transaction    | Yes    |         |
 | VBegin         | No     |         |
@@ -574,8 +568,7 @@ Modifiers:
 | VRename        | No     |         |
 | VUpdate        | Yes    |         |
 | Vacuum         | No     |         |
-| Variable       | No     |         |
-| VerifyCookie   | No     |         |
+| Variable       | Yes    |         |
 | Yield          | Yes    |         |
 | ZeroOrNull     | Yes    |         |
 
@@ -619,8 +612,8 @@ The `regexp` extension is compatible with [sqlean-regexp](https://github.com/nal
 | regexp(pattern, source)                        | Yes    |         |
 | regexp_like(source, pattern)                   | Yes    |         |
 | regexp_substr(source, pattern)                 | Yes    |         |
-| regexp_capture(source, pattern[, n])           | No     |         |
-| regexp_replace(source, pattern, replacement)   | No     |         |
+| regexp_capture(source, pattern[, n])           | Yes    |         |
+| regexp_replace(source, pattern, replacement)   | Yes    |         |
 
 ### Vector
 
@@ -634,6 +627,8 @@ The `vector` extension is compatible with libSQL native vector search.
 | vector_extract(x)                              | Yes    |         |
 | vector_distance_cos(x, y)                      | Yes    |         |
 | vector_distance_l2(x, y)                              | Yes    |Euclidean distance|
+| vector_concat(x, y)                            | Yes    |         |
+| vector_slice(x, start_index, end_index)        | Yes    |         |
 
 ### Time
 

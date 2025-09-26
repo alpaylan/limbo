@@ -42,6 +42,17 @@ pub fn derive_description_from_doc(item: TokenStream) -> TokenStream {
                         TokenTree::Ident(ident) => {
                             // Capture the enum variant name and associate it with its description
                             let ident_str = ident.to_string();
+
+                            // this is a quick fix for derive(EnumDiscriminants)
+                            if ident_str == "strum_discriminants" {
+                                continue;
+                            }
+
+                            // this is a quick fix for repr
+                            if ident_str == "repr" {
+                                continue;
+                            }
+
                             if let Some(desc) = &last_seen_desc {
                                 variant_description_map.insert(ident_str.clone(), desc.clone());
                             }
@@ -238,7 +249,7 @@ pub fn derive_agg_func(input: TokenStream) -> TokenStream {
 ///
 ///   /// Declare your virtual table and its schema
 ///  fn create(args: &[Value]) -> Result<(String, Self::Table), ResultCode> {
-///     let schema = "CREATE TABLE csv_data(
+///     let schema = "CREATE TABLE csv_data (
 ///             name TEXT,
 ///             age TEXT,
 ///             city TEXT
@@ -438,4 +449,18 @@ pub fn derive_vtab_module(input: TokenStream) -> TokenStream {
 #[proc_macro_derive(VfsDerive)]
 pub fn derive_vfs_module(input: TokenStream) -> TokenStream {
     ext::derive_vfs_module(input)
+}
+
+/// match_ignore_ascii_case will generate trie-like tree matching from normal match expression.
+/// example:
+/// ```ignore
+///     match_ignore_ascii_case!(match input {
+///        b"AB" => TokenType::TK_ABORT,
+///        b"AC" => TokenType::TK_ACTION,
+///        _ => TokenType::TK_ID,
+///    })
+/// ```
+#[proc_macro]
+pub fn match_ignore_ascii_case(input: TokenStream) -> TokenStream {
+    ext::match_ignore_ascci_case(input)
 }

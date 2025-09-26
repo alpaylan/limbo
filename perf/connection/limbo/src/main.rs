@@ -21,11 +21,12 @@ fn main() {
     
     println!("Testing connection performance with database: {}", opts.database);
     
+    // Open the database object.
+    let db = Database::open_file(io.clone(), &opts.database, false, false).unwrap();
     for i in 0..opts.iterations {
         let start = Instant::now();
         
-        // Open connection to database and prepare a statement
-        let db = Database::open_file(io.clone(), &opts.database, false, false).unwrap();
+        // now open a new connection and prepare a statement.
         let conn = db.connect().unwrap();
         let _stmt = conn.prepare("SELECT name FROM table_0 WHERE id = ?").unwrap();
         

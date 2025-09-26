@@ -1,9 +1,11 @@
 /target
 /.idea
 /.vscode
+**/target
 
 *.so
 *.ipynb
+*.o
 
 # Python
 .mypy_cache/
@@ -23,7 +25,8 @@ dist/
 **/*.db-wal
 **/*.db-shm
 **/*-wal
-
+# perf
+/Mobibench
 # OS
 .DS_Store
 
@@ -37,3 +40,11 @@ testing/*.log
 .bugbase
 limbostress.log
 simulator.log
+**/*.txt
+profile.json.gz
+simulator-output/
+
+&1
+bisected.sql
+*.log
+

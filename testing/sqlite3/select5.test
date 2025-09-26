@@ -19,7 +19,7 @@ source $testdir/tester.tcl
 # Build some test data
 #
 execsql {
-  CREATE TABLE t1(x int, y int);
+  CREATE TABLE t1 (x int, y int);
   BEGIN;
 }
 for {set i 1} {$i<32} {incr i} {
@@ -127,7 +127,7 @@ do_test select5-4.5 {
 #
 do_test select5-5.1 {
   execsql {
-    CREATE TABLE t2(a, b, c);
+    CREATE TABLE t2 (a, b, c);
     INSERT INTO t2 VALUES(1, 2, 3);
     INSERT INTO t2 VALUES(1, 4, 5);
     INSERT INTO t2 VALUES(6, 4, 7);
@@ -168,7 +168,7 @@ do_test select5-5.11 {
 #
 do_test select5-6.1 {
   execsql {
-    CREATE TABLE t3(x,y);
+    CREATE TABLE t3 (x,y);
     INSERT INTO t3 VALUES(1,NULL);
     INSERT INTO t3 VALUES(2,NULL);
     INSERT INTO t3 VALUES(3,4);
@@ -177,7 +177,7 @@ do_test select5-6.1 {
 } {1 4 2 {}}
 do_test select5-6.2 {
   execsql {
-    CREATE TABLE t4(x,y,z);
+    CREATE TABLE t4 (x,y,z);
     INSERT INTO t4 VALUES(1,2,NULL);
     INSERT INTO t4 VALUES(2,3,NULL);
     INSERT INTO t4 VALUES(3,NULL,5);
@@ -200,8 +200,8 @@ do_test select5-7.2 {
 #
 do_test select5-8.1 {
   execsql {
-    CREATE TABLE t8a(a,b);
-    CREATE TABLE t8b(x);
+    CREATE TABLE t8a (a,b);
+    CREATE TABLE t8b (x);
     INSERT INTO t8a VALUES('one', 1);
     INSERT INTO t8a VALUES('one', 2);
     INSERT INTO t8a VALUES('two', 3);
@@ -253,7 +253,7 @@ do_test select5-8.8 {
 # 2021-04-26 forum https://sqlite.org/forum/forumpost/74330094d8
 reset_db
 do_execsql_test select5-9.1 {
-  CREATE TABLE t1(a INT, b INT);
+  CREATE TABLE t1 (a INT, b INT);
   INSERT INTO t1(a,b) VALUES(1,null),(null,null),(1,null);
   CREATE UNIQUE INDEX t1b ON t1(abs(b));
   SELECT quote(a), quote(b), '|' FROM t1 GROUP BY a, abs(b);

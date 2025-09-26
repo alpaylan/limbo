@@ -1,17 +1,13 @@
 use std::{
-    cell::RefCell,
     collections::{HashMap, HashSet},
     path::Path,
-    pin::Pin,
     rc::Rc,
     sync::Arc,
 };
 
 use rand::{seq::SliceRandom, RngCore, SeedableRng};
 use rand_chacha::ChaCha8Rng;
-use turso_core::{
-    Buffer, Completion, CompletionType, File, OpenFlags, PlatformIO, WriteCompletion, IO,
-};
+use turso_core::{Buffer, Completion, File, OpenFlags, PlatformIO, IO};
 use zerocopy::big_endian::{U16, U32, U64};
 
 use crate::common::{limbo_exec_rows, sqlite_exec_rows, TempDatabase};
@@ -431,15 +427,16 @@ impl BTreeGenerator<'_> {
 }
 
 fn write_at(io: &impl IO, file: Arc<dyn File>, offset: usize, data: &[u8]) {
-    let completion = Completion::new(CompletionType::Write(WriteCompletion::new(Box::new(
-        |_| {},
-    ))));
-    let drop_fn = Rc::new(move |_| {});
     #[allow(clippy::arc_with_non_send_sync)]
-    let buffer = Arc::new(RefCell::new(Buffer::new(Pin::new(data.to_vec()), drop_fn)));
-    let result = file.pwrite(offset, buffer, completion.into()).unwrap();
+    let buffer = Arc::new(Buffer::new(data.to_vec()));
+    let _buf = buffer.clone();
+    let completion = Completion::new_write(move |_| {
+        // reference the buffer to keep alive for async io
+        let _buf = _buf.clone();
+    });
+    let result = file.pwrite(offset as u64, buffer, completion).unwrap();
     while !result.is_completed() {
-        io.run_once().unwrap();
+        io.step().unwrap();
     }
 }
 

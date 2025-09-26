@@ -1,18 +1,19 @@
 use std::{
     num::{NonZero, NonZeroUsize},
-    rc::Rc,
     sync::Arc,
 };
 
 use super::{execute, AggFunc, BranchOffset, CursorID, FuncCtx, InsnFunction, PageIdx};
 use crate::{
-    schema::{Affinity, BTreeTable, Index},
+    schema::{Affinity, BTreeTable, Column, Index},
     storage::{pager::CreateBTreeFlags, wal::CheckpointMode},
-    translate::collate::CollationSeq,
+    translate::{collate::CollationSeq, emitter::TransactionMode},
     Value,
 };
+use strum::EnumCount;
+use strum_macros::{EnumDiscriminants, FromRepr, VariantArray};
 use turso_macros::Description;
-use turso_sqlite3_parser::ast::SortOrder;
+use turso_parser::ast::SortOrder;
 
 /// Flags provided to comparison instructions (e.g. Eq, Ne) which determine behavior related to NULL values.
 #[derive(Clone, Copy, Debug, Default)]
@@ -53,7 +54,7 @@ impl CmpInsFlags {
 
     pub fn get_affinity(&self) -> Affinity {
         let aff_code = (self.0 & Self::AFFINITY_MASK) as u8;
-        Affinity::from_char_code(aff_code).unwrap_or(Affinity::Blob)
+        Affinity::from_char_code(aff_code)
     }
 }
 
@@ -108,7 +109,8 @@ impl IdxInsertFlags {
 pub struct InsertFlags(pub u8);
 
 impl InsertFlags {
-    pub const UPDATE: u8 = 0x01; // Flag indicating this is part of an UPDATE statement
+    pub const UPDATE_ROWID_CHANGE: u8 = 0x01; // Flag indicating this is part of an UPDATE statement where the row's rowid is changed
+    pub const REQUIRE_SEEK: u8 = 0x02; // Flag indicating that a seek is required to insert the row
 
     pub fn new() -> Self {
         InsertFlags(0)
@@ -118,12 +120,13 @@ impl InsertFlags {
         (self.0 & flag) != 0
     }
 
-    pub fn update(mut self, is_update: bool) -> Self {
-        if is_update {
-            self.0 |= InsertFlags::UPDATE;
-        } else {
-            self.0 &= !InsertFlags::UPDATE;
-        }
+    pub fn require_seek(mut self) -> Self {
+        self.0 |= InsertFlags::REQUIRE_SEEK;
+        self
+    }
+
+    pub fn update_rowid_change(mut self) -> Self {
+        self.0 |= InsertFlags::UPDATE_ROWID_CHANGE;
         self
     }
 }
@@ -149,7 +152,12 @@ impl<T: Copy + std::fmt::Display> std::fmt::Display for RegisterOrLiteral<T> {
     }
 }
 
-#[derive(Description, Debug)]
+// There are currently 190 opcodes in sqlite
+#[repr(u8)]
+#[derive(Description, Debug, EnumDiscriminants)]
+#[strum_discriminants(vis(pub(crate)))]
+#[strum_discriminants(derive(VariantArray, EnumCount, FromRepr))]
+#[strum_discriminants(name(InsnVariants))]
 pub enum Insn {
     /// Initialize the program state and jump to the given PC.
     Init {
@@ -187,6 +195,16 @@ pub enum Insn {
         lhs: usize,
         rhs: usize,
         dest: usize,
+    },
+    /// Updates the value of register dest_reg to the maximum of its current
+    /// value and the value in src_reg.
+    ///
+    ///    - dest_reg = max(int(dest_reg), int(src_reg))
+    ///
+    /// Both registers are converted to integers before the comparison.
+    MemMax {
+        dest_reg: usize, // P1
+        src_reg: usize,  // P2
     },
     /// Divide lhs by rhs and store the result in a third register.
     Divide {
@@ -333,6 +351,7 @@ pub enum Insn {
     OpenRead {
         cursor_id: CursorID,
         root_page: PageIdx,
+        db: usize,
     },
 
     /// Open a cursor for a virtual table.
@@ -419,7 +438,7 @@ pub enum Insn {
         /// GENERATED ALWAYS AS ... STATIC columns are only checked if P3 is zero.
         /// When P3 is non-zero, no type checking occurs for static generated columns.
         check_generated: bool, // P3
-        table_reference: Rc<BTreeTable>, // P4
+        table_reference: Arc<BTreeTable>, // P4
     },
 
     // Make a record and write it to destination register.
@@ -428,6 +447,7 @@ pub enum Insn {
         count: usize,     // P2
         dest_reg: usize,  // P3
         index_name: Option<String>,
+        affinity_str: Option<String>,
     },
 
     /// Emit a row of results.
@@ -462,7 +482,9 @@ pub enum Insn {
 
     /// Start a transaction.
     Transaction {
-        write: bool,
+        db: usize,                // p1
+        tx_mode: TransactionMode, // p2
+        schema_cookie: u32,       // p3
     },
 
     /// Set database auto-commit mode and potentially rollback.
@@ -667,6 +689,15 @@ pub enum Insn {
         func: AggFunc,
     },
 
+    /// Similar to AggFinal, but instead of writing the result back into the
+    /// accumulator register, it stores the result in a separate destination
+    /// register.
+    AggValue {
+        acc_reg: usize,
+        dest_reg: usize,
+        func: AggFunc,
+    },
+
     /// Open a sorter.
     SorterOpen {
         cursor_id: CursorID,                   // P1
@@ -708,6 +739,12 @@ pub enum Insn {
         func: FuncCtx,      // P4
     },
 
+    /// Cast register P1 to affinity P2 and store in register P1
+    Cast {
+        reg: usize,
+        affinity: Affinity,
+    },
+
     InitCoroutine {
         yield_reg: usize,
         jump_on_definition: BranchOffset,
@@ -740,6 +777,7 @@ pub enum Insn {
 
     Delete {
         cursor_id: CursorID,
+        table_name: String,
     },
 
     /// If P5 is not zero, then raise an SQLITE_CORRUPT_INDEX error if no matching index entry
@@ -767,11 +805,16 @@ pub enum Insn {
         reg: usize,
     },
 
-    /// If P4==0 then register P3 holds a blob constructed by [MakeRecord](https://sqlite.org/opcode.html#MakeRecord). If P4>0 then register P3 is the first of P4 registers that form an unpacked record.\
+    /// If P4==0 then register P3 holds a blob constructed by [MakeRecord](https://sqlite.org/opcode.html#MakeRecord).
+    /// If P4>0 then register P3 is the first of P4 registers that form an unpacked record.
     ///
-    /// Cursor P1 is on an index btree. If the record identified by P3 and P4 contains any NULL value, jump immediately to P2. If all terms of the record are not-NULL then a check is done to determine if any row in the P1 index btree has a matching key prefix. If there are no matches, jump immediately to P2. If there is a match, fall through and leave the P1 cursor pointing to the matching row.\
+    /// Cursor P1 is on an index btree. If the record identified by P3 and P4 contains any NULL value, jump immediately
+    /// to P2. If all terms of the record are not-NULL then a check is done to determine if any row in the P1 index
+    /// btree has a matching key prefix. If there are no matches, jump immediately to P2. If there is a match, fall
+    /// through and leave the P1 cursor pointing to the matching row.\
     ///
-    /// This opcode is similar to [NotFound](https://sqlite.org/opcode.html#NotFound) with the exceptions that the branch is always taken if any part of the search key input is NULL.
+    /// This opcode is similar to [NotFound](https://sqlite.org/opcode.html#NotFound) with the exceptions that the
+    /// branch is always taken if any part of the search key input is NULL.
     NoConflict {
         cursor_id: CursorID,     // P1 index cursor
         target_pc: BranchOffset, // P2 jump target
@@ -794,7 +837,7 @@ pub enum Insn {
     OpenWrite {
         cursor_id: CursorID,
         root_page: RegisterOrLiteral<PageIdx>,
-        name: String,
+        db: usize,
     },
 
     Copy {
@@ -823,6 +866,18 @@ pub enum Insn {
         is_temp: usize,
     },
 
+    /// Deletes all contents from the ephemeral table that the cursor points to.
+    ///
+    /// In Turso, we do not currently distinguish strictly between ephemeral
+    /// and standard tables at the type level. Therefore, it is the caller’s
+    /// responsibility to ensure that `ResetSorter` is applied only to ephemeral
+    /// tables.
+    ///
+    /// SQLite also supports sorter cursors, but this is not yet implemented in Turso.
+    ResetSorter {
+        cursor_id: CursorID,
+    },
+
     ///  Drop a table
     DropTable {
         ///  The database within which this b-tree needs to be dropped (P1).
@@ -833,6 +888,12 @@ pub enum Insn {
         _p3: usize,
         //  The name of the table being dropped
         table_name: String,
+    },
+    DropView {
+        /// The database within which this view needs to be dropped
+        db: usize,
+        /// The name of the view being dropped
+        view_name: String,
     },
     DropIndex {
         ///  The database within which this index needs to be dropped (P1).
@@ -854,9 +915,33 @@ pub enum Insn {
         /// Jump to this PC if the register is null (P2).
         target_pc: BranchOffset,
     },
+
+    /// Set the collation sequence for the next function call.
+    /// P4 is a pointer to a CollationSeq. If the next call to a user function
+    /// or aggregate calls sqlite3GetFuncCollSeq(), this collation sequence will
+    /// be returned. This is used by the built-in min(), max() and nullif()
+    /// functions.
+    ///
+    /// If P1 is not zero, then it is a register that a subsequent min() or
+    /// max() aggregate will set to 1 if the current row is not the minimum or
+    /// maximum.  The P1 register is initialized to 0 by this instruction.
+    CollSeq {
+        /// Optional register to initialize to 0 (P1).
+        reg: Option<usize>,
+        /// The collation sequence to set (P4).
+        collation: CollationSeq,
+    },
     ParseSchema {
         db: usize,
         where_clause: Option<String>,
+    },
+
+    /// Populate all materialized views after schema parsing
+    /// The cursors parameter contains a mapping of view names to cursor IDs that have been
+    /// opened to the view's btree for writing the materialized data
+    PopulateMaterializedViews {
+        /// Mapping of view name to cursor_id for writing to the view's btree
+        cursors: Vec<(String, usize)>,
     },
 
     /// Place the result of lhs >> rhs in dest register.
@@ -871,6 +956,14 @@ pub enum Insn {
         lhs: usize,
         rhs: usize,
         dest: usize,
+    },
+
+    /// Add immediate value to register and force integer conversion.
+    /// Add the constant P2 to the value in register P1. The result is always an integer.
+    /// To force any register to be an integer, just add 0.
+    AddImm {
+        register: usize, // P1: target register
+        value: i64,      // P2: immediate value to add
     },
 
     /// Get parameter variable.
@@ -938,6 +1031,17 @@ pub enum Insn {
     OpenAutoindex {
         cursor_id: usize,
     },
+    /// Opens a new cursor that points to the same table as the original.
+    /// In SQLite, this is restricted to cursors opened by `OpenEphemeral`
+    /// (i.e., ephemeral tables), and only ephemeral cursors may be duplicated.
+    /// In Turso, we currently do not strictly distinguish between ephemeral
+    /// and standard tables at the type level. Therefore, it is the caller’s
+    /// responsibility to ensure that `OpenDup` is applied only to ephemeral
+    /// cursors.
+    OpenDup {
+        new_cursor_id: CursorID,
+        original_cursor_id: CursorID,
+    },
     /// Fall through to the next instruction on the first invocation, otherwise jump to target_pc
     Once {
         target_pc_when_reentered: BranchOffset,
@@ -992,133 +1096,248 @@ pub enum Insn {
         roots: Vec<usize>,
         message_register: usize,
     },
+    RenameTable {
+        from: String,
+        to: String,
+    },
+    DropColumn {
+        table: String,
+        column_index: usize,
+    },
+    AddColumn {
+        table: String,
+        column: Column,
+    },
+    AlterColumn {
+        table: String,
+        column_index: usize,
+        definition: turso_parser::ast::ColumnDefinition,
+        rename: bool,
+    },
+    /// Try to set the maximum page count for database P1 to the value in P3.
+    /// Do not let the maximum page count fall below the current page count and
+    /// do not change the maximum page count value if P3==0.
+    /// Store the maximum page count after the change in register P2.
+    MaxPgcnt {
+        db: usize,      // P1: database index
+        dest: usize,    // P2: output register
+        new_max: usize, // P3: new maximum page count (0 = just return current)
+    },
+    /// Get or set the journal mode for database P1.
+    /// If P3 is not null, it contains the new journal mode string.
+    /// Store the resulting journal mode in register P2.
+    JournalMode {
+        db: usize,                // P1: database index
+        dest: usize,              // P2: output register for result
+        new_mode: Option<String>, // P3: new journal mode (if setting)
+    },
+    IfNeg {
+        reg: usize,
+        target_pc: BranchOffset,
+    },
+
+    /// Find the next available sequence number for cursor P1. Write the sequence number into register P2.
+    /// The sequence number on the cursor is incremented after this instruction.
+    Sequence {
+        cursor_id: CursorID,
+        target_reg: usize,
+    },
+
+    /// P1 is a sorter cursor. If the sequence counter is currently zero, jump to P2. Regardless of whether or not the jump is taken, increment the the sequence value.
+    SequenceTest {
+        cursor_id: CursorID,
+        target_pc: BranchOffset,
+        value_reg: usize,
+    },
+
+    // OP_Explain
+    Explain {
+        p1: usize,         // P1: address of instruction
+        p2: Option<usize>, // P2: address of parent explain instruction
+        detail: String,    // P4: detail text
+    },
+}
+
+const fn get_insn_virtual_table() -> [InsnFunction; InsnVariants::COUNT] {
+    let mut result: [InsnFunction; InsnVariants::COUNT] = [execute::op_init; InsnVariants::COUNT];
+
+    let mut insn = 0;
+    while insn < InsnVariants::COUNT {
+        result[insn] = InsnVariants::from_repr(insn as u8).unwrap().to_function();
+        insn += 1;
+    }
+
+    result
+}
+
+const INSN_VTABLE: [InsnFunction; InsnVariants::COUNT] = get_insn_virtual_table();
+
+impl InsnVariants {
+    // This function is used for testing
+    #[allow(dead_code)]
+    #[inline(always)]
+    pub(crate) const fn to_function_fast(self) -> InsnFunction {
+        INSN_VTABLE[self as usize]
+    }
+
+    // This function is used for generating `INSN_VTABLE`.
+    // We need to keep this function to make sure we implement all opcodes
+    pub(crate) const fn to_function(self) -> InsnFunction {
+        match self {
+            InsnVariants::Init => execute::op_init,
+            InsnVariants::Null => execute::op_null,
+            InsnVariants::BeginSubrtn => execute::op_null,
+            InsnVariants::NullRow => execute::op_null_row,
+            InsnVariants::Add => execute::op_add,
+            InsnVariants::Subtract => execute::op_subtract,
+            InsnVariants::Multiply => execute::op_multiply,
+            InsnVariants::Divide => execute::op_divide,
+            InsnVariants::DropIndex => execute::op_drop_index,
+            InsnVariants::Compare => execute::op_compare,
+            InsnVariants::BitAnd => execute::op_bit_and,
+            InsnVariants::BitOr => execute::op_bit_or,
+            InsnVariants::BitNot => execute::op_bit_not,
+            InsnVariants::Checkpoint => execute::op_checkpoint,
+            InsnVariants::Remainder => execute::op_remainder,
+            InsnVariants::Jump => execute::op_jump,
+            InsnVariants::Move => execute::op_move,
+            InsnVariants::IfPos => execute::op_if_pos,
+            InsnVariants::NotNull => execute::op_not_null,
+            InsnVariants::Eq
+            | InsnVariants::Ne
+            | InsnVariants::Lt
+            | InsnVariants::Le
+            | InsnVariants::Gt
+            | InsnVariants::Ge => execute::op_comparison,
+            InsnVariants::If => execute::op_if,
+            InsnVariants::IfNot => execute::op_if_not,
+            InsnVariants::OpenRead => execute::op_open_read,
+            InsnVariants::VOpen => execute::op_vopen,
+            InsnVariants::VCreate => execute::op_vcreate,
+            InsnVariants::VFilter => execute::op_vfilter,
+            InsnVariants::VColumn => execute::op_vcolumn,
+            InsnVariants::VUpdate => execute::op_vupdate,
+            InsnVariants::VNext => execute::op_vnext,
+            InsnVariants::VDestroy => execute::op_vdestroy,
+            InsnVariants::OpenPseudo => execute::op_open_pseudo,
+            InsnVariants::Rewind => execute::op_rewind,
+            InsnVariants::Last => execute::op_last,
+            InsnVariants::Column => execute::op_column,
+            InsnVariants::TypeCheck => execute::op_type_check,
+            InsnVariants::MakeRecord => execute::op_make_record,
+            InsnVariants::ResultRow => execute::op_result_row,
+            InsnVariants::Next => execute::op_next,
+            InsnVariants::Prev => execute::op_prev,
+            InsnVariants::Halt => execute::op_halt,
+            InsnVariants::HaltIfNull => execute::op_halt_if_null,
+            InsnVariants::Transaction => execute::op_transaction,
+            InsnVariants::AutoCommit => execute::op_auto_commit,
+            InsnVariants::Goto => execute::op_goto,
+            InsnVariants::Gosub => execute::op_gosub,
+            InsnVariants::Return => execute::op_return,
+            InsnVariants::Integer => execute::op_integer,
+            InsnVariants::Real => execute::op_real,
+            InsnVariants::RealAffinity => execute::op_real_affinity,
+            InsnVariants::String8 => execute::op_string8,
+            InsnVariants::Blob => execute::op_blob,
+            InsnVariants::RowData => execute::op_row_data,
+            InsnVariants::RowId => execute::op_row_id,
+            InsnVariants::IdxRowId => execute::op_idx_row_id,
+            InsnVariants::SeekRowid => execute::op_seek_rowid,
+            InsnVariants::DeferredSeek => execute::op_deferred_seek,
+            InsnVariants::SeekGE
+            | InsnVariants::SeekGT
+            | InsnVariants::SeekLE
+            | InsnVariants::SeekLT => execute::op_seek,
+            InsnVariants::SeekEnd => execute::op_seek_end,
+            InsnVariants::IdxGE => execute::op_idx_ge,
+            InsnVariants::IdxGT => execute::op_idx_gt,
+            InsnVariants::IdxLE => execute::op_idx_le,
+            InsnVariants::IdxLT => execute::op_idx_lt,
+            InsnVariants::DecrJumpZero => execute::op_decr_jump_zero,
+            InsnVariants::AggStep => execute::op_agg_step,
+            InsnVariants::AggFinal | InsnVariants::AggValue => execute::op_agg_final,
+            InsnVariants::SorterOpen => execute::op_sorter_open,
+            InsnVariants::SorterInsert => execute::op_sorter_insert,
+            InsnVariants::SorterSort => execute::op_sorter_sort,
+            InsnVariants::SorterData => execute::op_sorter_data,
+            InsnVariants::SorterNext => execute::op_sorter_next,
+            InsnVariants::Function => execute::op_function,
+            InsnVariants::Cast => execute::op_cast,
+            InsnVariants::InitCoroutine => execute::op_init_coroutine,
+            InsnVariants::EndCoroutine => execute::op_end_coroutine,
+            InsnVariants::Yield => execute::op_yield,
+            InsnVariants::Insert => execute::op_insert,
+            InsnVariants::Int64 => execute::op_int_64,
+            InsnVariants::IdxInsert => execute::op_idx_insert,
+            InsnVariants::Delete => execute::op_delete,
+            InsnVariants::NewRowid => execute::op_new_rowid,
+            InsnVariants::MustBeInt => execute::op_must_be_int,
+            InsnVariants::SoftNull => execute::op_soft_null,
+            InsnVariants::NoConflict => execute::op_no_conflict,
+            InsnVariants::NotExists => execute::op_not_exists,
+            InsnVariants::OffsetLimit => execute::op_offset_limit,
+            InsnVariants::OpenWrite => execute::op_open_write,
+            InsnVariants::Copy => execute::op_copy,
+            InsnVariants::CreateBtree => execute::op_create_btree,
+            InsnVariants::Destroy => execute::op_destroy,
+            InsnVariants::ResetSorter => execute::op_reset_sorter,
+            InsnVariants::DropTable => execute::op_drop_table,
+            InsnVariants::DropView => execute::op_drop_view,
+            InsnVariants::Close => execute::op_close,
+            InsnVariants::IsNull => execute::op_is_null,
+            InsnVariants::CollSeq => execute::op_coll_seq,
+            InsnVariants::ParseSchema => execute::op_parse_schema,
+            InsnVariants::PopulateMaterializedViews => execute::op_populate_materialized_views,
+            InsnVariants::ShiftRight => execute::op_shift_right,
+            InsnVariants::ShiftLeft => execute::op_shift_left,
+            InsnVariants::AddImm => execute::op_add_imm,
+            InsnVariants::Variable => execute::op_variable,
+            InsnVariants::ZeroOrNull => execute::op_zero_or_null,
+            InsnVariants::Not => execute::op_not,
+            InsnVariants::Concat => execute::op_concat,
+            InsnVariants::And => execute::op_and,
+            InsnVariants::Or => execute::op_or,
+            InsnVariants::Noop => execute::op_noop,
+            InsnVariants::PageCount => execute::op_page_count,
+            InsnVariants::ReadCookie => execute::op_read_cookie,
+            InsnVariants::SetCookie => execute::op_set_cookie,
+            InsnVariants::OpenEphemeral | InsnVariants::OpenAutoindex => execute::op_open_ephemeral,
+            InsnVariants::Once => execute::op_once,
+            InsnVariants::Found | InsnVariants::NotFound => execute::op_found,
+            InsnVariants::Affinity => execute::op_affinity,
+            InsnVariants::IdxDelete => execute::op_idx_delete,
+            InsnVariants::Count => execute::op_count,
+            InsnVariants::IntegrityCk => execute::op_integrity_check,
+            InsnVariants::RenameTable => execute::op_rename_table,
+            InsnVariants::DropColumn => execute::op_drop_column,
+            InsnVariants::AddColumn => execute::op_add_column,
+            InsnVariants::AlterColumn => execute::op_alter_column,
+            InsnVariants::MaxPgcnt => execute::op_max_pgcnt,
+            InsnVariants::JournalMode => execute::op_journal_mode,
+            InsnVariants::IfNeg => execute::op_if_neg,
+            InsnVariants::Explain => execute::op_noop,
+            InsnVariants::OpenDup => execute::op_open_dup,
+            InsnVariants::MemMax => execute::op_mem_max,
+            InsnVariants::Sequence => execute::op_sequence,
+            InsnVariants::SequenceTest => execute::op_sequence_test,
+        }
+    }
 }
 
 impl Insn {
+    // SAFETY: If the enumeration specifies a primitive representation,
+    // then the discriminant may be reliably accessed via unsafe pointer casting
+    #[inline(always)]
+    fn discriminant(&self) -> u8 {
+        unsafe { *(self as *const Self as *const u8) }
+    }
+
+    #[inline(always)]
     pub fn to_function(&self) -> InsnFunction {
-        match self {
-            Insn::Init { .. } => execute::op_init,
-            Insn::Null { .. } => execute::op_null,
-            Insn::BeginSubrtn { .. } => execute::op_null,
-            Insn::NullRow { .. } => execute::op_null_row,
-            Insn::Add { .. } => execute::op_add,
-            Insn::Subtract { .. } => execute::op_subtract,
-            Insn::Multiply { .. } => execute::op_multiply,
-            Insn::Divide { .. } => execute::op_divide,
-            Insn::DropIndex { .. } => execute::op_drop_index,
-            Insn::Compare { .. } => execute::op_compare,
-            Insn::BitAnd { .. } => execute::op_bit_and,
-            Insn::BitOr { .. } => execute::op_bit_or,
-            Insn::BitNot { .. } => execute::op_bit_not,
-            Insn::Checkpoint { .. } => execute::op_checkpoint,
-            Insn::Remainder { .. } => execute::op_remainder,
-            Insn::Jump { .. } => execute::op_jump,
-            Insn::Move { .. } => execute::op_move,
-            Insn::IfPos { .. } => execute::op_if_pos,
-            Insn::NotNull { .. } => execute::op_not_null,
-            Insn::Eq { .. }
-            | Insn::Ne { .. }
-            | Insn::Lt { .. }
-            | Insn::Le { .. }
-            | Insn::Gt { .. }
-            | Insn::Ge { .. } => execute::op_comparison,
-            Insn::If { .. } => execute::op_if,
-            Insn::IfNot { .. } => execute::op_if_not,
-            Insn::OpenRead { .. } => execute::op_open_read,
-            Insn::VOpen { .. } => execute::op_vopen,
-            Insn::VCreate { .. } => execute::op_vcreate,
-            Insn::VFilter { .. } => execute::op_vfilter,
-            Insn::VColumn { .. } => execute::op_vcolumn,
-            Insn::VUpdate { .. } => execute::op_vupdate,
-            Insn::VNext { .. } => execute::op_vnext,
-            Insn::VDestroy { .. } => execute::op_vdestroy,
-
-            Insn::OpenPseudo { .. } => execute::op_open_pseudo,
-            Insn::Rewind { .. } => execute::op_rewind,
-            Insn::Last { .. } => execute::op_last,
-            Insn::Column { .. } => execute::op_column,
-            Insn::TypeCheck { .. } => execute::op_type_check,
-            Insn::MakeRecord { .. } => execute::op_make_record,
-            Insn::ResultRow { .. } => execute::op_result_row,
-            Insn::Next { .. } => execute::op_next,
-            Insn::Prev { .. } => execute::op_prev,
-            Insn::Halt { .. } => execute::op_halt,
-            Insn::HaltIfNull { .. } => execute::op_halt_if_null,
-            Insn::Transaction { .. } => execute::op_transaction,
-            Insn::AutoCommit { .. } => execute::op_auto_commit,
-            Insn::Goto { .. } => execute::op_goto,
-            Insn::Gosub { .. } => execute::op_gosub,
-            Insn::Return { .. } => execute::op_return,
-            Insn::Integer { .. } => execute::op_integer,
-            Insn::Real { .. } => execute::op_real,
-            Insn::RealAffinity { .. } => execute::op_real_affinity,
-            Insn::String8 { .. } => execute::op_string8,
-            Insn::Blob { .. } => execute::op_blob,
-            Insn::RowData { .. } => execute::op_row_data,
-            Insn::RowId { .. } => execute::op_row_id,
-            Insn::IdxRowId { .. } => execute::op_idx_row_id,
-            Insn::SeekRowid { .. } => execute::op_seek_rowid,
-            Insn::DeferredSeek { .. } => execute::op_deferred_seek,
-            Insn::SeekGE { .. }
-            | Insn::SeekGT { .. }
-            | Insn::SeekLE { .. }
-            | Insn::SeekLT { .. } => execute::op_seek,
-            Insn::SeekEnd { .. } => execute::op_seek_end,
-            Insn::IdxGE { .. } => execute::op_idx_ge,
-            Insn::IdxGT { .. } => execute::op_idx_gt,
-            Insn::IdxLE { .. } => execute::op_idx_le,
-            Insn::IdxLT { .. } => execute::op_idx_lt,
-            Insn::DecrJumpZero { .. } => execute::op_decr_jump_zero,
-            Insn::AggStep { .. } => execute::op_agg_step,
-            Insn::AggFinal { .. } => execute::op_agg_final,
-            Insn::SorterOpen { .. } => execute::op_sorter_open,
-            Insn::SorterInsert { .. } => execute::op_sorter_insert,
-            Insn::SorterSort { .. } => execute::op_sorter_sort,
-            Insn::SorterData { .. } => execute::op_sorter_data,
-            Insn::SorterNext { .. } => execute::op_sorter_next,
-            Insn::Function { .. } => execute::op_function,
-            Insn::InitCoroutine { .. } => execute::op_init_coroutine,
-            Insn::EndCoroutine { .. } => execute::op_end_coroutine,
-            Insn::Yield { .. } => execute::op_yield,
-            Insn::Insert { .. } => execute::op_insert,
-            Insn::Int64 { .. } => execute::op_int_64,
-            Insn::IdxInsert { .. } => execute::op_idx_insert,
-            Insn::Delete { .. } => execute::op_delete,
-            Insn::NewRowid { .. } => execute::op_new_rowid,
-            Insn::MustBeInt { .. } => execute::op_must_be_int,
-            Insn::SoftNull { .. } => execute::op_soft_null,
-            Insn::NoConflict { .. } => execute::op_no_conflict,
-            Insn::NotExists { .. } => execute::op_not_exists,
-            Insn::OffsetLimit { .. } => execute::op_offset_limit,
-            Insn::OpenWrite { .. } => execute::op_open_write,
-            Insn::Copy { .. } => execute::op_copy,
-            Insn::CreateBtree { .. } => execute::op_create_btree,
-            Insn::Destroy { .. } => execute::op_destroy,
-
-            Insn::DropTable { .. } => execute::op_drop_table,
-            Insn::Close { .. } => execute::op_close,
-            Insn::IsNull { .. } => execute::op_is_null,
-            Insn::ParseSchema { .. } => execute::op_parse_schema,
-            Insn::ShiftRight { .. } => execute::op_shift_right,
-            Insn::ShiftLeft { .. } => execute::op_shift_left,
-            Insn::Variable { .. } => execute::op_variable,
-            Insn::ZeroOrNull { .. } => execute::op_zero_or_null,
-            Insn::Not { .. } => execute::op_not,
-            Insn::Concat { .. } => execute::op_concat,
-            Insn::And { .. } => execute::op_and,
-            Insn::Or { .. } => execute::op_or,
-            Insn::Noop => execute::op_noop,
-            Insn::PageCount { .. } => execute::op_page_count,
-            Insn::ReadCookie { .. } => execute::op_read_cookie,
-            Insn::SetCookie { .. } => execute::op_set_cookie,
-            Insn::OpenEphemeral { .. } | Insn::OpenAutoindex { .. } => execute::op_open_ephemeral,
-            Insn::Once { .. } => execute::op_once,
-            Insn::Found { .. } | Insn::NotFound { .. } => execute::op_found,
-            Insn::Affinity { .. } => execute::op_affinity,
-            Insn::IdxDelete { .. } => execute::op_idx_delete,
-            Insn::Count { .. } => execute::op_count,
-            Insn::IntegrityCk { .. } => execute::op_integrity_check,
-        }
+        // dont use this because its still using match
+        // InsnVariants::from(self).to_function_fast()
+        INSN_VTABLE[self.discriminant() as usize]
     }
 }
 
@@ -1139,4 +1358,24 @@ pub enum Cookie {
     UserVersion = 6,
     /// The auto-vacuum mode setting.
     IncrementalVacuum = 7,
+    /// The application ID as set by the application_id pragma.
+    ApplicationId = 8,
+}
+
+#[cfg(test)]
+mod tests {
+    use strum::VariantArray;
+
+    #[test]
+    fn test_make_sure_correct_insn_table() {
+        for variant in super::InsnVariants::VARIANTS {
+            let func1 = variant.to_function();
+            let func2 = variant.to_function_fast();
+            assert_eq!(
+                func1 as usize, func2 as usize,
+                "Variant {:?} does not match in fast table at index {}",
+                variant, *variant as usize
+            );
+        }
+    }
 }

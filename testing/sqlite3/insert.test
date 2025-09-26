@@ -32,7 +32,7 @@ do_test insert-1.2 {
 # Try to insert the wrong number of entries.
 #
 do_test insert-1.3 {
-  execsql {CREATE TABLE test1(one int, two int, three int)}
+  execsql {CREATE TABLE test1 (one int, two int, three int)}
   set v [catch {execsql {INSERT INTO test1 VALUES(1,2)}} msg]
   lappend v $msg
 } {1 {table test1 has 3 columns but 2 values were supplied}}
@@ -89,7 +89,7 @@ do_test insert-1.6c {
 #
 do_test insert-2.1 {
   execsql {
-    CREATE TABLE test2(
+    CREATE TABLE test2 (
       f1 int default -111, 
       f2 real default +4.32,
       f3 int default +222,
@@ -113,7 +113,7 @@ do_test insert-2.4 {
 do_test insert-2.10 {
   execsql {
     DROP TABLE test2;
-    CREATE TABLE test2(
+    CREATE TABLE test2 (
       f1 int default 111, 
       f2 real default -4.32,
       f3 text default hi,
@@ -170,7 +170,7 @@ integrity_check insert-3.5
 #
 do_test insert-4.1 {
   execsql {
-    CREATE TABLE t3(a,b,c);
+    CREATE TABLE t3 (a,b,c);
     INSERT INTO t3 VALUES(1+2+3,4,5);
     SELECT * FROM t3;
   }
@@ -292,7 +292,7 @@ ifcapable conflict {
   # defined at compilation time.
   do_test insert-6.1 {
     execsql {
-      CREATE TABLE t1(a INTEGER PRIMARY KEY, b UNIQUE);
+      CREATE TABLE t1 (a INTEGER PRIMARY KEY, b UNIQUE);
       INSERT INTO t1 VALUES(1,2);
       INSERT INTO t1 VALUES(2,3);
       SELECT b FROM t1 WHERE b=2;
@@ -332,7 +332,7 @@ ifcapable conflict {
 # INSERT statments.
 do_test insert-7.1 {
   execsql {
-    CREATE TABLE t1(a);
+    CREATE TABLE t1 (a);
     INSERT INTO t1 VALUES(1);
     INSERT INTO t1 VALUES(2);
     CREATE INDEX i1 ON t1(a);
@@ -366,7 +366,7 @@ ifcapable subquery&&compound {
 #
 do_test insert-9.1 {
   execsql {
-    CREATE TABLE t5(x);
+    CREATE TABLE t5 (x);
     INSERT INTO t5 VALUES(1);
     INSERT INTO t5 VALUES(2);
     INSERT INTO t5 VALUES(3);
@@ -376,7 +376,7 @@ do_test insert-9.1 {
 } {1 1 2 2 3 3 12 101 13 102 16 103}
 do_test insert-9.2 {
   execsql {
-    CREATE TABLE t6(x INTEGER PRIMARY KEY, y);
+    CREATE TABLE t6 (x INTEGER PRIMARY KEY, y);
     INSERT INTO t6 VALUES(1,1);
     INSERT INTO t6 VALUES(2,2);
     INSERT INTO t6 VALUES(3,3);
@@ -390,7 +390,7 @@ do_test insert-9.2 {
 ifcapable compound {
   do_test insert-10.1 {
     execsql {
-      CREATE TABLE t10(a,b,c);
+      CREATE TABLE t10 (a,b,c);
       INSERT INTO t10 VALUES(1,2,3), (4,5,6), (7,8,9);
       SELECT * FROM t10;
     }
@@ -416,20 +416,20 @@ do_execsql_test insert-11.1 {
 # Ticket http://sqlite.org/src/info/e9654505cfda9361
 #
 do_execsql_test insert-12.1 {
-  CREATE TABLE t12a(a,b,c,d,e,f,g);
+  CREATE TABLE t12a (a,b,c,d,e,f,g);
   INSERT INTO t12a VALUES(101,102,103,104,105,106,107);
-  CREATE TABLE t12b(x);
+  CREATE TABLE t12b (x);
   INSERT INTO t12b(x,rowid,x,x,x,x,x) SELECT * FROM t12a;
   SELECT rowid, x FROM t12b;
 } {102 101}
 do_execsql_test insert-12.2 {
-  CREATE TABLE tab1( value INTEGER);
+  CREATE TABLE tab1 ( value INTEGER);
   INSERT INTO tab1 (value, _rowid_) values( 11, 1);
   INSERT INTO tab1 (value, _rowid_) SELECT 22,999;
   SELECT * FROM tab1;
 } {11 22}
 do_execsql_test insert-12.3 {
-  CREATE TABLE t12c(a, b DEFAULT 'xyzzy', c);
+  CREATE TABLE t12c (a, b DEFAULT 'xyzzy', c);
   INSERT INTO t12c(a, rowid, c) SELECT 'one', 999, 'two';
   SELECT * FROM t12c;
 } {one xyzzy two}
@@ -441,7 +441,7 @@ do_execsql_test insert-12.3 {
 #
 do_execsql_test insert-13.1 {
   DROP TABLE IF EXISTS t13;
-  CREATE TABLE t13(a INTEGER PRIMARY KEY,b UNIQUE);
+  CREATE TABLE t13 (a INTEGER PRIMARY KEY,b UNIQUE);
   CREATE INDEX t13x1 ON t13(-b=b);
   INSERT INTO t13 VALUES(1,5),(6,2);
   REPLACE INTO t13 SELECT b,0 FROM t13;
@@ -452,7 +452,7 @@ do_execsql_test insert-13.1 {
 #
 do_execsql_test insert-14.1 {
   DROP TABLE IF EXISTS t14;
-  CREATE TABLE t14(x INTEGER PRIMARY KEY);
+  CREATE TABLE t14 (x INTEGER PRIMARY KEY);
   INSERT INTO t14 VALUES(CASE WHEN 1 THEN null END);
   SELECT x FROM t14;
 } {1}
@@ -464,9 +464,9 @@ integrity_check insert-14.2
 do_execsql_test insert-15.1 {
   DROP TABLE IF EXISTS t1;
   DROP TABLE IF EXISTS t2;
-  CREATE TABLE t1(a INTEGER PRIMARY KEY, b TEXT);
+  CREATE TABLE t1 (a INTEGER PRIMARY KEY, b TEXT);
   CREATE INDEX i1 ON t1(b);
-  CREATE TABLE t2(a, b);
+  CREATE TABLE t2 (a, b);
   INSERT INTO t2 VALUES(4, randomblob(31000));
   INSERT INTO t2 VALUES(4, randomblob(32000));
   INSERT INTO t2 VALUES(4, randomblob(33000));
@@ -483,7 +483,7 @@ db close
 sqlite3 db :memory:
 do_catchsql_test insert-16.1 {
   PRAGMA recursive_triggers = true;
-  CREATE TABLE t0(c0,c1);
+  CREATE TABLE t0 (c0,c1);
   CREATE UNIQUE INDEX i0 ON t0(c0);
   INSERT INTO t0(c0,c1) VALUES(123,1);
   CREATE TRIGGER tr0 AFTER DELETE ON t0
@@ -497,7 +497,7 @@ do_execsql_test insert-16.2 {
 } {123 1}
 integrity_check insert-16.3
 do_catchsql_test insert-16.4 {
-  CREATE TABLE t1(a INTEGER PRIMARY KEY, b);
+  CREATE TABLE t1 (a INTEGER PRIMARY KEY, b);
   CREATE INDEX t1b ON t1(b);
   INSERT INTO t1 VALUES(1, 'one');
   CREATE TRIGGER tr3 AFTER DELETE ON t1 BEGIN
@@ -508,8 +508,8 @@ do_catchsql_test insert-16.4 {
 integrity_check insert-16.5
 do_catchsql_test insert-16.6 {
   PRAGMA foreign_keys = 1;
-  CREATE TABLE p1(a, b UNIQUE);
-  CREATE TABLE c1(c, d REFERENCES p1(b) ON DELETE CASCADE);
+  CREATE TABLE p1 (a, b UNIQUE);
+  CREATE TABLE c1 (c, d REFERENCES p1(b) ON DELETE CASCADE);
   CREATE TRIGGER tr6 AFTER DELETE ON c1 BEGIN
     INSERT INTO p1 VALUES(4, 1);
   END;
@@ -523,7 +523,7 @@ integrity_check insert-16.7
 do_catchsql_test insert-17.1 {
   PRAGMA temp.recursive_triggers = true;
   DROP TABLE IF EXISTS t0;
-  CREATE TABLE t0(aa, bb);
+  CREATE TABLE t0 (aa, bb);
   CREATE UNIQUE INDEX t0bb ON t0(bb);
   CREATE TRIGGER "r17.1" BEFORE DELETE ON t0
     BEGIN INSERT INTO t0(aa,bb) VALUES(99,1);
@@ -534,7 +534,7 @@ do_catchsql_test insert-17.1 {
 integrity_check insert-17.2
 do_catchsql_test insert-17.3 {
   DROP TABLE IF EXISTS t1;
-  CREATE TABLE t1(a, b UNIQUE, c UNIQUE);
+  CREATE TABLE t1 (a, b UNIQUE, c UNIQUE);
   INSERT INTO t1(a,b,c) VALUES(1,1,1),(2,2,2),(3,3,3),(4,4,4);
   CREATE TRIGGER "r17.3" AFTER DELETE ON t1 WHEN OLD.c<>3 BEGIN
     INSERT INTO t1(rowid,a,b,c) VALUES(100,100,100,3);
@@ -543,10 +543,10 @@ do_catchsql_test insert-17.3 {
 } {1 {UNIQUE constraint failed: t1.c}}
 integrity_check insert-17.4
 do_execsql_test insert-17.5 {
-  CREATE TABLE t2(a INTEGER PRIMARY KEY, b);
+  CREATE TABLE t2 (a INTEGER PRIMARY KEY, b);
   CREATE UNIQUE INDEX t2b ON t2(b);
   INSERT INTO t2(a,b) VALUES(1,1),(2,2),(3,3),(4,4);
-  CREATE TABLE fire(x);
+  CREATE TABLE fire (x);
   CREATE TRIGGER t2r1 AFTER DELETE ON t2 BEGIN
     INSERT INTO fire VALUES(old.a);
   END;
@@ -567,7 +567,7 @@ do_execsql_test insert-17.8 {
   SELECT x FROM fire ORDER BY x;
 } {3}
 do_execsql_test insert-17.10 {
-  CREATE TABLE t3(a INTEGER PRIMARY KEY, b INT, c INT, d INT);
+  CREATE TABLE t3 (a INTEGER PRIMARY KEY, b INT, c INT, d INT);
   CREATE UNIQUE INDEX t3bpi ON t3(b) WHERE c<=d;
   CREATE UNIQUE INDEX t3d ON t3(d);
   INSERT INTO t3(a,b,c,d) VALUES(1,1,1,1),(2,1,3,2),(3,4,5,6);

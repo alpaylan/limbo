@@ -5,6 +5,7 @@ use std::{
     io::{self, Write},
     sync::Arc,
 };
+use turso_core::{LimboError, StepResult};
 
 #[derive(Copy, Clone)]
 pub enum DbLocation {
@@ -62,6 +63,7 @@ impl Default for Io {
 pub enum OutputMode {
     List,
     Pretty,
+    Line,
 }
 
 impl std::fmt::Display for OutputMode {
@@ -81,9 +83,10 @@ pub struct Settings {
     pub echo: bool,
     pub is_stdout: bool,
     pub io: Io,
-    pub tracing_output: Option<String>,
     pub timer: bool,
     pub headers: bool,
+    pub mcp: bool,
+    pub stats: bool,
 }
 
 impl From<Opts> for Settings {
@@ -106,9 +109,10 @@ impl From<Opts> for Settings {
                 "" => Io::default(),
                 vfs => Io::External(vfs.to_string()),
             },
-            tracing_output: opts.tracing_output,
             timer: false,
             headers: false,
+            mcp: opts.mcp,
+            stats: false,
         }
     }
 }
@@ -178,15 +182,132 @@ pub fn get_io(db_location: DbLocation, io_choice: &str) -> anyhow::Result<Arc<dy
     })
 }
 
+pub struct ApplyWriter<'a> {
+    target: &'a Arc<turso_core::Connection>,
+    // accumulate raw bytes to support non-utf8 BLOB types
+    buf: Vec<u8>,
+}
+
+impl<'a> ApplyWriter<'a> {
+    pub fn new(target: &'a Arc<turso_core::Connection>) -> Self {
+        Self {
+            target,
+            buf: Vec::new(),
+        }
+    }
+
+    // Find the next statement terminator ;\n or ;\r\n in a byte buffer.
+    // Returns (end_idx_inclusive, drain_len), where drain_len includes the newline(s).
+    fn find_stmt_end(buf: &[u8]) -> Option<(usize, usize)> {
+        let mut i = 0;
+        while i < buf.len() {
+            // Look for ';'
+            if buf[i] == b';' {
+                // Accept ;\n
+                if i + 1 < buf.len() && buf[i + 1] == b'\n' {
+                    return Some((i, 2));
+                }
+                // Accept ;\r\n
+                if i + 2 < buf.len() && buf[i + 1] == b'\r' && buf[i + 2] == b'\n' {
+                    return Some((i, 3));
+                }
+            }
+            i += 1;
+        }
+        None
+    }
+
+    pub fn flush_complete_statements(&mut self) -> io::Result<()> {
+        while let Some((end_inclusive, drain_len)) = Self::find_stmt_end(&self.buf) {
+            // Copy stmt bytes [0..=end_inclusive]
+            let stmt_bytes = self.buf[..=end_inclusive].to_vec();
+            // Drain including the trailing newline(s)
+            self.buf.drain(..end_inclusive + drain_len);
+            self.exec_stmt_bytes(&stmt_bytes)?;
+        }
+        Ok(())
+    }
+
+    // Handle final trailing statement that ends with ';' followed only by ASCII whitespace.
+    pub fn finish(mut self) -> io::Result<()> {
+        // Skip if buffer empty or no ';'
+        if let Some(semicolon_pos) = self.buf.iter().rposition(|&b| b == b';') {
+            // Are all bytes after ';' ASCII whitespace?
+            if self.buf[semicolon_pos + 1..]
+                .iter()
+                .all(|&b| matches!(b, b' ' | b'\t' | b'\r' | b'\n'))
+            {
+                let stmt_bytes = self.buf[..=semicolon_pos].to_vec();
+                self.buf.clear();
+                self.exec_stmt_bytes(&stmt_bytes)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn exec_stmt_bytes(&self, stmt_bytes: &[u8]) -> io::Result<()> {
+        // SQL must be UTF-8. If not, surface a clear error.
+        let sql = std::str::from_utf8(stmt_bytes).map_err(|e| {
+            io::Error::new(io::ErrorKind::InvalidData, format!("non-UTF8 SQL: {e}"))
+        })?;
+        self.exec_stmt(sql)
+            .map_err(|e| io::Error::other(e.to_string()))
+    }
+
+    fn exec_stmt(&self, sql: &str) -> Result<(), LimboError> {
+        match self.target.query(sql) {
+            Ok(Some(mut rows)) => loop {
+                match rows.step()? {
+                    StepResult::Row => {}
+                    StepResult::IO => rows.run_once()?,
+                    StepResult::Done | StepResult::Interrupt => break,
+                    StepResult::Busy => {
+                        return Err(LimboError::InternalError("target database is busy".into()))
+                    }
+                }
+            },
+            Ok(None) => {}
+            Err(e) => return Err(e),
+        }
+        Ok(())
+    }
+}
+
+impl<'a> Write for ApplyWriter<'a> {
+    fn write(&mut self, data: &[u8]) -> io::Result<usize> {
+        self.buf.extend_from_slice(data);
+        self.flush_complete_statements()?;
+        Ok(data.len())
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        self.flush_complete_statements()
+    }
+}
+
+pub trait ProgressSink {
+    fn on<S: Display>(&mut self, _p: S) {}
+}
+
+pub struct NoopProgress;
+impl ProgressSink for NoopProgress {}
+
+pub struct StderrProgress;
+
+impl ProgressSink for StderrProgress {
+    fn on<S: Display>(&mut self, s: S) {
+        eprintln!("{s}... done");
+    }
+}
+
 pub const BEFORE_HELP_MSG: &str = r#"
 
-Limbo SQL Shell Help
+Turso SQL Shell Help
 ==============
-Welcome to the Limbo SQL Shell! You can execute any standard SQL command here.
+Welcome to the Turso SQL Shell! You can execute any standard SQL command here.
 In addition to standard SQL commands, the following special commands are available:"#;
 pub const AFTER_HELP_MSG: &str = r#"Usage Examples:
 ---------------
-1. To quit the Limbo SQL Shell:
+1. To quit the Turso SQL Shell:
    .quit
 
 2. To open a database file at path './employees.db':
@@ -198,40 +319,51 @@ pub const AFTER_HELP_MSG: &str = r#"Usage Examples:
 4. To list all tables:
    .tables
 
-5. To list all available SQL opcodes:
+5. To list all databases:
+   .databases
+
+6. To list all available SQL opcodes:
    .opcodes
 
-6. To change the current output mode to 'pretty':
+7. To change the current output mode to 'pretty':
    .mode pretty
 
-7. Send output to STDOUT if no file is specified:
+8. Send output to STDOUT if no file is specified:
    .output
 
-8. To change the current working directory to '/tmp':
+9. To change the current working directory to '/tmp':
    .cd /tmp
 
-9. Show the current values of settings:
+10. Show the current values of settings:
    .show
 
-10. To import csv file 'sample.csv' into 'csv_table' table:
+11. To import csv file 'sample.csv' into 'csv_table' table:
    .import --csv sample.csv csv_table
 
-11. To display the database contents as SQL:
+12. To display the database contents as SQL:
    .dump
 
-12. To load an extension library:
+13. To load an extension library:
    .load /target/debug/liblimbo_regexp
 
-13. To list all available VFS:
+14. To list all available VFS:
    .listvfs
-14. To show names of indexes:
+
+15. To show names of indexes:
    .indexes ?TABLE?
 
-15. To turn on column headers in list mode:
+16. To turn on column headers in list mode:
    .headers on
 
-16. To turn off column headers in list mode:
+17. To turn off column headers in list mode:
    .headers off
+
+18. To clone the open database to another file:
+   .clone output_file.db
+
+19. To view manual pages for features:
+   .manual mcp    # View MCP server documentation
+   .man           # List all available manuals
 
 Note:
 - All SQL commands must end with a semicolon (;).

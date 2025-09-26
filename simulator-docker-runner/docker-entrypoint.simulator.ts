@@ -72,6 +72,8 @@ const timeouter = (seconds: number, runNumber: number) => {
   return timeouterPromise;
 }
 
+let unexpectedExits = 0;
+
 const run = async (seed: string, bin: string, args: string[]): Promise<boolean> => {
   const proc = spawn([`/app/${bin}`, ...args], {
     stdout: LOG_TO_STDOUT ? "inherit" : "pipe",
@@ -87,7 +89,7 @@ const run = async (seed: string, bin: string, args: string[]): Promise<boolean> 
     const stdout = await new Response(proc.stdout).text();
     const stderr = await new Response(proc.stderr).text();
 
-    if (exitCode !== 0) {
+    if (exitCode !== 0 && exitCode !== 137) {
       console.log(`[${new Date().toISOString()}]: ${bin} ${args.join(" ")} exited with code ${exitCode}`);
       const output = stdout + stderr;
 
@@ -123,6 +125,9 @@ const run = async (seed: string, bin: string, args: string[]): Promise<boolean> 
         console.log(`Simulator seed: ${seed}`);
         process.exit(1);
       }
+    } else if (exitCode === 137) {
+      console.error("Child process exited due to sigkill, ignoring...");
+      unexpectedExits++;
     }
   } catch (err) {
     if (err instanceof TimeoutError) {
@@ -166,9 +171,15 @@ while (new Date().getTime() - startTime.getTime() < TIME_LIMIT_MINUTES * 60 * 10
   args.push('--seed', seed);
   // Bugbase wants to have .git available, so we disable it
   args.push("--disable-bugbase");
+
+  if (Math.random() < 0.5) {
+    args.push("--profile", "faultless");
+  }
+
   args.push(...["--minimum-tests", "100", "--maximum-tests", "1000"]);
   const loop = args.includes("loop") ? [] : ["loop", "-n", "10", "--short-circuit"]
   args.push(...loop);
+
 
   console.log(`[${timestamp}]: Running "limbo_sim ${args.join(" ")}" - (seed ${seed}, run number ${runNumber})`);
   const issuePosted = await run(seed, "limbo_sim", args);
@@ -190,6 +201,7 @@ console.log(`\nRun completed! Total runs: ${runNumber}, Issues posted: ${totalIs
 await slack.postRunSummary({
   totalRuns: runNumber,
   issuesPosted: totalIssuesPosted,
+  unexpectedExits,
   timeElapsed,
   gitHash: github.GIT_HASH,
 });

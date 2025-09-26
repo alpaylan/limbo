@@ -1,26 +1,31 @@
-use std::rc::Rc;
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
-use crate::schema::{BTreeTable, Column, Type};
+use crate::schema::{BTreeTable, Column, Type, ROWID_SENTINEL};
+use crate::translate::emitter::Resolver;
+use crate::translate::expr::{
+    bind_and_rewrite_expr, walk_expr, BindingBehavior, ParamState, WalkControl,
+};
 use crate::translate::optimizer::optimize_select_plan;
-use crate::translate::plan::{Operation, QueryDestination, Search, SelectPlan};
+use crate::translate::plan::{Operation, QueryDestination, Scan, Search, SelectPlan};
+use crate::translate::planner::{parse_limit, ROWID_STRS};
 use crate::vdbe::builder::CursorType;
 use crate::{
     bail_parse_error,
     schema::{Schema, Table},
     util::normalize_ident,
     vdbe::builder::{ProgramBuilder, ProgramBuilderOpts},
-    SymbolTable,
 };
-use turso_sqlite3_parser::ast::{self, Expr, ResultColumn, SortOrder, Update};
+use turso_parser::ast::{self, Expr, Indexed, SortOrder};
 
 use super::emitter::emit_program;
+use super::expr::process_returning_clause;
 use super::optimizer::optimize_plan;
 use super::plan::{
     ColumnUsedMask, IterationDirection, JoinedTable, Plan, ResultSetColumn, TableReferences,
     UpdatePlan,
 };
-use super::planner::bind_column_references;
-use super::planner::{parse_limit, parse_where};
+use super::planner::parse_where;
 /*
 * Update is simple. By default we scan the table, and for each row, we check the WHERE
 * clause. If it evaluates to true, we build the new record with the updated value and insert.
@@ -51,76 +56,122 @@ addr  opcode         p1    p2    p3    p4             p5  comment
 18    Goto           0     1     0                    0
 */
 pub fn translate_update(
-    schema: &Schema,
-    body: &mut Update,
-    syms: &SymbolTable,
+    body: &mut ast::Update,
+    resolver: &Resolver,
     mut program: ProgramBuilder,
+    connection: &Arc<crate::Connection>,
 ) -> crate::Result<ProgramBuilder> {
-    let mut plan = prepare_update_plan(&mut program, schema, body)?;
-    optimize_plan(&mut plan, schema)?;
-    // TODO: freestyling these numbers
+    let mut plan = prepare_update_plan(&mut program, resolver.schema, body, connection, false)?;
+    optimize_plan(&mut plan, resolver.schema)?;
     let opts = ProgramBuilderOpts {
         num_cursors: 1,
         approx_num_insns: 20,
         approx_num_labels: 4,
     };
     program.extend(&opts);
-    emit_program(&mut program, plan, schema, syms, |_| {})?;
+    emit_program(connection, resolver, &mut program, plan, |_| {})?;
     Ok(program)
 }
 
-pub fn translate_update_with_after(
-    schema: &Schema,
-    body: &mut Update,
-    syms: &SymbolTable,
+pub fn translate_update_for_schema_change(
+    body: &mut ast::Update,
+    resolver: &Resolver,
     mut program: ProgramBuilder,
+    connection: &Arc<crate::Connection>,
+    ddl_query: &str,
     after: impl FnOnce(&mut ProgramBuilder),
 ) -> crate::Result<ProgramBuilder> {
-    let mut plan = prepare_update_plan(&mut program, schema, body)?;
-    optimize_plan(&mut plan, schema)?;
-    // TODO: freestyling these numbers
+    let mut plan = prepare_update_plan(&mut program, resolver.schema, body, connection, true)?;
+
+    if let Plan::Update(plan) = &mut plan {
+        if program.capture_data_changes_mode().has_updates() {
+            plan.cdc_update_alter_statement = Some(ddl_query.to_string());
+        }
+    }
+
+    optimize_plan(&mut plan, resolver.schema)?;
     let opts = ProgramBuilderOpts {
         num_cursors: 1,
         approx_num_insns: 20,
         approx_num_labels: 4,
     };
     program.extend(&opts);
-    emit_program(&mut program, plan, schema, syms, after)?;
+    emit_program(connection, resolver, &mut program, plan, after)?;
     Ok(program)
 }
 
 pub fn prepare_update_plan(
     program: &mut ProgramBuilder,
     schema: &Schema,
-    body: &mut Update,
+    body: &mut ast::Update,
+    connection: &Arc<crate::Connection>,
+    is_internal_schema_change: bool,
 ) -> crate::Result<Plan> {
     if body.with.is_some() {
-        bail_parse_error!("WITH clause is not supported");
+        bail_parse_error!("WITH clause is not supported in UPDATE");
     }
     if body.or_conflict.is_some() {
-        bail_parse_error!("ON CONFLICT clause is not supported");
+        bail_parse_error!("ON CONFLICT clause is not supported in UPDATE");
     }
+    if body
+        .indexed
+        .as_ref()
+        .is_some_and(|i| matches!(i, Indexed::IndexedBy(_)))
+    {
+        bail_parse_error!("INDEXED BY clause is not supported in UPDATE");
+    }
+
+    if !body.order_by.is_empty() {
+        bail_parse_error!("ORDER BY is not supported in UPDATE");
+    }
+
     let table_name = &body.tbl_name.name;
+
+    // Check if this is a system table that should be protected from direct writes
+    // Skip this check for internal schema change operations (like ALTER TABLE)
+    if !is_internal_schema_change && crate::schema::is_system_table(table_name.as_str()) {
+        bail_parse_error!("table {} may not be modified", table_name);
+    }
+
     if schema.table_has_indexes(&table_name.to_string()) && !schema.indexes_enabled() {
         // Let's disable altering a table with indices altogether instead of checking column by
         // column to be extra safe.
         bail_parse_error!(
-            "UPDATE table disabled for table with indexes is disabled by default. Run with `--experimental-indexes` to enable this feature."
+            "UPDATE table disabled for table with indexes is disabled. Omit the `--experimental-indexes=false` flag to enable this feature."
         );
     }
-    let table = match schema.get_table(table_name.0.as_str()) {
+    let table = match schema.get_table(table_name.as_str()) {
         Some(table) => table,
         None => bail_parse_error!("Parse error: no such table: {}", table_name),
     };
+
+    // Check if this is a materialized view
+    if schema.is_materialized_view(table_name.as_str()) {
+        bail_parse_error!("cannot modify materialized view {}", table_name);
+    }
+
+    // Check if this table has any incompatible dependent views
+    let incompatible_views = schema.has_incompatible_dependent_views(table_name.as_str());
+    if !incompatible_views.is_empty() {
+        use crate::incremental::compiler::DBSP_CIRCUIT_VERSION;
+        bail_parse_error!(
+            "Cannot UPDATE table '{}' because it has incompatible dependent materialized view(s): {}. \n\
+             These views were created with a different DBSP version than the current version ({}). \n\
+             Please DROP and recreate the view(s) before modifying this table.",
+            table_name,
+            incompatible_views.join(", "),
+            DBSP_CIRCUIT_VERSION
+        );
+    }
+
+    let table_name = table.get_name();
     let iter_dir = body
         .order_by
-        .as_ref()
-        .and_then(|order_by| {
-            order_by.first().and_then(|ob| {
-                ob.order.map(|o| match o {
-                    SortOrder::Asc => IterationDirection::Forwards,
-                    SortOrder::Desc => IterationDirection::Backwards,
-                })
+        .first()
+        .and_then(|ob| {
+            ob.order.map(|o| match o {
+                SortOrder::Asc => IterationDirection::Forwards,
+                SortOrder::Desc => IterationDirection::Backwards,
             })
         })
         .unwrap_or(IterationDirection::Forwards);
@@ -131,70 +182,109 @@ pub fn prepare_update_plan(
             Table::BTree(btree_table) => Table::BTree(btree_table.clone()),
             _ => unreachable!(),
         },
-        identifier: table_name.0.clone(),
+        identifier: table_name.to_string(),
         internal_id: program.table_reference_counter.next(),
-        op: Operation::Scan {
-            iter_dir,
-            index: None,
-        },
+        op: build_scan_op(&table, iter_dir),
         join_info: None,
         col_used_mask: ColumnUsedMask::default(),
+        database_id: 0,
     }];
     let mut table_references = TableReferences::new(joined_tables, vec![]);
-    let set_clauses = body
-        .sets
-        .iter_mut()
-        .map(|set| {
-            let ident = normalize_ident(set.col_names[0].0.as_str());
-            let col_index = table
-                .columns()
-                .iter()
-                .enumerate()
-                .find_map(|(i, col)| {
-                    col.name
-                        .as_ref()
-                        .filter(|name| name.eq_ignore_ascii_case(&ident))
-                        .map(|_| i)
-                })
-                .ok_or_else(|| {
-                    crate::LimboError::ParseError(format!(
-                        "column '{}' not found in table '{}'",
-                        ident, table_name.0
-                    ))
-                })?;
 
-            let _ = bind_column_references(&mut set.expr, &mut table_references, None);
-            Ok((col_index, set.expr.clone()))
-        })
-        .collect::<Result<Vec<(usize, Expr)>, crate::LimboError>>()?;
+    let column_lookup: HashMap<String, usize> = table
+        .columns()
+        .iter()
+        .enumerate()
+        .filter_map(|(i, col)| col.name.as_ref().map(|name| (name.to_lowercase(), i)))
+        .collect();
 
-    let mut result_columns = vec![];
-    if let Some(returning) = &mut body.returning {
-        for rc in returning.iter_mut() {
-            if let ResultColumn::Expr(expr, alias) = rc {
-                bind_column_references(expr, &mut table_references, None)?;
-                result_columns.push(ResultSetColumn {
-                    expr: expr.clone(),
-                    alias: alias.as_ref().and_then(|a| {
-                        if let ast::As::As(name) = a {
-                            Some(name.to_string())
-                        } else {
-                            None
-                        }
-                    }),
-                    contains_aggregates: false,
-                });
+    let mut set_clauses = Vec::with_capacity(body.sets.len());
+
+    // Process each SET assignment and map column names to expressions
+    // e.g the statement `SET x = 1, y = 2, z = 3` has 3 set assigments
+    for set in &mut body.sets {
+        bind_and_rewrite_expr(
+            &mut set.expr,
+            Some(&mut table_references),
+            None,
+            connection,
+            &mut program.param_ctx,
+            BindingBehavior::ResultColumnsNotAllowed,
+        )?;
+
+        let values = match set.expr.as_ref() {
+            Expr::Parenthesized(vals) => vals.clone(),
+            expr => vec![expr.clone().into()],
+        };
+
+        if set.col_names.len() != values.len() {
+            bail_parse_error!(
+                "{} columns assigned {} values",
+                set.col_names.len(),
+                values.len()
+            );
+        }
+
+        for (col_name, expr) in set.col_names.iter().zip(values.iter()) {
+            let ident = normalize_ident(col_name.as_str());
+
+            // Check if this is the 'rowid' keyword
+            if ROWID_STRS.iter().any(|s| s.eq_ignore_ascii_case(&ident)) {
+                // Find the rowid alias column if it exists
+                if let Some((idx, _col)) = table
+                    .columns()
+                    .iter()
+                    .enumerate()
+                    .find(|(_, c)| c.is_rowid_alias)
+                {
+                    // Use the rowid alias column index
+                    match set_clauses.iter_mut().find(|(i, _)| i == &idx) {
+                        Some((_, existing_expr)) => *existing_expr = expr.clone(),
+                        None => set_clauses.push((idx, expr.clone())),
+                    }
+                } else {
+                    // No rowid alias, use sentinel value for actual rowid
+                    match set_clauses.iter_mut().find(|(i, _)| *i == ROWID_SENTINEL) {
+                        Some((_, existing_expr)) => *existing_expr = expr.clone(),
+                        None => set_clauses.push((ROWID_SENTINEL, expr.clone())),
+                    }
+                }
             } else {
-                bail_parse_error!("Only expressions are allowed in RETURNING clause");
+                let col_index = match column_lookup.get(&ident) {
+                    Some(idx) => idx,
+                    None => bail_parse_error!("no such column: {}", ident),
+                };
+                match set_clauses.iter_mut().find(|(idx, _)| idx == col_index) {
+                    Some((_, existing_expr)) => *existing_expr = expr.clone(),
+                    None => set_clauses.push((*col_index, expr.clone())),
+                }
             }
         }
     }
-    let order_by = body.order_by.as_ref().map(|order| {
-        order
-            .iter()
-            .map(|o| (o.expr.clone(), o.order.unwrap_or(SortOrder::Asc)))
-            .collect()
-    });
+
+    let (result_columns, _table_references) = process_returning_clause(
+        &mut body.returning,
+        &table,
+        body.tbl_name.name.as_str(),
+        program,
+        connection,
+    )?;
+
+    let order_by = body
+        .order_by
+        .iter_mut()
+        .map(|o| {
+            let _ = bind_and_rewrite_expr(
+                &mut o.expr,
+                Some(&mut table_references),
+                Some(&result_columns),
+                connection,
+                &mut program.param_ctx,
+                BindingBehavior::ResultColumnsNotAllowed,
+            );
+            (o.expr.clone(), o.order.unwrap_or(SortOrder::Asc))
+        })
+        .collect();
 
     // Sqlite determines we should create an ephemeral table if we do not have a FROM clause
     // Difficult to say what items from the plan can be checked for this so currently just checking if a RowId Alias is referenced
@@ -203,10 +293,11 @@ pub fn prepare_update_plan(
     let columns = table.columns();
 
     let rowid_alias_used = set_clauses.iter().fold(false, |accum, (idx, _)| {
-        accum || columns[*idx].is_rowid_alias
+        accum || (*idx != ROWID_SENTINEL && columns[*idx].is_rowid_alias)
     });
+    let direct_rowid_update = set_clauses.iter().any(|(idx, _)| *idx == ROWID_SENTINEL);
 
-    let (ephemeral_plan, mut where_clause) = if rowid_alias_used {
+    let (ephemeral_plan, mut where_clause) = if rowid_alias_used || direct_rowid_update {
         let mut where_clause = vec![];
         let internal_id = program.table_reference_counter.next();
 
@@ -216,29 +307,30 @@ pub fn prepare_update_plan(
                 Table::BTree(btree_table) => Table::BTree(btree_table.clone()),
                 _ => unreachable!(),
             },
-            identifier: table_name.0.clone(),
+            identifier: table_name.to_string(),
             internal_id,
-            op: Operation::Scan {
-                iter_dir,
-                index: None,
-            },
+            op: build_scan_op(&table, iter_dir),
             join_info: None,
             col_used_mask: ColumnUsedMask::default(),
+            database_id: 0,
         }];
         let mut table_references = TableReferences::new(joined_tables, vec![]);
 
         // Parse the WHERE clause
         parse_where(
-            body.where_clause.as_ref().map(|w| *w.clone()),
+            body.where_clause.as_deref(),
             &mut table_references,
             Some(&result_columns),
             &mut where_clause,
+            connection,
+            &mut program.param_ctx,
         )?;
 
-        let table = Rc::new(BTreeTable {
+        let table = Arc::new(BTreeTable {
             root_page: 0, // Not relevant for ephemeral table definition
             name: "ephemeral_scratch".to_string(),
             has_rowid: true,
+            has_autoincrement: false,
             primary_key_columns: vec![],
             columns: vec![Column {
                 name: Some("rowid".to_string()),
@@ -253,7 +345,7 @@ pub fn prepare_update_plan(
                 hidden: false,
             }],
             is_strict: false,
-            unique_sets: None,
+            unique_sets: vec![],
         });
 
         let temp_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(table.clone()));
@@ -270,7 +362,7 @@ pub fn prepare_update_plan(
             }],
             where_clause,       // original WHERE terms from the UPDATE clause
             group_by: None,     // N/A
-            order_by: None,     // N/A
+            order_by: vec![],   // N/A
             aggregates: vec![], // N/A
             limit: None,        // N/A
             query_destination: QueryDestination::EphemeralTable {
@@ -282,6 +374,7 @@ pub fn prepare_update_plan(
             contains_constant_false_condition: false,
             distinctness: super::plan::Distinctness::NonDistinct,
             values: vec![],
+            window: None,
         };
 
         optimize_select_plan(&mut ephemeral_plan, schema)?;
@@ -303,45 +396,110 @@ pub fn prepare_update_plan(
     if ephemeral_plan.is_none() {
         // Parse the WHERE clause
         parse_where(
-            body.where_clause.as_ref().map(|w| *w.clone()),
+            body.where_clause.as_deref(),
             &mut table_references,
             Some(&result_columns),
             &mut where_clause,
+            connection,
+            &mut program.param_ctx,
         )?;
     };
 
     // Parse the LIMIT/OFFSET clause
-    let (limit, offset) = body
-        .limit
-        .as_ref()
-        .map(|l| parse_limit(l))
-        .unwrap_or(Ok((None, None)))?;
+    let (limit, offset) = body.limit.as_mut().map_or(Ok((None, None)), |l| {
+        parse_limit(l, connection, &mut program.param_ctx)
+    })?;
 
     // Check what indexes will need to be updated by checking set_clauses and see
     // if a column is contained in an index.
-    let indexes = schema.get_indices(&table_name.0);
-    let indexes_to_update = indexes
+    let indexes = schema.get_indices(table_name);
+    let updated_cols: HashSet<usize> = set_clauses.iter().map(|(i, _)| *i).collect();
+    let rowid_alias_used = set_clauses
         .iter()
-        .filter(|index| {
-            index.columns.iter().any(|index_column| {
-                set_clauses
+        .any(|(idx, _)| *idx == ROWID_SENTINEL || columns[*idx].is_rowid_alias);
+    let indexes_to_update = if rowid_alias_used {
+        // If the rowid alias is used in the SET clause, we need to update all indexes
+        indexes.cloned().collect()
+    } else {
+        // otherwise we need to update the indexes whose columns are set in the SET clause,
+        // or if the colunns used in the partial index WHERE clause are being updated
+        indexes
+            .filter_map(|idx| {
+                let mut needs = idx
+                    .columns
                     .iter()
-                    .any(|(set_index_column, _)| index_column.pos_in_table == *set_index_column)
+                    .any(|c| updated_cols.contains(&c.pos_in_table));
+
+                if !needs {
+                    if let Some(w) = &idx.where_clause {
+                        let mut where_copy = w.as_ref().clone();
+                        let mut param = ParamState::disallow();
+                        let mut tr =
+                            TableReferences::new(table_references.joined_tables().to_vec(), vec![]);
+                        bind_and_rewrite_expr(
+                            &mut where_copy,
+                            Some(&mut tr),
+                            None,
+                            connection,
+                            &mut param,
+                            BindingBehavior::ResultColumnsNotAllowed,
+                        )
+                        .ok()?;
+                        let cols_used = collect_cols_used_in_expr(&where_copy);
+                        // if any of the columns used in the partial index WHERE clause is being
+                        // updated, we need to update this index
+                        needs = cols_used.iter().any(|c| updated_cols.contains(c));
+                    }
+                }
+                if needs {
+                    Some(idx.clone())
+                } else {
+                    None
+                }
             })
-        })
-        .cloned()
-        .collect();
+            .collect()
+    };
 
     Ok(Plan::Update(UpdatePlan {
         table_references,
         set_clauses,
         where_clause,
-        returning: Some(result_columns),
+        returning: if result_columns.is_empty() {
+            None
+        } else {
+            Some(result_columns)
+        },
         order_by,
         limit,
         offset,
         contains_constant_false_condition: false,
         indexes_to_update,
         ephemeral_plan,
+        cdc_update_alter_statement: None,
     }))
+}
+
+fn build_scan_op(table: &Table, iter_dir: IterationDirection) -> Operation {
+    match table {
+        Table::BTree(_) => Operation::Scan(Scan::BTreeTable {
+            iter_dir,
+            index: None,
+        }),
+        Table::Virtual(_) => Operation::default_scan_for(table),
+        _ => unreachable!(),
+    }
+}
+
+/// Returns a set of column indices used in the expression.
+/// *Must* be used on an Expr already processed by `bind_and_rewrite_expr`
+fn collect_cols_used_in_expr(expr: &Expr) -> HashSet<usize> {
+    let mut acc = HashSet::new();
+    let _ = walk_expr(expr, &mut |expr| match expr {
+        Expr::Column { column, .. } => {
+            acc.insert(*column);
+            Ok(WalkControl::Continue)
+        }
+        _ => Ok(WalkControl::Continue),
+    });
+    acc
 }

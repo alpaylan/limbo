@@ -1,9 +1,8 @@
-use super::MemoryIO;
 use crate::{Clock, Completion, File, Instant, LimboError, OpenFlags, Result, IO};
-use std::cell::RefCell;
+use parking_lot::RwLock;
 use std::io::{Read, Seek, Write};
 use std::sync::Arc;
-use tracing::{debug, trace};
+use tracing::{debug, instrument, trace, Level};
 pub struct WindowsIO {}
 
 impl WindowsIO {
@@ -13,10 +12,8 @@ impl WindowsIO {
     }
 }
 
-unsafe impl Send for WindowsIO {}
-unsafe impl Sync for WindowsIO {}
-
 impl IO for WindowsIO {
+    #[instrument(err, skip_all, level = Level::TRACE)]
     fn open_file(&self, path: &str, flags: OpenFlags, direct: bool) -> Result<Arc<dyn File>> {
         trace!("open_file(path = {})", path);
         let mut file = std::fs::File::options();
@@ -29,29 +26,19 @@ impl IO for WindowsIO {
 
         let file = file.open(path)?;
         Ok(Arc::new(WindowsFile {
-            file: RefCell::new(file),
+            file: RwLock::new(file),
         }))
     }
 
-    fn wait_for_completion(&self, c: Arc<Completion>) -> Result<()> {
-        while !c.is_completed() {
-            self.run_once()?;
-        }
+    #[instrument(err, skip_all, level = Level::TRACE)]
+    fn remove_file(&self, path: &str) -> Result<()> {
+        trace!("remove_file(path = {})", path);
+        Ok(std::fs::remove_file(path)?)
+    }
+
+    #[instrument(err, skip_all, level = Level::TRACE)]
+    fn step(&self) -> Result<()> {
         Ok(())
-    }
-
-    fn run_once(&self) -> Result<()> {
-        Ok(())
-    }
-
-    fn generate_random_number(&self) -> i64 {
-        let mut buf = [0u8; 8];
-        getrandom::getrandom(&mut buf).unwrap();
-        i64::from_ne_bytes(buf)
-    }
-
-    fn get_memory_io(&self) -> Arc<MemoryIO> {
-        Arc::new(MemoryIO::new())
     }
 }
 
@@ -66,27 +53,27 @@ impl Clock for WindowsIO {
 }
 
 pub struct WindowsFile {
-    file: RefCell<std::fs::File>,
+    file: RwLock<std::fs::File>,
 }
 
-unsafe impl Send for WindowsFile {}
-unsafe impl Sync for WindowsFile {}
-
 impl File for WindowsFile {
+    #[instrument(err, skip_all, level = Level::TRACE)]
     fn lock_file(&self, exclusive: bool) -> Result<()> {
         unimplemented!()
     }
 
+    #[instrument(err, skip_all, level = Level::TRACE)]
     fn unlock_file(&self) -> Result<()> {
         unimplemented!()
     }
 
-    fn pread(&self, pos: usize, c: Arc<Completion>) -> Result<Arc<Completion>> {
-        let mut file = self.file.borrow_mut();
-        file.seek(std::io::SeekFrom::Start(pos as u64))?;
+    #[instrument(skip(self, c), level = Level::TRACE)]
+    fn pread(&self, pos: u64, c: Completion) -> Result<Completion> {
+        let mut file = self.file.write();
+        file.seek(std::io::SeekFrom::Start(pos))?;
         let nr = {
             let r = c.as_read();
-            let mut buf = r.buf_mut();
+            let buf = r.buf();
             let buf = buf.as_mut_slice();
             file.read_exact(buf)?;
             buf.len() as i32
@@ -95,30 +82,34 @@ impl File for WindowsFile {
         Ok(c)
     }
 
-    fn pwrite(
-        &self,
-        pos: usize,
-        buffer: Arc<RefCell<crate::Buffer>>,
-        c: Arc<Completion>,
-    ) -> Result<Arc<Completion>> {
-        let mut file = self.file.borrow_mut();
-        file.seek(std::io::SeekFrom::Start(pos as u64))?;
-        let buf = buffer.borrow();
-        let buf = buf.as_slice();
+    #[instrument(skip(self, c, buffer), level = Level::TRACE)]
+    fn pwrite(&self, pos: u64, buffer: Arc<crate::Buffer>, c: Completion) -> Result<Completion> {
+        let mut file = self.file.write();
+        file.seek(std::io::SeekFrom::Start(pos))?;
+        let buf = buffer.as_slice();
         file.write_all(buf)?;
-        c.complete(buffer.borrow().len() as i32);
+        c.complete(buffer.len() as i32);
         Ok(c)
     }
 
-    fn sync(&self, c: Arc<Completion>) -> Result<Arc<Completion>> {
-        let file = self.file.borrow_mut();
-        file.sync_all().map_err(LimboError::IOError)?;
+    #[instrument(err, skip_all, level = Level::TRACE)]
+    fn sync(&self, c: Completion) -> Result<Completion> {
+        let file = self.file.write();
+        file.sync_all()?;
+        c.complete(0);
+        Ok(c)
+    }
+
+    #[instrument(err, skip_all, level = Level::TRACE)]
+    fn truncate(&self, len: u64, c: Completion) -> Result<Completion> {
+        let file = self.file.write();
+        file.set_len(len)?;
         c.complete(0);
         Ok(c)
     }
 
     fn size(&self) -> Result<u64> {
-        let file = self.file.borrow();
+        let file = self.file.read();
         Ok(file.metadata().unwrap().len())
     }
 }

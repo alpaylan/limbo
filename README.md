@@ -4,14 +4,14 @@
 </p>
 
 <p align="center">
-  <i>Turso Database</i> is an in-process SQL database, compatible with SQLite.
+  An in-process SQL database, compatible with SQLite.
 </p>
 
 <p align="center">
   <a title="Build Status" target="_blank" href="https://github.com/tursodatabase/turso/actions/workflows/rust.yml"><img src="https://img.shields.io/github/actions/workflow/status/tursodatabase/turso/rust.yml?style=flat-square"></a>
   <a title="Releases" target="_blank" href="https://github.com/tursodatabase/turso/releases"><img src="https://img.shields.io/github/release/tursodatabase/turso?style=flat-square&color=9CF"></a>
   <a title="Rust" target="_blank" href="https://crates.io/crates/turso"><img alt="PyPI" src="https://img.shields.io/crates/v/turso"></a>
-  <a title="JavaScript" target="_blank" href="https://www.npmjs.com/package/@tursodatabase/turso"><img alt="PyPI" src="https://img.shields.io/npm/v/@tursodatabase/turso"></a>
+  <a title="JavaScript" target="_blank" href="https://www.npmjs.com/package/@tursodatabase/database"><img alt="PyPI" src="https://img.shields.io/npm/v/@tursodatabase/database"></a>
   <a title="Python" target="_blank" href="https://pypi.org/project/pyturso/"><img alt="PyPI" src="https://img.shields.io/pypi/v/pyturso"></a>
   <a title="MIT" target="_blank" href="https://github.com/tursodatabase/turso/blob/main/LICENSE.md"><img src="http://img.shields.io/badge/license-MIT-orange.svg?style=flat-square"></a>
   <br>
@@ -28,20 +28,36 @@
 
 ---
 
+## About
+
+Turso Database is an in-process SQL database written in Rust, compatible with SQLite.
+
+> **⚠️ Warning:** This software is ALPHA, only use for development, testing, and experimentation. We are working to make it production ready, but do not use it for critical data right now.
+> 
 ## Features and Roadmap
 
-Turso Database is a _work-in-progress_, in-process OLTP database engine library written in Rust that has:
-
-* **SQLite compatibility** [[doc](COMPAT.md)] for SQL dialect, file formats, and the C API
-* **Language bindings** for JavaScript/WebAssembly, Rust, Go, Python, and [Java](bindings/java)
+* **SQLite compatibility** for SQL dialect, file formats, and the C API [see [document](COMPAT.md) for details]
+* **Change data capture (CDC)** for real-time tracking of database changes.
+* **Language support** for
+  * [Go](https://github.com/tursodatabase/turso-go)
+  * [JavaScript](bindings/javascript)
+  * [Java](bindings/java)
+  * [Python](bindings/python)
+  * [Rust](bindings/rust)
+  * [WebAssembly](bindings/javascript)
 * **Asynchronous I/O** support on Linux with `io_uring`
-* **OS support** for Linux, macOS, and Windows
+* **Cross-platform** support for Linux, macOS, Windows and browsers (through WebAssembly)
+* **Vector support** support including exact search and vector manipulation
+* **Improved schema management** including extended `ALTER` support and faster schema changes.
 
-In the future, we will be also working on:
+The database has the following experimental features:
 
-* **`BEGIN CONCURRENT`** for improved write throughput.
-* **Indexing for vector search**.
-* **Improved schema management** including better `ALTER` support and strict column types by default.
+* **`BEGIN CONCURRENT`** for improved write throughput using multi-version concurrency control (MVCC).
+* **Incremental computation** using DBSP for incremental view mainatenance and query subscriptions.
+
+The following features are on our current roadmap:
+
+* **Vector indexing** for fast approximate vector search, similar to [libSQL vector search](https://turso.tech/vector).
 
 ## Getting Started
 
@@ -57,7 +73,13 @@ curl --proto '=https' --tlsv1.2 -LsSf \
   https://github.com/tursodatabase/turso/releases/latest/download/turso_cli-installer.sh | sh
 ```
 
-Then launch the shell to execute SQL statements:
+Then launch the interactive shell:
+
+```shell
+$ tursodb
+```
+
+This will start the Turso interactive shell where you can execute SQL statements:
 
 ```console
 Turso
@@ -77,6 +99,14 @@ You can also build and run the latest development version with:
 ```shell
 cargo run
 ```
+
+If you like docker, we got you covered. Simply run this in the root folder:
+
+```bash
+make docker-cli-build && \
+make docker-cli-run
+```
+
 </details>
 
 <details>
@@ -102,15 +132,15 @@ let res = conn.query("SELECT * FROM users", ()).await?;
 <br>
 
 ```console
-npm i @tursodatabase/turso
+npm i @tursodatabase/database
 ```
 
 Example usage:
 
 ```js
-import { Database } from '@tursodatabase/turso';
+import { connect } from '@tursodatabase/database';
 
-const db = new Database('sqlite.db');
+const db = await connect('sqlite.db');
 const stmt = db.prepare('SELECT * FROM users');
 const users = stmt.all();
 console.log(users);
@@ -122,7 +152,7 @@ console.log(users);
 <br>
 
 ```console
-pip install pyturso
+uv pip install pyturso
 ```
 
 Example usage:
@@ -141,27 +171,19 @@ print(res.fetchone())
 <summary>🦫 Go</summary>
 <br>
 
-1. Clone the repository
-2. Build the library and set your LD_LIBRARY_PATH to include turso's target directory
 ```console
-cargo build --package limbo-go
-export LD_LIBRARY_PATH=/path/to/limbo/target/debug:$LD_LIBRARY_PATH
-```
-3. Use the driver
-
-```console
-go get github.com/tursodatabase/turso
-go install github.com/tursodatabase/turso
+go get github.com/tursodatabase/turso-go
+go install github.com/tursodatabase/turso-go
 ```
 
 Example usage:
 ```go
 import (
     "database/sql"
-    _ "github.com/tursodatabase/turso"
+    _ "github.com/tursodatabase/turso-go"
 )
 
-conn, _ = sql.Open("sqlite3", "sqlite.db")
+conn, _ = sql.Open("turso", "sqlite.db")
 defer conn.Close()
 
 stmt, _ := conn.Prepare("select * from users")
@@ -186,9 +208,144 @@ We integrated Turso Database into JDBC. For detailed instructions on how to use 
 the [README.md under bindings/java](bindings/java/README.md).
 </details>
 
+<details>
+<summary>🤖 MCP Server Mode</summary>
+<br>
+
+
+The Turso CLI includes a built-in [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) server that allows AI assistants to interact with your databases.
+
+Start the MCP server with:
+
+```shell
+tursodb your_database.db --mcp
+```
+
+The MCP server provides seven tools for database interaction:
+
+#### Available Tools
+
+1. **`open_database`** - Open a new database
+2. **`current_database`** - Describe the current database
+3. **`list_tables`** - List all tables in the database
+4. **`describe_table`** - Describe the structure of a specific table
+5. **`execute_query`** - Execute read-only SELECT queries
+6. **`insert_data`** - Insert new data into tables
+7. **`update_data`** - Update existing data in tables
+8. **`delete_data`** - Delete data from tables
+9. **`schema_change`** - Execute schema modification statements (CREATE TABLE, ALTER TABLE, DROP TABLE)
+
+#### Example Usage
+
+The MCP server runs as a single process that handles multiple JSON-RPC requests over stdin/stdout. Here's how to interact with it:
+
+#### Example with In-Memory Database
+
+```bash
+cat << 'EOF' | tursodb --mcp
+{"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2024-11-05", "capabilities": {}, "clientInfo": {"name": "client", "version": "1.0"}}}
+{"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "schema_change", "arguments": {"query": "CREATE TABLE users (id INTEGER, name TEXT, email TEXT)"}}}
+{"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": "list_tables", "arguments": {}}}
+{"jsonrpc": "2.0", "id": 4, "method": "tools/call", "params": {"name": "insert_data", "arguments": {"query": "INSERT INTO users VALUES (1, 'Alice', 'alice@example.com')"}}}
+{"jsonrpc": "2.0", "id": 5, "method": "tools/call", "params": {"name": "execute_query", "arguments": {"query": "SELECT * FROM users"}}}
+EOF
+```
+
+#### Example with Existing Database
+
+```bash
+# Working with an existing database file
+cat << 'EOF' | tursodb mydb.db --mcp
+{"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2024-11-05", "capabilities": {}, "clientInfo": {"name": "client", "version": "1.0"}}}
+{"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "list_tables", "arguments": {}}}
+EOF
+```
+
+#### Using with Claude Code
+
+If you're using [Claude Code](https://claude.ai/code), you can easily connect to your Turso MCP server using the built-in MCP management commands:
+
+##### Quick Setup
+
+1. **Add the MCP server** to Claude Code:
+   ```bash
+   claude mcp add my-database -- tursodb ./path/to/your/database.db --mcp
+   ```
+
+2. **Restart Claude Code** to activate the connection
+
+3. **Start querying** your database through natural language!
+
+##### Command Breakdown
+
+```bash
+claude mcp add my-database -- tursodb ./path/to/your/database.db --mcp
+#              ↑            ↑       ↑                           ↑
+#              |            |       |                           |
+#              Name         |       Database path               MCP flag
+#                          Separator
+```
+
+- **`my-database`** - Choose any name for your MCP server
+- **`--`** - Required separator between Claude options and your command
+- **`tursodb`** - The Turso database CLI
+- **`./path/to/your/database.db`** - Path to your SQLite database file
+- **`--mcp`** - Enables MCP server mode
+
+##### Example Usage
+
+```bash
+# For a local project database
+cd /your/project
+claude mcp add my-project-db -- tursodb ./data/app.db --mcp
+
+# For an absolute path
+claude mcp add analytics-db -- tursodb /Users/you/databases/analytics.db --mcp
+
+# For a specific project (local scope)
+claude mcp add project-db --local -- tursodb ./database.db --mcp
+```
+
+##### Managing MCP Servers
+
+```bash
+# List all configured MCP servers
+claude mcp list
+
+# Get details about a specific server
+claude mcp get my-database
+
+# Remove an MCP server
+claude mcp remove my-database
+```
+
+Once configured, you can ask Claude Code to:
+- "Show me all tables in the database"
+- "What's the schema for the users table?"
+- "Find all posts with more than 100 upvotes"
+- "Insert a new user with name 'Alice' and email 'alice@example.com'"
+</details>
+
 ## Contributing
 
 We'd love to have you contribute to Turso Database! Please check out the [contribution guide] to get started.
+
+### Found a data corruption bug? Get up to $1,000.00
+
+SQLite is loved because it is the most reliable database in the world. The next evolution of SQLite has
+to match or surpass this level of reliability. Turso is built with [Deterministic Simulation Testing](simulator/)
+from the ground up, and is also tested by [Antithesis](https://antithesis.com).
+
+Even during Alpha, if you find a bug that leads to a data corruption and demonstrate
+how our simulator failed to catch it, you can get up to $1,000.00. As the project matures we will
+increase the size of the prize, and the scope of the bugs.
+
+More details [here](https://turso.algora.io).
+
+You can see an example of an awarded case on [#2049](https://github.com/tursodatabase/turso/issues/2049).
+
+Turso core staff are not eligible.
+
 
 ## FAQ
 
@@ -217,8 +374,8 @@ Unless you explicitly state otherwise, any contribution intentionally submitted
 for inclusion in Turso Database by you, shall be licensed as MIT, without any additional
 terms or conditions.
 
-[contribution guide]: https://github.com/tursodatabase/turso/blob/main/CONTRIBUTING.md
-[MIT license]: https://github.com/tursodatabase/turso/blob/main/LICENSE.md
+[contribution guide]: CONTRIBUTING.md
+[MIT license]: LICENSE.md
 
 ## Partners
 

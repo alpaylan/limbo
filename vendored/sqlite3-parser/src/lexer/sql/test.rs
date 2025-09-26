@@ -77,7 +77,7 @@ fn vtab_args() -> Result<(), Error> {
         panic!("unexpected AST")
     };
     assert_eq!(create_virtual_table.tbl_name.name, "mail");
-    assert_eq!(create_virtual_table.module_name.0, "fts3");
+    assert_eq!(create_virtual_table.module_name.as_str(), "fts3");
     let args = create_virtual_table.args.as_ref().unwrap();
     assert_eq!(args.len(), 2);
     assert_eq!(args[0], "subject VARCHAR(256) NOT NULL");
@@ -187,7 +187,7 @@ fn create_temporary_table_with_qualified_name() {
 #[test]
 fn create_table_with_only_generated_column() {
     expect_parser_err_msg(
-        b"CREATE TABLE test(data AS (1))",
+        b"CREATE TABLE test (data AS (1))",
         "must have at least one non-generated column",
     );
 }
@@ -208,7 +208,7 @@ fn create_strict_table_unknown_datatype() {
 #[test]
 fn foreign_key_on_column() {
     expect_parser_err_msg(
-        b"CREATE TABLE t(a REFERENCES o(a,b))",
+        b"CREATE TABLE t (a REFERENCES o(a,b))",
         "foreign key on a should reference only one column of table o",
     );
 }
@@ -307,8 +307,8 @@ fn cast_without_typename() {
 
 #[test]
 fn unknown_table_option() {
-    expect_parser_err_msg(b"CREATE TABLE t(x)o", "unknown table option: o");
-    expect_parser_err_msg(b"CREATE TABLE t(x) WITHOUT o", "unknown table option: o");
+    expect_parser_err_msg(b"CREATE TABLE t (x)o", "unknown table option: o");
+    expect_parser_err_msg(b"CREATE TABLE t (x) WITHOUT o", "unknown table option: o");
 }
 
 #[test]

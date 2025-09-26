@@ -42,9 +42,9 @@ ifcapable tempdb {
 #ifcapable view {
 #do_test select7-2.1 {
 #  execsql {
-#    CREATE TABLE x(id integer primary key, a TEXT NULL);
+#    CREATE TABLE x (id integer primary key, a TEXT NULL);
 #    INSERT INTO x (a) VALUES ('first');
-#    CREATE TABLE tempx(id integer primary key, a TEXT NULL);
+#    CREATE TABLE tempx (id integer primary key, a TEXT NULL);
 #    INSERT INTO tempx (a) VALUES ('t-first');
 #    CREATE VIEW tv1 AS SELECT x.id, tx.id FROM x JOIN tempx tx ON tx.id=x.id;
 #    CREATE VIEW tv1b AS SELECT x.id, tx.id FROM x JOIN tempx tx on tx.id=x.id;
@@ -112,7 +112,7 @@ ifcapable {subquery && compound} {
 ifcapable {subquery && compound} {
   do_test select7-5.1 {
     catchsql {
-      CREATE TABLE t2(a,b);
+      CREATE TABLE t2 (a,b);
       SELECT 5 IN (SELECT a,b FROM t2);
     }
   } {1 {sub-select returns 2 columns - expected 1}}
@@ -162,7 +162,7 @@ if {[clang_sanitize_address]==0} {
 #
 do_execsql_test select7-6.5 {
   DROP TABLE IF EXISTS t1;
-  CREATE TABLE t1(a,b,c);
+  CREATE TABLE t1 (a,b,c);
 }
 sqlite3_limit db SQLITE_LIMIT_COMPOUND_SELECT 10
 sqlite3_db_config db SQLITE_DBCONFIG_DQS_DML 0
@@ -192,7 +192,7 @@ do_execsql_test select7-6.9 {
 #
 do_test select7-7.1 {
   execsql {
-    CREATE TABLE t3(a REAL);
+    CREATE TABLE t3 (a REAL);
     INSERT INTO t3 VALUES(44.0);
     INSERT INTO t3 VALUES(56.0);
   }
@@ -206,7 +206,7 @@ do_test select7-7.2 {
 } {1.38 1 1.62 1}
 do_test select7-7.3 {
   execsql {
-    CREATE TABLE t4(a REAL);
+    CREATE TABLE t4 (a REAL);
     INSERT INTO t4 VALUES( 2.0 );
     INSERT INTO t4 VALUES( 3.0 );
   }
@@ -225,15 +225,15 @@ do_test select7-7.6 {
 
 do_test select7-7.7 {
   execsql {
-    CREATE TABLE t5(a TEXT, b INT);
+    CREATE TABLE t5 (a TEXT, b INT);
     INSERT INTO t5 VALUES(123, 456);
     SELECT typeof(a), a FROM t5 GROUP BY a HAVING a<b;
   }
 } {text 123}
 
 do_execsql_test 8.0 { 
-  CREATE TABLE t01(x, y);
-  CREATE TABLE t02(x, y);
+  CREATE TABLE t01 (x, y);
+  CREATE TABLE t02 (x, y);
 }
 
 do_catchsql_test 8.1 {

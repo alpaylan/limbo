@@ -3,16 +3,45 @@
 set testdir [file dirname $argv0]
 source $testdir/tester.tcl
 
-if {[info exists ::env(SQLITE_EXEC)] && ($::env(SQLITE_EXEC) eq "scripts/limbo-sqlite3-index-experimental" || $::env(SQLITE_EXEC) eq "sqlite3")} {
-    do_execsql_test_in_memory_any_error create_table_one_unique_set {
-        CREATE TABLE t4(a, unique(b));
-    }
+do_execsql_test_in_memory_any_error create_table_one_unique_set {
+    CREATE TABLE t4 (a, unique(b));
+}
 
-    do_execsql_test_on_specific_db {:memory:} create_table_same_uniques_and_primary_keys {
-        CREATE TABLE t2(a,b, unique(a,b), primary key(a,b));
-    } {}
+do_execsql_test_on_specific_db {:memory:} create_table_same_uniques_and_primary_keys {
+    CREATE TABLE t2 (a,b, unique(a,b), primary key(a,b));
+} {}
 
-    do_execsql_test_on_specific_db {:memory:} create_table_unique_contained_in_primary_keys {
-        CREATE TABLE t4(a,b, primary key(a,b), unique(a));
-    } {}
+do_execsql_test_on_specific_db {:memory:} create_table_unique_contained_in_primary_keys {
+    CREATE TABLE t4 (a,b, primary key(a,b), unique(a));
+} {}
+
+# https://github.com/tursodatabase/turso/issues/3187
+do_execsql_test_on_specific_db {:memory:} create_table_unique_constraint_and_autoinc_backticks { 
+	CREATE TABLE `databases` (`id` integer PRIMARY KEY AUTOINCREMENT,`created_at` datetime,`updated_at` datetime,`deleted_at` datetime,`hostname` text NOT NULL,`namespace` text,`address` text,`primary_address` text,`local` numeric,`allowed_ips` text, CONSTRAINT `uni_databases_hostname` UNIQUE (`hostname`));
+} {}
+
+# https://github.com/tursodatabase/turso/issues/2686
+do_execsql_test_on_specific_db {:memory:} create_table_rowid_unique_regression_test {
+  create table u(x integer unique primary key);
+  insert into u values (1),(2),(3);
+  select * from u where x > 2;
+} {3}
+
+# https://github.com/tursodatabase/turso/issues/2886#issuecomment-3244885481
+do_execsql_test_on_specific_db {:memory:} create_table_with_empty_string_name {
+  create table ''('' INTEGER) strict;
+  insert into '' values(9);
+  select * from '';
+} {9}
+
+do_execsql_test_in_memory_any_error create_table_multiple_column_primary_keys {
+    CREATE TABLE t(a primary key, b primary key);
+}
+
+do_execsql_test_in_memory_any_error create_table_column_and_table_primary_keys {
+    CREATE TABLE t(a primary key, b,c, primary key(b,c));
+}
+
+do_execsql_test_in_memory_any_error create_table_multiple_table_primary_keys {
+    CREATE TABLE t(a,b,c,d,primary key(a,b), primary key(c,d));
 }

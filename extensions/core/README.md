@@ -2,6 +2,27 @@
 
 The `turso_ext` crate simplifies the creation and registration of libraries meant to extend the functionality of `Turso`, that can be loaded
 like traditional `sqlite3` extensions, but are able to be written in much more ergonomic Rust.
+
+**Attention**
+If you wish to link with extensions dynamically, you will need to coordinate the allocator with each extension you would like to load at runtime by either using `MiMalloc` (the default) or setting your global allocator of choice in `macros/src/ext/mod.rs`. 
+
+E.g
+```diff
+#[cfg(not(target_family = "wasm"))]
+#[cfg(not(feature = "static"))]
+#[global_allocator]
+- static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
++ static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc
+```
+
+Then add the allocator to the extension you want to use
+
+```toml
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
+tikv-jemallocator = "0.5"
+```
+
+Then you just the compile the dynamic library and extract the necessary `.so/.dylib/.dll` files from `.target` folder. 
  
 ---
 

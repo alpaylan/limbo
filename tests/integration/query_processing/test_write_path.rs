@@ -3,7 +3,9 @@ use crate::common::{compare_string, do_flush, TempDatabase};
 use log::debug;
 use std::io::{Read, Seek, Write};
 use std::sync::Arc;
-use turso_core::{Connection, Database, Row, Statement, StepResult, Value};
+use turso_core::{
+    CheckpointMode, Connection, Database, LimboError, Row, Statement, StepResult, Value,
+};
 
 const WAL_HEADER_SIZE: usize = 32;
 const WAL_FRAME_HEADER_SIZE: usize = 24;
@@ -173,10 +175,10 @@ fn test_sequential_write() -> anyhow::Result<()> {
             println!("progress {progress:.1}%");
         }
         let insert_query = format!("INSERT INTO test VALUES ({i})");
-        run_query(&tmp_db, &conn, &insert_query)?;
+        common::run_query(&tmp_db, &conn, &insert_query)?;
 
         let mut current_read_index = 0;
-        run_query_on_row(&tmp_db, &conn, list_query, |row: &Row| {
+        common::run_query_on_row(&tmp_db, &conn, list_query, |row: &Row| {
             let first_value = row.get::<&Value>(0).expect("missing id");
             let id = match first_value {
                 turso_core::Value::Integer(i) => *i as i32,
@@ -202,14 +204,14 @@ fn test_regression_multi_row_insert() -> anyhow::Result<()> {
     let insert_query = "INSERT INTO test VALUES (-2), (-3), (-1)";
     let list_query = "SELECT * FROM test";
 
-    run_query(&tmp_db, &conn, insert_query)?;
+    common::run_query(&tmp_db, &conn, insert_query)?;
 
     common::do_flush(&conn, &tmp_db)?;
 
     let mut current_read_index = 1;
     let expected_ids = vec![-3, -2, -1];
     let mut actual_ids = Vec::new();
-    run_query_on_row(&tmp_db, &conn, list_query, |row: &Row| {
+    common::run_query_on_row(&tmp_db, &conn, list_query, |row: &Row| {
         let first_value = row.get::<&Value>(0).expect("missing id");
         let id = match first_value {
             Value::Float(f) => *f as i32,
@@ -273,7 +275,6 @@ fn test_statement_reset() -> anyhow::Result<()> {
 }
 
 #[test]
-#[ignore]
 fn test_wal_checkpoint() -> anyhow::Result<()> {
     let _ = env_logger::try_init();
     let tmp_db =
@@ -283,16 +284,19 @@ fn test_wal_checkpoint() -> anyhow::Result<()> {
     let conn = tmp_db.connect_limbo();
 
     for i in 0..iterations {
+        log::info!("iteration #{i}");
         let insert_query = format!("INSERT INTO test VALUES ({i})");
         do_flush(&conn, &tmp_db)?;
-        conn.checkpoint()?;
-        run_query(&tmp_db, &conn, &insert_query)?;
+        conn.checkpoint(CheckpointMode::Passive {
+            upper_bound_inclusive: None,
+        })?;
+        common::run_query(&tmp_db, &conn, &insert_query)?;
     }
 
     do_flush(&conn, &tmp_db)?;
     let list_query = "SELECT * FROM test LIMIT 1";
     let mut current_index = 0;
-    run_query_on_row(&tmp_db, &conn, list_query, |row: &Row| {
+    common::run_query_on_row(&tmp_db, &conn, list_query, |row: &Row| {
         let id = row.get::<i64>(0).unwrap();
         assert_eq!(current_index, id as usize);
         current_index += 1;
@@ -311,9 +315,9 @@ fn test_wal_restart() -> anyhow::Result<()> {
     fn insert(i: usize, conn: &Arc<Connection>, tmp_db: &TempDatabase) -> anyhow::Result<()> {
         debug!("inserting {i}");
         let insert_query = format!("INSERT INTO test VALUES ({i})");
-        run_query(tmp_db, conn, &insert_query)?;
+        common::run_query(tmp_db, conn, &insert_query)?;
         debug!("inserted {i}");
-        tmp_db.io.run_once()?;
+        tmp_db.io.step()?;
         Ok(())
     }
 
@@ -321,7 +325,7 @@ fn test_wal_restart() -> anyhow::Result<()> {
         debug!("counting");
         let list_query = "SELECT count(x) FROM test";
         let mut count = None;
-        run_query_on_row(tmp_db, conn, list_query, |row: &Row| {
+        common::run_query_on_row(tmp_db, conn, list_query, |row: &Row| {
             assert!(count.is_none());
             count = Some(row.get::<i64>(0).unwrap() as usize);
             debug!("counted {count:?}");
@@ -374,15 +378,15 @@ fn test_write_delete_with_index() -> anyhow::Result<()> {
     for i in 0..max_iterations {
         println!("inserting {i} ");
         let insert_query = format!("INSERT INTO test VALUES ({i})");
-        run_query(&tmp_db, &conn, &insert_query)?;
+        common::run_query(&tmp_db, &conn, &insert_query)?;
     }
     for i in 0..max_iterations {
         println!("deleting {i} ");
         let delete_query = format!("delete from test where x={i}");
-        run_query(&tmp_db, &conn, &delete_query)?;
+        common::run_query(&tmp_db, &conn, &delete_query)?;
         println!("listing after deleting {i} ");
         let mut current_read_index = i + 1;
-        run_query_on_row(&tmp_db, &conn, list_query, |row: &Row| {
+        common::run_query_on_row(&tmp_db, &conn, list_query, |row: &Row| {
             let first_value = row.get::<&Value>(0).expect("missing id");
             let id = match first_value {
                 turso_core::Value::Integer(i) => *i as i32,
@@ -394,7 +398,7 @@ fn test_write_delete_with_index() -> anyhow::Result<()> {
         })?;
         for i in i + 1..max_iterations {
             // now test with seek
-            run_query_on_row(
+            common::run_query_on_row(
                 &tmp_db,
                 &conn,
                 &format!("select * from test where x = {i}"),
@@ -424,20 +428,20 @@ fn test_update_with_index() -> anyhow::Result<()> {
         TempDatabase::new_with_rusqlite("CREATE TABLE test (x REAL PRIMARY KEY, y TEXT);", true);
     let conn = tmp_db.connect_limbo();
 
-    run_query(&tmp_db, &conn, "INSERT INTO test VALUES (1.0, 'foo')")?;
-    run_query(&tmp_db, &conn, "INSERT INTO test VALUES (2.0, 'bar')")?;
+    common::run_query(&tmp_db, &conn, "INSERT INTO test VALUES (1.0, 'foo')")?;
+    common::run_query(&tmp_db, &conn, "INSERT INTO test VALUES (2.0, 'bar')")?;
 
-    run_query_on_row(&tmp_db, &conn, "SELECT * from test WHERE x=10.0", |row| {
+    common::run_query_on_row(&tmp_db, &conn, "SELECT * from test WHERE x=10.0", |row| {
         assert_eq!(row.get::<f64>(0).unwrap(), 1.0);
     })?;
-    run_query(&tmp_db, &conn, "UPDATE test SET x=10.0 WHERE x=1.0")?;
-    run_query_on_row(&tmp_db, &conn, "SELECT * from test WHERE x=10.0", |row| {
+    common::run_query(&tmp_db, &conn, "UPDATE test SET x=10.0 WHERE x=1.0")?;
+    common::run_query_on_row(&tmp_db, &conn, "SELECT * from test WHERE x=10.0", |row| {
         assert_eq!(row.get::<f64>(0).unwrap(), 10.0);
     })?;
 
     let mut count_1 = 0;
     let mut count_10 = 0;
-    run_query_on_row(&tmp_db, &conn, "SELECT * from test", |row| {
+    common::run_query_on_row(&tmp_db, &conn, "SELECT * from test", |row| {
         let v = row.get::<f64>(0).unwrap();
         if v == 1.0 {
             count_1 += 1;
@@ -457,13 +461,13 @@ fn test_delete_with_index() -> anyhow::Result<()> {
 
     maybe_setup_tracing();
 
-    let tmp_db = TempDatabase::new_with_rusqlite("CREATE TABLE t(x UNIQUE)", true);
+    let tmp_db = TempDatabase::new_with_rusqlite("CREATE TABLE t (x UNIQUE)", true);
     let conn = tmp_db.connect_limbo();
 
-    run_query(&tmp_db, &conn, "INSERT INTO t VALUES (1), (2)")?;
-    run_query(&tmp_db, &conn, "DELETE FROM t WHERE x >= 1")?;
+    common::run_query(&tmp_db, &conn, "INSERT INTO t VALUES (1), (2)")?;
+    common::run_query(&tmp_db, &conn, "DELETE FROM t WHERE x >= 1")?;
 
-    run_query_on_row(&tmp_db, &conn, "SELECT * FROM t", |_| {
+    common::run_query_on_row(&tmp_db, &conn, "SELECT * FROM t", |_| {
         panic!("Delete should've deleted every row!");
     })?;
 
@@ -507,12 +511,12 @@ fn test_update_regression() -> anyhow::Result<()> {
 #[test]
 fn test_multiple_statements() -> anyhow::Result<()> {
     let _ = env_logger::try_init();
-    let tmp_db = TempDatabase::new_with_rusqlite("CREATE TABLE t(x)", false);
+    let tmp_db = TempDatabase::new_with_rusqlite("CREATE TABLE t (x)", false);
     let conn = tmp_db.connect_limbo();
 
     conn.execute("INSERT INTO t values(1); insert into t values(2);")?;
 
-    run_query_on_row(&tmp_db, &conn, "SELECT count(1) from t;", |row| {
+    common::run_query_on_row(&tmp_db, &conn, "SELECT count(1) from t;", |row| {
         let count = row.get::<i64>(0).unwrap();
         assert_eq!(count, 2);
     })
@@ -522,7 +526,7 @@ fn test_multiple_statements() -> anyhow::Result<()> {
 }
 
 fn check_integrity_is_ok(tmp_db: TempDatabase, conn: Arc<Connection>) -> Result<(), anyhow::Error> {
-    run_query_on_row(&tmp_db, &conn, "pragma integrity_check", |row: &Row| {
+    common::run_query_on_row(&tmp_db, &conn, "pragma integrity_check", |row: &Row| {
         let res = row.get::<String>(0).unwrap();
         assert!(res.contains("ok"));
     })?;
@@ -601,7 +605,7 @@ fn test_write_concurrent_connections() -> anyhow::Result<()> {
 
     maybe_setup_tracing();
 
-    let tmp_db = TempDatabase::new_with_rusqlite("CREATE TABLE t(x)", false);
+    let tmp_db = TempDatabase::new_with_rusqlite("CREATE TABLE t (x)", false);
     let num_connections = 4;
     let num_inserts_per_connection = 100;
     let mut connections = vec![];
@@ -635,7 +639,7 @@ fn test_write_concurrent_connections() -> anyhow::Result<()> {
     }
 
     let conn = tmp_db.connect_limbo();
-    run_query_on_row(&tmp_db, &conn, "SELECT count(1) from t", |row: &Row| {
+    common::run_query_on_row(&tmp_db, &conn, "SELECT count(1) from t", |row: &Row| {
         let count = row.get::<i64>(0).unwrap();
         assert_eq!(
             count,
@@ -652,21 +656,21 @@ fn test_wal_bad_frame() -> anyhow::Result<()> {
     maybe_setup_tracing();
     let _ = env_logger::try_init();
     let db_path = {
-        let tmp_db = TempDatabase::new_with_rusqlite("CREATE TABLE t1(x)", false);
+        let tmp_db = TempDatabase::new_with_rusqlite("CREATE TABLE t1 (x)", false);
         let db_path = tmp_db.path.clone();
         let conn = tmp_db.connect_limbo();
         conn.execute("BEGIN")?;
-        conn.execute("CREATE TABLE t2(x)")?;
-        conn.execute("CREATE TABLE t3(x)")?;
+        conn.execute("CREATE TABLE t2 (x)")?;
+        conn.execute("CREATE TABLE t3 (x)")?;
         conn.execute("INSERT INTO t2(x) VALUES (1)")?;
         conn.execute("INSERT INTO t3(x) VALUES (1)")?;
         conn.execute("COMMIT")?;
-        run_query_on_row(&tmp_db, &conn, "SELECT count(1) from t2", |row| {
+        common::run_query_on_row(&tmp_db, &conn, "SELECT count(1) from t2", |row| {
             let x = row.get::<i64>(0).unwrap();
             assert_eq!(x, 1);
         })
         .unwrap();
-        run_query_on_row(&tmp_db, &conn, "SELECT count(1) from t3", |row| {
+        common::run_query_on_row(&tmp_db, &conn, "SELECT count(1) from t3", |row| {
             let x = row.get::<i64>(0).unwrap();
             assert_eq!(x, 1);
         })
@@ -696,14 +700,14 @@ fn test_wal_bad_frame() -> anyhow::Result<()> {
         db_path
     };
     {
-        let result = std::panic::catch_unwind(|| {
+        let result = {
             let io: Arc<dyn turso_core::IO> = Arc::new(turso_core::PlatformIO::new().unwrap());
             let db = Database::open_file_with_flags(
                 io.clone(),
                 db_path.to_str().unwrap(),
                 turso_core::OpenFlags::default(),
-                false,
-                false,
+                turso_core::DatabaseOpts::new().with_indexes(false),
+                None,
             )
             .unwrap();
             let tmp_db = TempDatabase {
@@ -712,23 +716,24 @@ fn test_wal_bad_frame() -> anyhow::Result<()> {
                 db,
             };
             let conn = tmp_db.connect_limbo();
-            run_query_on_row(&tmp_db, &conn, "SELECT count(1) from t2", |row| {
+            common::run_query_on_row(&tmp_db, &conn, "SELECT count(1) from t2", |row| {
                 let x = row.get::<i64>(0).unwrap();
                 assert_eq!(x, 0);
             })
-        });
+        };
 
         match result {
-            Err(panic_info) => {
-                let panic_msg = panic_info
-                    .downcast_ref::<String>()
-                    .map(|s| s.as_str())
-                    .or_else(|| panic_info.downcast_ref::<&str>().copied())
-                    .unwrap_or("Unknown panic message");
+            Err(error) => {
+                dbg!(&error);
+                let panic_msg = error.downcast_ref::<LimboError>().unwrap();
+                let msg = match panic_msg {
+                    LimboError::ParseError(message) => message,
+                    _ => panic!("Unexpected panic message: {panic_msg}"),
+                };
 
                 assert!(
-                    panic_msg.contains("WAL frame checksum mismatch."),
-                    "Expected panic message not found. Got: {panic_msg}"
+                    msg.contains("no such table: t2"),
+                    "Expected panic message not found. Got: {msg}"
                 );
             }
             Ok(_) => panic!("Expected query to panic, but it succeeded"),
@@ -752,7 +757,7 @@ fn test_read_wal_dumb_no_frames() -> anyhow::Result<()> {
     {
         let tmp_db = TempDatabase::new_with_existent(&db_path, false);
         let conn = tmp_db.connect_limbo();
-        conn.execute("CREATE TABLE t0(x)")?;
+        conn.execute("CREATE TABLE t0 (x)")?;
         conn.close()?;
     }
     {
@@ -765,45 +770,23 @@ fn test_read_wal_dumb_no_frames() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn run_query(tmp_db: &TempDatabase, conn: &Arc<Connection>, query: &str) -> anyhow::Result<()> {
-    run_query_core(tmp_db, conn, query, None::<fn(&Row)>)
-}
+#[test]
+fn test_insert_with_column_names() -> anyhow::Result<()> {
+    let tmp_db = TempDatabase::new_with_rusqlite("CREATE TABLE a(z)", false);
+    let conn = tmp_db.connect_limbo();
+    let result = conn.execute("INSERT INTO a VALUES (b.x)");
 
-fn run_query_on_row(
-    tmp_db: &TempDatabase,
-    conn: &Arc<Connection>,
-    query: &str,
-    on_row: impl FnMut(&Row),
-) -> anyhow::Result<()> {
-    run_query_core(tmp_db, conn, query, Some(on_row))
-}
+    match result {
+        Ok(_) => panic!("Expected error but query succeeded."),
+        Err(error) => {
+            let error_msg = match error {
+                LimboError::ParseError(msg) => msg,
+                _ => panic!("Unexpected {error}"),
+            };
 
-fn run_query_core(
-    _tmp_db: &TempDatabase,
-    conn: &Arc<Connection>,
-    query: &str,
-    mut on_row: Option<impl FnMut(&Row)>,
-) -> anyhow::Result<()> {
-    match conn.query(query) {
-        Ok(Some(ref mut rows)) => loop {
-            match rows.step()? {
-                StepResult::IO => {
-                    rows.run_once()?;
-                }
-                StepResult::Done => break,
-                StepResult::Row => {
-                    if let Some(on_row) = on_row.as_mut() {
-                        let row = rows.row().unwrap();
-                        on_row(row)
-                    }
-                }
-                _ => unreachable!(),
-            }
-        },
-        Ok(None) => {}
-        Err(err) => {
-            eprintln!("{err}");
+            assert_eq!(error_msg, "no such column: b.x")
         }
-    };
+    }
+
     Ok(())
 }

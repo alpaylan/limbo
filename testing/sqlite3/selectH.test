@@ -17,7 +17,7 @@ source $testdir/tester.tcl
 set testprefix selectH
 
 do_execsql_test 1.1 {
-  CREATE TABLE t1(
+  CREATE TABLE t1 (
      c0,  c1,  c2,  c3,  c4,  c5,  c6,  c7,  c8,  c9,
      c10, c11, c12, c13, c14, c15, c16, c17, c18, c19,
      c20, c21, c22, c23, c24, c25, c26, c27, c28, c29,
@@ -110,7 +110,7 @@ do_test 2.2 {
 #
 do_execsql_test 4.1 {
   DROP TABLE IF EXISTS t1;
-  CREATE TABLE t1(a INTEGER PRIMARY KEY, b TEXT);
+  CREATE TABLE t1 (a INTEGER PRIMARY KEY, b TEXT);
   SELECT 1 FROM (SELECT DISTINCT name COLLATE rtrim FROM sqlite_schema
                  UNION ALL SELECT a FROM t1);
 } {1 1}

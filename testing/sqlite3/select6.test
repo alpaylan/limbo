@@ -26,7 +26,7 @@ set ::testprefix select6
 do_test select6-1.0 {
   execsql {
     BEGIN;
-    CREATE TABLE t1(x, y);
+    CREATE TABLE t1 (x, y);
     INSERT INTO t1 VALUES(1,1);
     INSERT INTO t1 VALUES(2,2);
     INSERT INTO t1 VALUES(3,2);
@@ -103,7 +103,7 @@ do_test select6-1.9 {
 
 do_test select6-2.0 {
   execsql {
-    CREATE TABLE t2(a INTEGER PRIMARY KEY, b);
+    CREATE TABLE t2 (a INTEGER PRIMARY KEY, b);
     INSERT INTO t2 SELECT * FROM t1;
     SELECT DISTINCT b FROM t2 ORDER BY b;
   }
@@ -389,10 +389,10 @@ proc is_flat {sql} {
 do_test select6-8.1 {
   execsql {
     BEGIN;
-    CREATE TABLE t3(p,q);
+    CREATE TABLE t3 (p,q);
     INSERT INTO t3 VALUES(1,11);
     INSERT INTO t3 VALUES(2,22);
-    CREATE TABLE t4(q,r);
+    CREATE TABLE t4 (q,r);
     INSERT INTO t4 VALUES(11,111);
     INSERT INTO t4 VALUES(22,222);
     COMMIT;
@@ -518,9 +518,9 @@ do_test select6-9.11 {
 # return the same number of result columns, the error is detected.
 #
 do_execsql_test 10.1 {
-  CREATE TABLE t(i,j,k);
-  CREATE TABLE j(l,m);
-  CREATE TABLE k(o);
+  CREATE TABLE t (i,j,k);
+  CREATE TABLE j (l,m);
+  CREATE TABLE k (o);
 }
 
 set err [list 1 {SELECTs to the left and right of UNION ALL do not have the same number of result columns}]
@@ -561,7 +561,7 @@ do_catchsql_test 10.8 {
 #
 do_execsql_test 11.1 {
   DROP TABLE IF EXISTS t1;
-  CREATE TABLE t1(w INT, x INT);
+  CREATE TABLE t1 (w INT, x INT);
   INSERT INTO t1(w,x)
    VALUES(1,10),(2,20),(3,30),
          (2,21),(3,31),
@@ -569,7 +569,7 @@ do_execsql_test 11.1 {
   CREATE INDEX t1wx ON t1(w,x);
 
   DROP TABLE IF EXISTS t2;
-  CREATE TABLE t2(w INT, y VARCHAR(8));
+  CREATE TABLE t2 (w INT, y VARCHAR(8));
   INSERT INTO t2(w,y) VALUES(1,'one'),(2,'two'),(3,'three'),(4,'four');
   CREATE INDEX t2wy ON t2(w,y);
 
@@ -605,8 +605,8 @@ do_execsql_test 11.5 {
 do_execsql_test 11.100 {
   DROP TABLE t1;
   DROP TABLE t2;
-  CREATE TABLE t1(x);
-  CREATE TABLE t2(y, z);
+  CREATE TABLE t1 (x);
+  CREATE TABLE t2 (y, z);
   SELECT ( SELECT y FROM t2 WHERE z = cnt )
     FROM ( SELECT count(*) AS cnt FROM t1 );
 } {{}}
@@ -617,10 +617,10 @@ do_execsql_test 11.100 {
 do_execsql_test 12.100 {
   DROP TABLE t1;
   DROP TABLE t2;
-  CREATE TABLE t1(a);
+  CREATE TABLE t1 (a);
   INSERT INTO t1 VALUES(1);
   INSERT INTO t1 VALUES(2);
-  CREATE TABLE t2(b);
+  CREATE TABLE t2 (b);
   INSERT INTO t2 VALUES(3);
   SELECT * FROM (
     SELECT * FROM (SELECT * FROM t1 LIMIT 1)

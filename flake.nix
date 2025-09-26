@@ -71,6 +71,7 @@
             python3
             nodejs
             toolchain
+            uv
           ] ++ lib.optionals pkgs.stdenv.isDarwin [
             apple-sdk
           ];

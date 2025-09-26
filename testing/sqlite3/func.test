@@ -19,7 +19,7 @@ set testprefix func
 # Create a table to work with.
 #
 do_test func-0.0 {
-  execsql {CREATE TABLE tbl1(t1 text)}
+  execsql {CREATE TABLE tbl1 (t1 text)}
   foreach word {this program is free software} {
     execsql "INSERT INTO tbl1 VALUES('$word')"
   }
@@ -27,7 +27,7 @@ do_test func-0.0 {
 } {free is program software this}
 do_test func-0.1 {
   execsql {
-     CREATE TABLE t2(a);
+     CREATE TABLE t2 (a);
      INSERT INTO t2 VALUES(1);
      INSERT INTO t2 VALUES(NULL);
      INSERT INTO t2 VALUES(345);
@@ -185,7 +185,7 @@ do_test func-3.99 {
 ifcapable !floatingpoint {
   do_test func-4.1 {
     execsql {
-      CREATE TABLE t1(a,b,c);
+      CREATE TABLE t1 (a,b,c);
       INSERT INTO t1 VALUES(1,2,3);
       INSERT INTO t1 VALUES(2,12345678901234,-1234567890);
       INSERT INTO t1 VALUES(3,-2,-5);
@@ -196,7 +196,7 @@ ifcapable !floatingpoint {
 ifcapable floatingpoint {
   do_test func-4.1 {
     execsql {
-      CREATE TABLE t1(a,b,c);
+      CREATE TABLE t1 (a,b,c);
       INSERT INTO t1 VALUES(1,2,3);
       INSERT INTO t1 VALUES(2,1.2345678901234,-12345.67890);
       INSERT INTO t1 VALUES(3,-2,-5);
@@ -662,7 +662,7 @@ do_test func-12.4 {
 } {0}
 do_test func-12.5 {
   execsql {
-    CREATE TABLE t4(x);
+    CREATE TABLE t4 (x);
     INSERT INTO t4 VALUES(test_destructor('hello'));
     INSERT INTO t4 VALUES(test_destructor('world'));
     SELECT min(test_destructor(x)), max(test_destructor(x)) FROM t4;
@@ -691,7 +691,7 @@ do_test func-13.1 {
 
 do_test func-13.2 {
   execsql {
-    CREATE TABLE t4(a, b);
+    CREATE TABLE t4 (a, b);
     INSERT INTO t4 VALUES('abc', 'def');
     INSERT INTO t4 VALUES('ghi', 'jkl');
   }
@@ -784,7 +784,7 @@ do_test func-15.4 {
 # Test the quote function for BLOB and NULL values.
 do_test func-16.1 {
   execsql {
-    CREATE TABLE tbl2(a, b);
+    CREATE TABLE tbl2 (a, b);
   }
   set STMT [sqlite3_prepare $::DB "INSERT INTO tbl2 VALUES(?, ?)" -1 TAIL]
   sqlite3_bind_blob $::STMT 1 abc 3
@@ -814,7 +814,7 @@ do_test func-17.1 {
 #
 do_test func-18.1 {
   execsql {
-    CREATE TABLE t5(x);
+    CREATE TABLE t5 (x);
     INSERT INTO t5 VALUES(1);
     INSERT INTO t5 VALUES(-99);
     INSERT INTO t5 VALUES(10000);
@@ -865,7 +865,7 @@ do_test func-18.6 {
 #
 do_test func-18.10 {
   execsql {
-    CREATE TABLE t6(x INTEGER);
+    CREATE TABLE t6 (x INTEGER);
     INSERT INTO t6 VALUES(1);
     INSERT INTO t6 VALUES(1<<62);
     SELECT sum(x) - ((1<<62)+1) from t6;
@@ -1328,7 +1328,7 @@ do_test func-27.3 {
 #
 do_test func-28.1 {
   db eval {
-    CREATE TABLE t28(x, y DEFAULT(nosuchfunc(1)));
+    CREATE TABLE t28 (x, y DEFAULT(nosuchfunc(1)));
   }
   catchsql {
     INSERT INTO t28(x) VALUES(1);
@@ -1340,7 +1340,7 @@ do_test func-28.1 {
 #
 do_test func-29.1 {
   db eval {
-    CREATE TABLE t29(id INTEGER PRIMARY KEY, x, y);
+    CREATE TABLE t29 (id INTEGER PRIMARY KEY, x, y);
     INSERT INTO t29 VALUES(1, 2, 3), (2, NULL, 4), (3, 4.5, 5);
     INSERT INTO t29 VALUES(4, randomblob(1000000), 6);
     INSERT INTO t29 VALUES(5, 'hello', 7);
@@ -1387,7 +1387,7 @@ do_test func-29.6 {
 # page.  Make sure the optimization works.
 #
 do_execsql_test func-29.10 {
-  CREATE TABLE t29b(a,b,c,d,e,f,g,h,i);
+  CREATE TABLE t29b (a,b,c,d,e,f,g,h,i);
   INSERT INTO t29b 
    VALUES(1, hex(randomblob(2000)), null, 0, 1, '', zeroblob(0),'x',x'01');
   SELECT typeof(c), typeof(d), typeof(e), typeof(f),
@@ -1443,7 +1443,7 @@ do_execsql_test func-32.120 {
 } {2}
 do_execsql_test func-32.130 {
   DROP TABLE IF EXISTS t1;
-  CREATE TABLE t1(a,b,c,e,f);
+  CREATE TABLE t1 (a,b,c,e,f);
   INSERT INTO t1 VALUES(1,2.5,'xyz',x'e0c1b2a3',null);
   SELECT test_frombind(a,b,c,e,f,$xyz) FROM t1;
 } {32}
@@ -1478,8 +1478,8 @@ do_catchsql_test func-33.5 {
   SELECT * FROM c;
 } {1 {unsafe use of testdirectonly()}}
 do_execsql_test func-33.10 {
-  CREATE TABLE t33a(a,b);
-  CREATE TABLE t33b(x,y);
+  CREATE TABLE t33a (a,b);
+  CREATE TABLE t33b (x,y);
   CREATE TRIGGER r1 AFTER INSERT ON t33a BEGIN
     INSERT INTO t33b(x,y) VALUES(testdirectonly(new.a),new.b);
   END;
@@ -1503,7 +1503,7 @@ do_execsql_test func-33.20 {
 #
 reset_db
 do_execsql_test func-34.10 {
-  CREATE TABLE t1(a INT CHECK(
+  CREATE TABLE t1 (a INT CHECK(
      datetime( 0, 1, 2, 3, 4, 5, 6, 7, 8, 9,
               10,11,12,13,14,15,16,17,18,19,
               20,21,22,23,24,25,26,27,28,29,
@@ -1524,14 +1524,14 @@ do_execsql_test func-34.10 {
 #
 reset_db
 do_execsql_test func-35.100 {
-  CREATE TABLE t1(x);
+  CREATE TABLE t1 (x);
   SELECT coalesce(x, abs(-9223372036854775808)) FROM t1;
 } {}
 do_execsql_test func-35.110 {
   SELECT coalesce(x, 'xyz' LIKE printf('%.1000000c','y')) FROM t1;
 } {}
 do_execsql_test func-35.200 {
-  CREATE TABLE t0(c0 CHECK(ABS(-9223372036854775808)));
+  CREATE TABLE t0 (c0 CHECK(ABS(-9223372036854775808)));
   PRAGMA integrity_check;
 } {ok}
 

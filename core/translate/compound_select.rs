@@ -1,27 +1,29 @@
 use crate::schema::{Index, IndexColumn, Schema};
-use crate::translate::emitter::{emit_query, LimitCtx, TransactionMode, TranslateCtx};
+use crate::translate::emitter::{emit_query, LimitCtx, Resolver, TranslateCtx};
+use crate::translate::expr::translate_expr;
 use crate::translate::plan::{Plan, QueryDestination, SelectPlan};
+use crate::translate::result_row::try_fold_expr_to_i64;
 use crate::vdbe::builder::{CursorType, ProgramBuilder};
 use crate::vdbe::insn::Insn;
 use crate::vdbe::BranchOffset;
-use crate::SymbolTable;
+use crate::{emit_explain, QueryMode, SymbolTable};
 use std::sync::Arc;
 use tracing::instrument;
-use turso_sqlite3_parser::ast::{CompoundOperator, SortOrder};
+use turso_parser::ast::{CompoundOperator, SortOrder};
 
 use tracing::Level;
 
 #[instrument(skip_all, level = Level::DEBUG)]
 pub fn emit_program_for_compound_select(
     program: &mut ProgramBuilder,
+    resolver: &Resolver,
     plan: Plan,
-    schema: &Schema,
-    syms: &SymbolTable,
 ) -> crate::Result<()> {
     let Plan::CompoundSelect {
         left: _left,
         right_most,
         limit,
+        offset,
         ..
     } = &plan
     else {
@@ -30,24 +32,58 @@ pub fn emit_program_for_compound_select(
 
     let right_plan = right_most.clone();
     // Trivial exit on LIMIT 0
-    if let Some(limit) = limit {
-        if *limit == 0 {
-            program.epilogue(TransactionMode::Read);
-            program.result_columns = right_plan.result_columns;
-            program.table_references.extend(right_plan.table_references);
-            return Ok(());
-        }
+    if matches!(limit.as_ref().and_then(try_fold_expr_to_i64), Some(v) if v == 0) {
+        program.result_columns = right_plan.result_columns;
+        program.table_references.extend(right_plan.table_references);
+        return Ok(());
     }
 
-    // Each subselect shares the same limit_ctx, because the LIMIT applies to the entire compound select,
-    // not just a single subselect.
-    let limit_ctx = limit.map(|limit| {
+    let right_most_ctx = TranslateCtx::new(
+        program,
+        resolver.schema,
+        resolver.symbol_table,
+        right_most.table_references.joined_tables().len(),
+    );
+
+    // Each subselect shares the same limit_ctx and offset, because the LIMIT, OFFSET applies to
+    // the entire compound select, not just a single subselect.
+    let limit_ctx = limit.as_ref().map(|limit| {
         let reg = program.alloc_register();
-        program.emit_insn(Insn::Integer {
-            value: limit as i64,
-            dest: reg,
-        });
+        if let Some(val) = try_fold_expr_to_i64(limit) {
+            program.emit_insn(Insn::Integer {
+                value: val,
+                dest: reg,
+            });
+        } else {
+            program.add_comment(program.offset(), "OFFSET expr");
+            _ = translate_expr(program, None, limit, reg, &right_most_ctx.resolver);
+            program.emit_insn(Insn::MustBeInt { reg });
+        }
         LimitCtx::new_shared(reg)
+    });
+    let offset_reg = offset.as_ref().map(|offset_expr| {
+        let reg = program.alloc_register();
+
+        if let Some(val) = try_fold_expr_to_i64(offset_expr) {
+            // Compile-time constant offset
+            program.emit_insn(Insn::Integer {
+                value: val,
+                dest: reg,
+            });
+        } else {
+            program.add_comment(program.offset(), "OFFSET expr");
+            _ = translate_expr(program, None, offset_expr, reg, &right_most_ctx.resolver);
+            program.emit_insn(Insn::MustBeInt { reg });
+        }
+
+        let combined_reg = program.alloc_register();
+        program.emit_insn(Insn::OffsetLimit {
+            offset_reg: reg,
+            combined_reg,
+            limit_reg: limit_ctx.as_ref().unwrap().reg_limit,
+        });
+
+        reg
     });
 
     // When a compound SELECT is part of a query that yields results to a coroutine (e.g. within an INSERT clause),
@@ -61,17 +97,19 @@ pub fn emit_program_for_compound_select(
         _ => (None, None),
     };
 
+    emit_explain!(program, true, "COMPOUND QUERY".to_owned());
     emit_compound_select(
         program,
         plan,
-        schema,
-        syms,
+        right_most_ctx.resolver.schema,
+        right_most_ctx.resolver.symbol_table,
         limit_ctx,
+        offset_reg,
         yield_reg,
         reg_result_cols_start,
     )?;
+    program.pop_current_parent_explain();
 
-    program.epilogue(TransactionMode::Read);
     program.result_columns = right_plan.result_columns;
     program.table_references.extend(right_plan.table_references);
 
@@ -80,12 +118,14 @@ pub fn emit_program_for_compound_select(
 
 // Emits bytecode for a compound SELECT statement. This function processes the rightmost part of
 // the compound SELECT and handles the left parts recursively based on the compound operator type.
+#[allow(clippy::too_many_arguments)]
 fn emit_compound_select(
     program: &mut ProgramBuilder,
     plan: Plan,
     schema: &Schema,
     syms: &SymbolTable,
     limit_ctx: Option<LimitCtx>,
+    offset_reg: Option<usize>,
     yield_reg: Option<usize>,
     reg_result_cols_start: Option<usize>,
 ) -> crate::Result<()> {
@@ -105,7 +145,6 @@ fn emit_compound_select(
         schema,
         syms,
         right_most.table_references.joined_tables().len(),
-        right_most.result_columns.len(),
     );
     right_most_ctx.reg_result_cols_start = reg_result_cols_start;
     match left.pop() {
@@ -120,8 +159,8 @@ fn emit_compound_select(
                 let compound_select = Plan::CompoundSelect {
                     left,
                     right_most: plan,
-                    limit,
-                    offset,
+                    limit: limit.clone(),
+                    offset: offset.clone(),
                     order_by,
                 };
                 emit_compound_select(
@@ -130,6 +169,7 @@ fn emit_compound_select(
                     schema,
                     syms,
                     limit_ctx,
+                    offset_reg,
                     yield_reg,
                     reg_result_cols_start,
                 )?;
@@ -144,7 +184,14 @@ fn emit_compound_select(
                     right_most.limit = limit;
                     right_most_ctx.limit_ctx = Some(limit_ctx);
                 }
+                if offset_reg.is_some() {
+                    right_most.offset = offset;
+                    right_most_ctx.reg_offset = offset_reg;
+                }
+
+                emit_explain!(program, true, "UNION ALL".to_owned());
                 emit_query(program, &mut right_most, &mut right_most_ctx)?;
+                program.pop_current_parent_explain();
                 program.preassign_label_to_next_insn(label_next_select);
             }
             CompoundOperator::Union => {
@@ -176,6 +223,7 @@ fn emit_compound_select(
                     schema,
                     syms,
                     None,
+                    None,
                     yield_reg,
                     reg_result_cols_start,
                 )?;
@@ -185,7 +233,10 @@ fn emit_compound_select(
                     index: dedupe_index.1.clone(),
                     is_delete: false,
                 };
+
+                emit_explain!(program, true, "UNION USING TEMP B-TREE".to_owned());
                 emit_query(program, &mut right_most, &mut right_most_ctx)?;
+                program.pop_current_parent_explain();
 
                 if new_dedupe_index {
                     read_deduplicated_union_or_except_rows(
@@ -193,6 +244,7 @@ fn emit_compound_select(
                         dedupe_index.0,
                         dedupe_index.1.as_ref(),
                         limit_ctx,
+                        offset_reg,
                         yield_reg,
                     );
                 }
@@ -225,6 +277,7 @@ fn emit_compound_select(
                     schema,
                     syms,
                     None,
+                    None,
                     yield_reg,
                     reg_result_cols_start,
                 )?;
@@ -236,7 +289,9 @@ fn emit_compound_select(
                     index: right_index,
                     is_delete: false,
                 };
+                emit_explain!(program, true, "INTERSECT USING TEMP B-TREE".to_owned());
                 emit_query(program, &mut right_most, &mut right_most_ctx)?;
+                program.pop_current_parent_explain();
                 read_intersect_rows(
                     program,
                     left_cursor_id,
@@ -244,6 +299,7 @@ fn emit_compound_select(
                     right_cursor_id,
                     target_cursor_id,
                     limit_ctx,
+                    offset_reg,
                     yield_reg,
                 );
             }
@@ -276,6 +332,7 @@ fn emit_compound_select(
                     schema,
                     syms,
                     None,
+                    None,
                     yield_reg,
                     reg_result_cols_start,
                 )?;
@@ -284,10 +341,12 @@ fn emit_compound_select(
                     index: index.clone(),
                     is_delete: true,
                 };
+                emit_explain!(program, true, "EXCEPT USING TEMP B-TREE".to_owned());
                 emit_query(program, &mut right_most, &mut right_most_ctx)?;
+                program.pop_current_parent_explain();
                 if new_index {
                     read_deduplicated_union_or_except_rows(
-                        program, cursor_id, &index, limit_ctx, yield_reg,
+                        program, cursor_id, &index, limit_ctx, offset_reg, yield_reg,
                     );
                 }
             }
@@ -297,7 +356,13 @@ fn emit_compound_select(
                 right_most_ctx.limit_ctx = Some(limit_ctx);
                 right_most.limit = limit;
             }
+            if offset_reg.is_some() {
+                right_most.offset = offset;
+                right_most_ctx.reg_offset = offset_reg;
+            }
+            emit_explain!(program, true, "LEFT-MOST SUBQUERY".to_owned());
             emit_query(program, &mut right_most, &mut right_most_ctx)?;
+            program.pop_current_parent_explain();
         }
     }
 
@@ -311,7 +376,7 @@ fn create_dedupe_index(
     schema: &Schema,
 ) -> crate::Result<(usize, Arc<Index>)> {
     if !schema.indexes_enabled {
-        crate::bail_parse_error!("UNION OR INTERSECT is not supported without indexes");
+        crate::bail_parse_error!("UNION OR INTERSECT or EXCEPT is not supported without indexes");
     }
 
     let dedupe_index = Arc::new(Index {
@@ -333,8 +398,9 @@ fn create_dedupe_index(
         root_page: 0,
         ephemeral: true,
         table_name: String::new(),
-        unique: true,
+        unique: false,
         has_rowid: false,
+        where_clause: None,
     });
     let cursor_id = program.alloc_cursor_id(CursorType::BTreeIndex(dedupe_index.clone()));
     program.emit_insn(Insn::OpenEphemeral {
@@ -351,6 +417,7 @@ fn read_deduplicated_union_or_except_rows(
     dedupe_cursor_id: usize,
     dedupe_index: &Index,
     limit_ctx: Option<LimitCtx>,
+    offset_reg: Option<usize>,
     yield_reg: Option<usize>,
 ) {
     let label_close = program.allocate_label();
@@ -362,6 +429,13 @@ fn read_deduplicated_union_or_except_rows(
         pc_if_empty: label_dedupe_next,
     });
     program.preassign_label_to_next_insn(label_dedupe_loop_start);
+    if let Some(reg) = offset_reg {
+        program.emit_insn(Insn::IfPos {
+            reg,
+            target_pc: label_dedupe_next,
+            decrement_by: 1,
+        });
+    }
     for col_idx in 0..dedupe_index.columns.len() {
         let start_reg = if let Some(yield_reg) = yield_reg {
             // Need to reuse the yield_reg for the column being emitted
@@ -406,6 +480,7 @@ fn read_deduplicated_union_or_except_rows(
 }
 
 // Emits the bytecode for Reading rows from the intersection of two cursors.
+#[allow(clippy::too_many_arguments)]
 fn read_intersect_rows(
     program: &mut ProgramBuilder,
     left_cursor_id: usize,
@@ -413,6 +488,7 @@ fn read_intersect_rows(
     right_cursor_id: usize,
     target_cursor: Option<usize>,
     limit_ctx: Option<LimitCtx>,
+    offset_reg: Option<usize>,
     yield_reg: Option<usize>,
 ) {
     let label_close = program.allocate_label();
@@ -435,6 +511,13 @@ fn read_intersect_rows(
         record_reg: row_content_reg,
         num_regs: 0,
     });
+    if let Some(reg) = offset_reg {
+        program.emit_insn(Insn::IfPos {
+            reg,
+            target_pc: label_next,
+            decrement_by: 1,
+        });
+    }
     let column_count = index.columns.len();
     let cols_start_reg = if let Some(yield_reg) = yield_reg {
         yield_reg + 1
@@ -455,6 +538,7 @@ fn read_intersect_rows(
             count: column_count,
             dest_reg: row_content_reg,
             index_name: None,
+            affinity_str: None,
         });
         program.emit_insn(Insn::IdxInsert {
             cursor_id: target_cursor_id,

@@ -19,7 +19,7 @@ set testdir [file dirname $argv0]
 source $testdir/tester.tcl
 
 execsql {
-  CREATE TABLE songs(songid, artist, timesplayed);
+  CREATE TABLE songs (songid, artist, timesplayed);
   INSERT INTO songs VALUES(1,'one',1);
   INSERT INTO songs VALUES(2,'one',2);
   INSERT INTO songs VALUES(3,'two',3);

@@ -91,7 +91,6 @@ impl<'a> ImportFile<'a> {
                 }
             }
         };
-
         let file = match File::open(args.file) {
             Ok(file) => file,
             Err(e) => {

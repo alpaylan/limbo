@@ -1,6 +1,6 @@
 use std::fmt;
 use std::fmt::{Debug, Display};
-use std::rc::Rc;
+use std::sync::Arc;
 use turso_ext::{FinalizeFunction, InitAggFunction, ScalarFunction, StepFunction};
 
 use crate::LimboError;
@@ -157,6 +157,8 @@ pub enum VectorFunc {
     VectorExtract,
     VectorDistanceCos,
     VectorDistanceEuclidean,
+    VectorConcat,
+    VectorSlice,
 }
 
 impl VectorFunc {
@@ -175,6 +177,8 @@ impl Display for VectorFunc {
             Self::VectorDistanceCos => "vector_distance_cos".to_string(),
             // We use `distance_l2` to reduce user input
             Self::VectorDistanceEuclidean => "vector_distance_l2".to_string(),
+            Self::VectorConcat => "vector_concat".to_string(),
+            Self::VectorSlice => "vector_slice".to_string(),
         };
         write!(f, "{str}")
     }
@@ -199,7 +203,7 @@ pub enum AggFunc {
     JsonbGroupObject,
     #[cfg(feature = "json")]
     JsonGroupObject,
-    External(Rc<ExtFunc>),
+    External(Arc<ExtFunc>),
 }
 
 impl PartialEq for AggFunc {
@@ -213,7 +217,7 @@ impl PartialEq for AggFunc {
             | (Self::StringAgg, Self::StringAgg)
             | (Self::Sum, Self::Sum)
             | (Self::Total, Self::Total) => true,
-            (Self::External(a), Self::External(b)) => Rc::ptr_eq(a, b),
+            (Self::External(a), Self::External(b)) => Arc::ptr_eq(a, b),
             _ => false,
         }
     }
@@ -315,6 +319,7 @@ pub enum ScalarFunc {
     LastInsertRowid,
     Replace,
     #[cfg(feature = "fs")]
+    #[cfg(not(target_family = "wasm"))]
     LoadExtension,
     StrfTime,
     Printf,
@@ -323,6 +328,9 @@ pub enum ScalarFunc {
     Likelihood,
     TableColumnsJsonArray,
     BinRecordJsonObject,
+    Attach,
+    Detach,
+    Unlikely,
 }
 
 impl ScalarFunc {
@@ -374,6 +382,7 @@ impl ScalarFunc {
             ScalarFunc::LastInsertRowid => false,
             ScalarFunc::Replace => true,
             #[cfg(feature = "fs")]
+            #[cfg(not(target_family = "wasm"))]
             ScalarFunc::LoadExtension => true,
             ScalarFunc::StrfTime => false,
             ScalarFunc::Printf => false,
@@ -382,6 +391,9 @@ impl ScalarFunc {
             ScalarFunc::Likelihood => true,
             ScalarFunc::TableColumnsJsonArray => true, // while columns of the table can change with DDL statements, within single query plan it's static
             ScalarFunc::BinRecordJsonObject => true,
+            ScalarFunc::Attach => false, // changes database state
+            ScalarFunc::Detach => false, // changes database state
+            ScalarFunc::Unlikely => true,
         }
     }
 }
@@ -435,6 +447,7 @@ impl Display for ScalarFunc {
             Self::Replace => "replace".to_string(),
             Self::DateTime => "datetime".to_string(),
             #[cfg(feature = "fs")]
+            #[cfg(not(target_family = "wasm"))]
             Self::LoadExtension => "load_extension".to_string(),
             Self::StrfTime => "strftime".to_string(),
             Self::Printf => "printf".to_string(),
@@ -443,6 +456,9 @@ impl Display for ScalarFunc {
             Self::Likelihood => "likelihood".to_string(),
             Self::TableColumnsJsonArray => "table_columns_json_array".to_string(),
             Self::BinRecordJsonObject => "bin_record_json_object".to_string(),
+            Self::Attach => "attach".to_string(),
+            Self::Detach => "detach".to_string(),
+            Self::Unlikely => "unlikely".to_string(),
         };
         write!(f, "{str}")
     }
@@ -566,6 +582,7 @@ impl Display for MathFunc {
 #[derive(Debug)]
 pub enum AlterTableFunc {
     RenameTable,
+    AlterColumn,
     RenameColumn,
 }
 
@@ -574,6 +591,7 @@ impl Display for AlterTableFunc {
         match self {
             AlterTableFunc::RenameTable => write!(f, "limbo_rename_table"),
             AlterTableFunc::RenameColumn => write!(f, "limbo_rename_column"),
+            AlterTableFunc::AlterColumn => write!(f, "limbo_alter_column"),
         }
     }
 }
@@ -587,7 +605,7 @@ pub enum Func {
     #[cfg(feature = "json")]
     Json(JsonFunc),
     AlterTable(AlterTableFunc),
-    External(Rc<ExternalFunc>),
+    External(Arc<ExternalFunc>),
 }
 
 impl Display for Func {
@@ -734,6 +752,7 @@ impl Func {
             "replace" => Ok(Self::Scalar(ScalarFunc::Replace)),
             "likely" => Ok(Self::Scalar(ScalarFunc::Likely)),
             "likelihood" => Ok(Self::Scalar(ScalarFunc::Likelihood)),
+            "unlikely" => Ok(Self::Scalar(ScalarFunc::Unlikely)),
             #[cfg(feature = "json")]
             "json" => Ok(Self::Json(JsonFunc::Json)),
             #[cfg(feature = "json")]
@@ -818,6 +837,7 @@ impl Func {
             "tanh" => Ok(Self::Math(MathFunc::Tanh)),
             "trunc" => Ok(Self::Math(MathFunc::Trunc)),
             #[cfg(feature = "fs")]
+            #[cfg(not(target_family = "wasm"))]
             "load_extension" => Ok(Self::Scalar(ScalarFunc::LoadExtension)),
             "strftime" => Ok(Self::Scalar(ScalarFunc::StrfTime)),
             "printf" => Ok(Self::Scalar(ScalarFunc::Printf)),
@@ -827,6 +847,8 @@ impl Func {
             "vector_extract" => Ok(Self::Vector(VectorFunc::VectorExtract)),
             "vector_distance_cos" => Ok(Self::Vector(VectorFunc::VectorDistanceCos)),
             "vector_distance_l2" => Ok(Self::Vector(VectorFunc::VectorDistanceEuclidean)),
+            "vector_concat" => Ok(Self::Vector(VectorFunc::VectorConcat)),
+            "vector_slice" => Ok(Self::Vector(VectorFunc::VectorSlice)),
             _ => crate::bail_parse_error!("no such function: {}", name),
         }
     }

@@ -7,22 +7,22 @@ from cli_tests.test_turso_cli import TestTursoShell
 sqlite_exec = "./scripts/limbo-sqlite3"
 sqlite_flags = os.getenv("SQLITE_FLAGS", "-q").split(" ")
 
-test_data = """CREATE TABLE numbers ( id INTEGER PRIMARY KEY, value FLOAT NOT NULL);
-INSERT INTO numbers (value) VALUES (1.0);
-INSERT INTO numbers (value) VALUES (2.0);
-INSERT INTO numbers (value) VALUES (3.0);
-INSERT INTO numbers (value) VALUES (4.0);
-INSERT INTO numbers (value) VALUES (5.0);
-INSERT INTO numbers (value) VALUES (6.0);
-INSERT INTO numbers (value) VALUES (7.0);
-CREATE TABLE test (value REAL, percent REAL);
-INSERT INTO test values (10, 25);
-INSERT INTO test values (20, 25);
-INSERT INTO test values (30, 25);
-INSERT INTO test values (40, 25);
-INSERT INTO test values (50, 25);
-INSERT INTO test values (60, 25);
-INSERT INTO test values (70, 25);
+test_data = """CREATE TABLE numbers ( id INTEGER PRIMARY KEY, value FLOAT NOT NULL, category TEXT DEFAULT 'A');
+INSERT INTO numbers (value, category) VALUES (1.0, 'A');
+INSERT INTO numbers (value, category) VALUES (2.0, 'A');
+INSERT INTO numbers (value, category) VALUES (3.0, 'A');
+INSERT INTO numbers (value, category) VALUES (4.0, 'B');
+INSERT INTO numbers (value, category) VALUES (5.0, 'B');
+INSERT INTO numbers (value, category) VALUES (6.0, 'B');
+INSERT INTO numbers (value, category) VALUES (7.0, 'B');
+CREATE TABLE test (value REAL, percent REAL, category TEXT);
+INSERT INTO test values (10, 25, 'A');
+INSERT INTO test values (20, 25, 'A');
+INSERT INTO test values (30, 25, 'B');
+INSERT INTO test values (40, 25, 'C');
+INSERT INTO test values (50, 25, 'C');
+INSERT INTO test values (60, 25, 'C');
+INSERT INTO test values (70, 25, 'D');
 """
 
 
@@ -103,6 +103,18 @@ def test_regexp():
         "select regexp_replace('the year is 2021', '([0-9]+)', '$1 or 2050') = 'the year is 2021 or 2050';",
         true,
     )
+    limbo.run_test_fn(
+        "select regexp_capture('the year is 2021', '([0-9]+)') = '2021';",
+        true,
+    )
+    limbo.run_test_fn(
+        "select regexp_capture('abc 123 def', '([a-z]+) ([0-9]+) ([a-z]+)', 2) = '123';",
+        true,
+    )
+    limbo.run_test_fn(
+        "select regexp_capture('no digits here', '([0-9]+)');",
+        null,
+    )
     limbo.quit()
 
 
@@ -141,6 +153,11 @@ def test_aggregates():
         validate_median,
         "median agg function works",
     )
+    limbo.run_test_fn(
+        "select CASE WHEN median(value) > 0 THEN median(value) ELSE 0 END from numbers;",
+        validate_median,
+        "median agg function wrapped in expression works",
+    )
     limbo.execute_dot("INSERT INTO numbers (value) VALUES (8.0);\n")
     limbo.run_test_fn(
         "select median(value) from numbers;",
@@ -159,6 +176,44 @@ def test_aggregates():
     )
     limbo.run_test_fn("SELECT percentile_cont(value, 0.25) from test;", validate_percentile1)
     limbo.run_test_fn("SELECT percentile_disc(value, 0.55) from test;", validate_percentile_disc)
+    limbo.quit()
+
+
+def test_grouped_aggregates():
+    limbo = TestTursoShell(init_commands=test_data)
+    extension_path = "./target/debug/liblimbo_percentile"
+    limbo.execute_dot(f".load {extension_path}")
+
+    limbo.run_test_fn(
+        "SELECT median(value) FROM numbers GROUP BY category;",
+        lambda res: "2.0\n5.5" == res,
+        "median aggregate function works",
+    )
+    limbo.run_test_fn(
+        "select CASE WHEN median(value) > 0 THEN median(value) ELSE 0 END from numbers GROUP BY category;",
+        lambda res: "2.0\n5.5" == res,
+        "median aggregate function wrapped in expression works",
+    )
+    limbo.run_test_fn(
+        "SELECT percentile(value, percent) FROM test GROUP BY category;",
+        lambda res: "12.5\n30.0\n45.0\n70.0" == res,
+        "grouped aggregate percentile function with 2 arguments works",
+    )
+    limbo.run_test_fn(
+        "SELECT percentile(value, 55) FROM test GROUP BY category;",
+        lambda res: "15.5\n30.0\n51.0\n70.0" == res,
+        "grouped aggregate percentile function with 1 argument works",
+    )
+    limbo.run_test_fn(
+        "SELECT percentile_cont(value, 0.25) FROM test GROUP BY category;",
+        lambda res: "12.5\n30.0\n45.0\n70.0" == res,
+        "grouped aggregate percentile_cont function works",
+    )
+    limbo.run_test_fn(
+        "SELECT percentile_disc(value, 0.55) FROM test GROUP BY category;",
+        lambda res: "10.0\n30.0\n50.0\n70.0" == res,
+        "grouped aggregate percentile_disc function works",
+    )
     limbo.quit()
 
 
@@ -317,26 +372,6 @@ def _test_series(limbo: TestTursoShell):
         lambda res: res == "1\n2\n3\n4\n5\n6\n7\n8\n9\n10",
     )
     limbo.run_test_fn(
-        "SELECT * FROM generate_series WHERE start = 1 AND stop = 10;",
-        lambda res: res == "1\n2\n3\n4\n5\n6\n7\n8\n9\n10",
-    )
-    limbo.run_test_fn(
-        "SELECT * FROM generate_series(1, 10) WHERE value < 5;",
-        lambda res: res == "1\n2\n3\n4",
-    )
-    limbo.run_test_fn(
-        "SELECT * FROM generate_series WHERE start = 1 AND stop = 10 AND value < 5;",
-        lambda res: res == "1\n2\n3\n4",
-    )
-    limbo.run_test_fn(
-        "SELECT * FROM generate_series WHERE start = 1 AND stop = 10 AND start = 5;",
-        lambda res: res == "",
-    )
-    limbo.run_test_fn(
-        "SELECT * FROM generate_series WHERE start = 1 AND stop = 10 AND start > 5;",
-        lambda res: res == "",
-    )
-    limbo.run_test_fn(
         "SELECT * FROM generate_series;",
         lambda res: "Invalid Argument" in res or 'first argument to "generate_series()" missing or unusable' in res,
     )
@@ -345,32 +380,13 @@ def _test_series(limbo: TestTursoShell):
         lambda res: res == "1\n3\n5\n7\n9",
     )
     limbo.run_test_fn(
-        "SELECT * FROM generate_series WHERE start = 1 AND stop = 10 AND step = 2;",
-        lambda res: res == "1\n3\n5\n7\n9",
-    )
-    limbo.run_test_fn(
-        "SELECT * FROM generate_series(1, 10, 2, 3);",
-        lambda res: "too many arguments" in res.lower(),
-    )
-    limbo.run_test_fn(
         "SELECT * FROM generate_series(10, 1, -2);",
         lambda res: res == "10\n8\n6\n4\n2",
     )
     limbo.run_test_fn(
-        "SELECT "
-        "   a.value a_val, "
-        "   b.value b_val "
-        "FROM "
-        "   generate_series(1, 3) a "
-        "JOIN "
-        "   generate_series(1, 1) b ON a.value = b.value;",
-        lambda res: res == "1|1",
-    )
-    limbo.execute_dot("CREATE TABLE target (id integer primary key);")
-    limbo.execute_dot("INSERT INTO target SELECT * FROM generate_series(1, 5);")
-    limbo.run_test_fn(
-        "SELECT * FROM target;",
-        lambda res: res == "1\n2\n3\n4\n5",
+        "SELECT * FROM generate_series(b.start, b.stop) b;",
+        lambda res: "Invalid Argument" in res or 'first argument to "generate_series()" missing or unusable' in res,
+        "self-reference in generate_series arguments",
     )
     limbo.quit()
 
@@ -571,32 +587,6 @@ def test_vfs():
     limbo.quit()
 
 
-def test_drop_virtual_table():
-    ext_path = "target/debug/libturso_ext_tests"
-    limbo = TestTursoShell()
-    limbo.execute_dot(f".load {ext_path}")
-    limbo.run_debug(
-        "create virtual table t using kv_store;",
-    )
-    limbo.run_test_fn(".schema", lambda res: "CREATE VIRTUAL TABLE t" in res)
-    limbo.run_test_fn(
-        "insert into t values ('hello', 'world');",
-        null,
-        "can insert into kv_store vtable",
-    )
-    limbo.run_test_fn(
-        "DROP TABLE t;",
-        lambda res: "VDestroy called" in res,
-        "can drop kv_store vtable",
-    )
-    limbo.run_test_fn(
-        "DROP TABLE t;",
-        lambda res: "× Parse error: No such table: t" == res,
-        "should error when drop kv_store vtable",
-    )
-    limbo.quit()
-
-
 def test_sqlite_vfs_compat():
     sqlite = TestTursoShell(
         init_commands="",
@@ -626,50 +616,11 @@ def test_sqlite_vfs_compat():
     sqlite.quit()
 
 
-def test_create_virtual_table():
-    ext_path = "target/debug/libturso_ext_tests"
-
-    limbo = TestTursoShell()
-    limbo.execute_dot(f".load {ext_path}")
-
-    limbo.run_debug("CREATE VIRTUAL TABLE t1 USING kv_store;")
-    limbo.run_test_fn(
-        "CREATE VIRTUAL TABLE t1 USING kv_store;",
-        lambda res: "× Parse error: Table t1 already exists" == res,
-        "create virtual table fails if virtual table with the same name already exists",
-    )
-    limbo.run_test_fn(
-        "CREATE VIRTUAL TABLE IF NOT EXISTS t1 USING kv_store;",
-        null,
-        "create virtual table with IF NOT EXISTS succeeds",
-    )
-
-    limbo.run_debug("CREATE TABLE t2 (col INTEGER);")
-    limbo.run_test_fn(
-        "CREATE VIRTUAL TABLE t2 USING kv_store;",
-        lambda res: "× Parse error: Table t2 already exists" == res,
-        "create virtual table fails if regular table with the same name already exists",
-    )
-    limbo.run_test_fn(
-        "CREATE VIRTUAL TABLE IF NOT EXISTS t2 USING kv_store;",
-        null,
-        "create virtual table with IF NOT EXISTS succeeds",
-    )
-
-    limbo.run_debug("CREATE VIRTUAL TABLE t3 USING kv_store;")
-    limbo.run_test_fn(
-        "CREATE TABLE t3 (col INTEGER);",
-        lambda res: "× Parse error: Table t3 already exists" == res,
-        "create table fails if virtual table with the same name already exists",
-    )
-
-    limbo.quit()
-
-
 def test_csv():
-    limbo = TestTursoShell()
-    ext_path = "./target/debug/liblimbo_csv"
-    limbo.execute_dot(f".load {ext_path}")
+    # open new empty connection explicitly to test whether we can load an extension
+    # with brand new connection/uninitialized database.
+    limbo = TestTursoShell(init_commands="")
+    test_module_list(limbo, "target/debug/liblimbo_csv", "csv")
 
     limbo.run_test_fn(
         "CREATE VIRTUAL TABLE temp.csv USING csv(filename=./testing/test_files/test.csv);",
@@ -688,17 +639,17 @@ def test_csv():
     )
     limbo.run_test_fn(
         "INSERT INTO temp.csv VALUES (5, 6.0, 'String3');",
-        lambda res: "Virtual table update failed" in res,
+        lambda res: "Table is read-only" in res,
         "INSERT into CSV table should fail",
     )
     limbo.run_test_fn(
         "UPDATE temp.csv SET c0 = 10 WHERE c1 = '2.0';",
-        lambda res: "Virtual table update failed" in res,
+        lambda res: "is read-only" in res,
         "UPDATE on CSV table should fail",
     )
     limbo.run_test_fn(
         "DELETE FROM temp.csv WHERE c1 = '2.0';",
-        lambda res: "Virtual table update failed" in res,
+        lambda res: "is read-only" in res,
         "DELETE on CSV table should fail",
     )
     limbo.run_test_fn("DROP TABLE temp.csv;", null, "Drop CSV table")
@@ -726,7 +677,7 @@ def test_csv():
     )
     limbo.run_test_fn(
         "SELECT c1 FROM t1;",
-        lambda res: "Parse error: Column c1 not found" in res,
+        lambda res: "Parse error: no such column: c1" in res,
         "Empty CSV table without header should not have columns other than 'c0'",
     )
 
@@ -738,7 +689,7 @@ def test_csv():
     )
     limbo.run_test_fn(
         "SELECT c0 FROM t2;",
-        lambda res: "Parse error: Column c0 not found" in res,
+        lambda res: "Parse error: no such column: c0" in res,
         "Empty CSV table with header should not have columns other than '(NULL)'",
     )
 
@@ -755,6 +706,7 @@ def cleanup():
 def test_tablestats():
     ext_path = "target/debug/libturso_ext_tests"
     limbo = TestTursoShell(use_testing_db=True)
+    test_module_list(limbo, ext_path=ext_path, module_name="tablestats")
     limbo.execute_dot("CREATE TABLE people(id INTEGER PRIMARY KEY, name TEXT);")
     limbo.execute_dot("INSERT INTO people(name) VALUES ('Ada'), ('Grace'), ('Linus');")
 
@@ -772,8 +724,6 @@ def test_tablestats():
         lambda res: res == "1",
         "one logs rowverify logs count",
     )
-    # load extension
-    limbo.execute_dot(f".load {ext_path}")
     limbo.execute_dot("CREATE VIRTUAL TABLE stats USING tablestats;")
 
     def _split(res):
@@ -839,162 +789,23 @@ def test_tablestats():
     limbo.quit()
 
 
-def test_hidden_columns():
-    _test_hidden_columns(exec_name=None, ext_path="target/debug/libturso_ext_tests")
-    _test_hidden_columns(exec_name="sqlite3", ext_path="target/debug/liblimbo_sqlite_test_ext")
+def test_module_list(turso_shell, ext_path, module_name):
+    """loads the extension at the provided path and asserts that 'PRAGMA module_list;' displays 'module_name'"""
+    console.info(f"Running test_module_list for {ext_path}")
 
-
-def _test_hidden_columns(exec_name, ext_path):
-    console.info(f"Running test_hidden_columns for {ext_path}")
-
-    limbo = TestTursoShell(exec_name=exec_name,)
-    limbo.execute_dot(f".load {ext_path}")
-    limbo.execute_dot(
-        "create virtual table t using kv_store;",
-    )
-    limbo.run_test_fn(".schema", lambda res: "CREATE VIRTUAL TABLE t" in res)
-    limbo.run_test_fn(
-        "insert into t(key, value) values ('k0', 'v0');",
-        null,
-        "can insert if hidden column is not specified explicitly",
-    )
-    limbo.run_test_fn(
-        "insert into t(key, value) values ('k1', 'v1');",
-        null,
-        "can insert if hidden column is not specified explicitly",
-    )
-    limbo.run_test_fn(
-        "select comment from t where key = 'k0';",
-        lambda res: "auto-generated" == res,
-        "can select a hidden column from kv_store",
-    )
-    limbo.run_test_fn(
-        "select comment from (select * from t where key = 'k0');",
-        lambda res: "Column comment not found" in res or "no such column: comment" in res,
-        "hidden columns are not exposed by subqueries by default",
-    )
-    limbo.run_test_fn(
-        "select * from (select comment from t where key = 'k0');",
-        lambda res: "auto-generated" == res,
-        "can select hidden column exposed by subquery",
-    )
-    limbo.run_test_fn(
-        "insert into t(comment, key, value) values ('my comment', 'hidden', 'test');",
-        null,
-        "can insert if a hidden column is specified explicitly",
-    )
-    limbo.run_test_fn(
-        "select comment from t where key = 'hidden';",
-        lambda res: "my comment" == res,
-        "can select a hidden column from kv_store",
-    )
-    limbo.run_test_fn(
-        "select * from t where key = 'hidden';",
-        lambda res: "hidden|test" == res,
-        "hidden column is excluded from * expansion",
-    )
-    limbo.run_test_fn(
-        "select t.* from t where key = 'hidden';",
-        lambda res: "hidden|test" == res,
-        "hidden column is excluded from <table name>.* expansion",
-    )
-    limbo.run_test_fn(
-        "insert into t(comment, key, value) values ('insert_hidden', 'test');",
-        lambda res: "2 values for 3 columns" in res,
-        "fails when number of values does not match number of specified columns",
-    )
-    limbo.run_test_fn(
-        "update t set comment = 'updated comment' where key = 'hidden';",
-        null,
-        "can update a hidden column if specified explicitly",
-    )
-    limbo.run_test_fn(
-        "select comment from t where key = 'hidden';",
-        lambda res: "updated comment" == res,
-    )
-    limbo.run_test_fn(
-        "PRAGMA table_info=t;",
-        lambda res: "0|key|TEXT|0|TURSO|1\n1|value|TEXT|0|TURSO|0" == res,
-        "hidden columns are not listed in the dataset returned by 'PRAGMA table_info'",
-    )
-    limbo.run_test_fn(
-        "select comment, count(*) from t group by comment;",
-        lambda res: "auto-generated|2\nupdated comment|1" == res,
-        "can use hidden columns in aggregations",
+    turso_shell.run_test_fn(
+        "PRAGMA module_list;",
+        lambda res: "generate_series" in res and module_name not in res,
+        "lists built in modules but doesn't contain the module name yet",
     )
 
-    # ORDER BY
-    limbo.execute_dot("CREATE VIRTUAL TABLE o USING kv_store;")
-    limbo.run_test_fn(".schema", lambda res: "CREATE VIRTUAL TABLE o" in res)
-    limbo.execute_dot("INSERT INTO o(comment, key, value) VALUES ('0', '5', 'a');")
-    limbo.execute_dot("INSERT INTO o(comment, key, value) VALUES ('1', '4', 'b');")
-    limbo.execute_dot("INSERT INTO o(comment, key, value) VALUES ('2', '3', 'c');")
-    limbo.run_test_fn(
-        "SELECT * FROM o ORDER BY comment;",
-        lambda res: "5|a\n4|b\n3|c" == res,
+    turso_shell.run_test_fn("PRAGMA module_list;", lambda res: module_name not in res, "does not include module list")
+    turso_shell.execute_dot(f".load {ext_path}")
+    turso_shell.run_test_fn(
+        "PRAGMA module_list;",
+        lambda res: module_name in res,
+        f"includes {module_name} after loading extension",
     )
-    limbo.run_test_fn(
-        "SELECT * FROM o ORDER BY 0;",
-        lambda res: "invalid column index: 0" in res or "term out of range - should be between 1 and 2" in res,
-    )
-    limbo.run_test_fn(
-        "SELECT * FROM o ORDER BY 1;",
-        lambda res: "3|c\n4|b\n5|a" == res,
-    )
-
-    # JOINs
-    limbo.execute_dot("CREATE TABLE r (comment, key, value);")
-    limbo.execute_dot("INSERT INTO r VALUES ('comment0', '2', '3');")
-    limbo.execute_dot("INSERT INTO r VALUES ('comment1', '4', '5');")
-    limbo.execute_dot("CREATE VIRTUAL TABLE l USING kv_store;")
-    limbo.run_test_fn(".schema", lambda res: "CREATE VIRTUAL TABLE l" in res)
-    limbo.execute_dot("INSERT INTO l(comment, key, value) values ('comment1', '2', '3');")
-    limbo.run_test_fn(
-        "SELECT * FROM l NATURAL JOIN r;",
-        lambda res: "2|3|comment0" == res,
-    )
-    limbo.run_test_fn(
-        "SELECT * FROM l JOIN r USING (comment);",
-        lambda res: "2|3|4|5" == res,
-    )
-    limbo.run_test_fn(
-        "SELECT * FROM l JOIN r ON l.comment = r.comment;",
-        lambda res: "2|3|comment1|4|5" == res,
-    )
-    limbo.run_test_fn(
-        "SELECT * FROM l NATURAL JOIN r NATURAL JOIN r;",
-        lambda res: "2|3|comment0" == res,
-    )
-    limbo.run_test_fn(
-        "SELECT * FROM l NATURAL JOIN r NATURAL JOIN l;",
-        lambda res: "2|3|comment0" == res,
-    )
-    limbo.run_test_fn(
-        "SELECT * FROM r NATURAL JOIN l;",
-        lambda res: "comment0|2|3" == res,
-    )
-    limbo.run_test_fn(
-        "SELECT * FROM r NATURAL JOIN l NATURAL JOIN r;",
-        lambda res: "comment0|2|3" == res,
-    )
-    limbo.run_test_fn(
-        "SELECT * FROM (SELECT * FROM l JOIN r USING(key, value)) JOIN r USING(comment, key, value);",
-        lambda res: "2|3|comment0" == res,
-    )
-    limbo.run_test_fn(
-        "SELECT * FROM (SELECT * FROM l NATURAL JOIN r) JOIN r USING(comment, key, value);",
-        lambda res: "2|3|comment0" == res,
-    )
-    limbo.run_test_fn(
-        "SELECT * FROM l JOIN r USING(key, value) JOIN r USING(comment, key, value);",
-        lambda res: "" == res,
-    )
-    limbo.run_test_fn(
-        "SELECT * FROM l NATURAL JOIN r JOIN r USING(comment, key, value);",
-        lambda res: "" == res,
-    )
-
-    limbo.quit()
 
 
 def main():
@@ -1002,17 +813,15 @@ def main():
         test_regexp()
         test_uuid()
         test_aggregates()
+        test_grouped_aggregates()
         test_crypto()
         test_series()
         test_ipaddr()
         test_vfs()
         test_sqlite_vfs_compat()
         test_kv()
-        test_drop_virtual_table()
-        test_create_virtual_table()
         test_csv()
         test_tablestats()
-        test_hidden_columns()
     except Exception as e:
         console.error(f"Test FAILED: {e}")
         cleanup()

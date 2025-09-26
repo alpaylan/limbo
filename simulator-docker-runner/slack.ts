@@ -22,6 +22,7 @@ export class SlackClient {
   async postRunSummary(stats: {
     totalRuns: number;
     issuesPosted: number;
+    unexpectedExits: number;
     timeElapsed: number;
     gitHash: string;
   }): Promise<void> {
@@ -65,32 +66,34 @@ export class SlackClient {
   private createFallbackText(stats: {
     totalRuns: number;
     issuesPosted: number;
+    unexpectedExits: number;
     timeElapsed: number;
     gitHash: string;
   }): string {
-    const { totalRuns, issuesPosted, timeElapsed, gitHash } = stats;
+    const { totalRuns, issuesPosted, unexpectedExits, timeElapsed, gitHash } = stats;
     const hours = Math.floor(timeElapsed / 3600);
     const minutes = Math.floor((timeElapsed % 3600) / 60);
     const seconds = Math.floor(timeElapsed % 60);
     const timeString = `${hours}h ${minutes}m ${seconds}s`;
     const gitShortHash = gitHash.substring(0, 7);
     
-    return `🤖 Turso Simulator Run Complete - ${totalRuns} runs, ${issuesPosted} issues posted, ${timeString} elapsed (${gitShortHash})`;
+    return `🤖 Turso Simulator Run Complete - ${totalRuns} runs, ${issuesPosted} issues posted, ${unexpectedExits} unexpected exits, ${timeString} elapsed (${gitShortHash})`;
   }
 
   private createSummaryBlocks(stats: {
     totalRuns: number;
     issuesPosted: number;
+    unexpectedExits: number;
     timeElapsed: number;
     gitHash: string;
   }): any[] {
-    const { totalRuns, issuesPosted, timeElapsed, gitHash } = stats;
+    const { totalRuns, issuesPosted, unexpectedExits, timeElapsed, gitHash } = stats;
     const hours = Math.floor(timeElapsed / 3600);
     const minutes = Math.floor((timeElapsed % 3600) / 60);
     const seconds = Math.floor(timeElapsed % 60);
     const timeString = `${hours}h ${minutes}m ${seconds}s`;
     
-    const statusEmoji = issuesPosted > 0 ? "🔴" : "✅";
+    const statusEmoji = issuesPosted > 0 || unexpectedExits > 0 ? "🔴" : "✅";
     const statusText = issuesPosted > 0 ? `${issuesPosted} issues found` : "No issues found";
     const gitShortHash = gitHash.substring(0, 7);
     
@@ -122,6 +125,10 @@ export class SlackClient {
           {
             "type": "mrkdwn",
             "text": `*Issues posted:*\n${issuesPosted}`
+          },
+          {
+            "type": "mrkdwn",
+            "text": `*Unexpected exits:*\n${unexpectedExits}`
           },
           {
             "type": "mrkdwn",

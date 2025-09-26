@@ -1,10 +1,11 @@
-use rand::{rng, RngCore};
+use rand::{rng, RngCore, SeedableRng};
+use rand_chacha::ChaCha8Rng;
 use rusqlite::params;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tempfile::TempDir;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
-use turso_core::{types::IOResult, Connection, Database, IO};
+use turso_core::{Connection, Database, Row, StepResult, IO};
 
 #[allow(dead_code)]
 pub struct TempDatabase {
@@ -28,11 +29,30 @@ impl TempDatabase {
             io.clone(),
             path.to_str().unwrap(),
             turso_core::OpenFlags::default(),
-            false,
-            enable_indexes,
+            turso_core::DatabaseOpts::new().with_indexes(enable_indexes),
+            None,
         )
         .unwrap();
         Self { path, io, db }
+    }
+
+    pub fn new_with_opts(db_name: &str, opts: turso_core::DatabaseOpts) -> Self {
+        let mut path = TempDir::new().unwrap().keep();
+        path.push(db_name);
+        let io: Arc<dyn IO + Send> = Arc::new(turso_core::PlatformIO::new().unwrap());
+        let db = Database::open_file_with_flags(
+            io.clone(),
+            path.to_str().unwrap(),
+            turso_core::OpenFlags::default(),
+            opts,
+            None,
+        )
+        .unwrap();
+        Self {
+            path: path.to_path_buf(),
+            io,
+            db,
+        }
     }
 
     pub fn new_with_existent(db_path: &Path, enable_indexes: bool) -> Self {
@@ -53,8 +73,8 @@ impl TempDatabase {
             io.clone(),
             db_path.to_str().unwrap(),
             flags,
-            false,
-            enable_indexes,
+            turso_core::DatabaseOpts::new().with_indexes(enable_indexes),
+            None,
         )
         .unwrap();
         Self {
@@ -65,9 +85,6 @@ impl TempDatabase {
     }
 
     pub fn new_with_rusqlite(table_sql: &str, enable_indexes: bool) -> Self {
-        let _ = tracing_subscriber::fmt()
-            .with_max_level(tracing::Level::TRACE)
-            .finish();
         let mut path = TempDir::new().unwrap().keep();
         path.push("test.db");
         {
@@ -82,8 +99,8 @@ impl TempDatabase {
             io.clone(),
             path.to_str().unwrap(),
             turso_core::OpenFlags::default(),
-            false,
-            enable_indexes,
+            turso_core::DatabaseOpts::new().with_indexes(enable_indexes),
+            None,
         )
         .unwrap();
 
@@ -111,15 +128,9 @@ impl TempDatabase {
 }
 
 pub(crate) fn do_flush(conn: &Arc<Connection>, tmp_db: &TempDatabase) -> anyhow::Result<()> {
-    loop {
-        match conn.cacheflush()? {
-            IOResult::Done(_) => {
-                break;
-            }
-            IOResult::IO => {
-                tmp_db.io.run_once()?;
-            }
-        }
+    let completions = conn.cacheflush()?;
+    for c in completions {
+        tmp_db.io.wait_for_completion(c)?;
     }
     Ok(())
 }
@@ -149,7 +160,7 @@ pub fn maybe_setup_tracing() {
     let _ = tracing_subscriber::registry()
         .with(
             tracing_subscriber::fmt::layer()
-                .with_ansi(false)
+                .with_ansi(true)
                 .with_line_number(true)
                 .with_thread_ids(true),
         )
@@ -219,6 +230,45 @@ pub(crate) fn limbo_exec_rows(
     rows
 }
 
+pub(crate) fn limbo_exec_rows_fallible(
+    _db: &TempDatabase,
+    conn: &Arc<turso_core::Connection>,
+    query: &str,
+) -> Result<Vec<Vec<rusqlite::types::Value>>, turso_core::LimboError> {
+    let mut stmt = conn.prepare(query)?;
+    let mut rows = Vec::new();
+    'outer: loop {
+        let row = loop {
+            let result = stmt.step()?;
+            match result {
+                turso_core::StepResult::Row => {
+                    let row = stmt.row().unwrap();
+                    break row;
+                }
+                turso_core::StepResult::IO => {
+                    stmt.run_once()?;
+                    continue;
+                }
+
+                turso_core::StepResult::Done => break 'outer,
+                r => panic!("unexpected result {r:?}: expecting single row"),
+            }
+        };
+        let row = row
+            .get_values()
+            .map(|x| match x {
+                turso_core::Value::Null => rusqlite::types::Value::Null,
+                turso_core::Value::Integer(x) => rusqlite::types::Value::Integer(*x),
+                turso_core::Value::Float(x) => rusqlite::types::Value::Real(*x),
+                turso_core::Value::Text(x) => rusqlite::types::Value::Text(x.as_str().to_string()),
+                turso_core::Value::Blob(x) => rusqlite::types::Value::Blob(x.to_vec()),
+            })
+            .collect();
+        rows.push(row);
+    }
+    Ok(rows)
+}
+
 pub(crate) fn limbo_exec_rows_error(
     _db: &TempDatabase,
     conn: &Arc<turso_core::Connection>,
@@ -238,10 +288,61 @@ pub(crate) fn limbo_exec_rows_error(
     }
 }
 
+pub(crate) fn rng_from_time() -> (ChaCha8Rng, u64) {
+    let seed = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let rng = ChaCha8Rng::seed_from_u64(seed);
+    (rng, seed)
+}
+
+pub fn run_query(tmp_db: &TempDatabase, conn: &Arc<Connection>, query: &str) -> anyhow::Result<()> {
+    run_query_core(tmp_db, conn, query, None::<fn(&Row)>)
+}
+
+pub fn run_query_on_row(
+    tmp_db: &TempDatabase,
+    conn: &Arc<Connection>,
+    query: &str,
+    on_row: impl FnMut(&Row),
+) -> anyhow::Result<()> {
+    run_query_core(tmp_db, conn, query, Some(on_row))
+}
+
+pub fn run_query_core(
+    _tmp_db: &TempDatabase,
+    conn: &Arc<Connection>,
+    query: &str,
+    mut on_row: Option<impl FnMut(&Row)>,
+) -> anyhow::Result<()> {
+    if let Some(ref mut rows) = conn.query(query)? {
+        loop {
+            match rows.step()? {
+                StepResult::IO => {
+                    rows.run_once()?;
+                }
+                StepResult::Done => break,
+                StepResult::Row => {
+                    if let Some(on_row) = on_row.as_mut() {
+                        let row = rows.row().unwrap();
+                        on_row(row)
+                    }
+                }
+                r => panic!("unexpected step result: {r:?}"),
+            }
+        }
+    };
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
-    use std::vec;
-    use tempfile::TempDir;
+    use std::{sync::Arc, vec};
+    use tempfile::{NamedTempFile, TempDir};
+    use turso_core::{Database, StepResult, IO};
+
+    use crate::common::do_flush;
 
     use super::{limbo_exec_rows, limbo_exec_rows_error, TempDatabase};
     use rusqlite::types::Value;
@@ -295,7 +396,7 @@ mod tests {
                 false,
             );
             let conn = db.connect_limbo();
-            let ret = limbo_exec_rows(&db, &conn, "CREATE table t(a)");
+            let ret = limbo_exec_rows(&db, &conn, "CREATE table t (a)");
             assert!(ret.is_empty(), "{ret:?}");
             limbo_exec_rows(&db, &conn, "INSERT INTO t values (1)");
             conn.close().unwrap()
@@ -324,7 +425,7 @@ mod tests {
         let db = TempDatabase::new_empty(true);
         let conn = db.connect_limbo();
 
-        let _ = limbo_exec_rows(&db, &conn, "CREATE TABLE t(x INTEGER UNIQUE)");
+        let _ = limbo_exec_rows(&db, &conn, "CREATE TABLE t (x INTEGER UNIQUE)");
 
         // Insert 100 random integers between -1000 and 1000
         let mut expected = Vec::new();
@@ -365,7 +466,7 @@ mod tests {
         let db = TempDatabase::new_with_existent(&path, true);
         let conn = db.connect_limbo();
 
-        let _ = limbo_exec_rows(&db, &conn, "CREATE TABLE t(x BLOB UNIQUE)");
+        let _ = limbo_exec_rows(&db, &conn, "CREATE TABLE t (x BLOB UNIQUE)");
 
         // Insert 11 unique 1MB blobs
         for i in 0..11 {
@@ -381,6 +482,212 @@ mod tests {
             vec![vec![Value::Integer(11)]],
             "Expected 11 rows but got {ret:?}",
         );
+
+        Ok(())
+    }
+
+    #[test]
+    /// Test that a transaction cannot read uncommitted changes of another transaction (no: READ UNCOMMITTED)
+    fn test_tx_isolation_no_dirty_reads() -> anyhow::Result<()> {
+        let path = TempDir::new()
+            .unwrap()
+            .keep()
+            .join("temp_transaction_isolation");
+        let db = TempDatabase::new_with_existent(&path, true);
+
+        // Create two separate connections
+        let conn1 = db.connect_limbo();
+
+        // Create test table
+        let _ = limbo_exec_rows(&db, &conn1, "CREATE TABLE t (x INTEGER)");
+
+        // Begin transaction on first connection and insert a value
+        let _ = limbo_exec_rows(&db, &conn1, "BEGIN");
+        let _ = limbo_exec_rows(&db, &conn1, "INSERT INTO t VALUES (42)");
+        do_flush(&conn1, &db)?;
+
+        // Second connection should not see uncommitted changes
+        let conn2 = db.connect_limbo();
+        let ret = limbo_exec_rows(&db, &conn2, "SELECT x FROM t");
+        assert!(
+            ret.is_empty(),
+            "DIRTY READ: Second connection saw uncommitted changes: {ret:?}"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    /// Test that a transaction cannot read committed changes that were committed after the transaction started (no: READ COMMITTED)
+    fn test_tx_isolation_no_read_committed() -> anyhow::Result<()> {
+        let path = TempDir::new()
+            .unwrap()
+            .keep()
+            .join("temp_transaction_isolation");
+        let db = TempDatabase::new_with_existent(&path, true);
+
+        // Create two separate connections
+        let conn1 = db.connect_limbo();
+
+        // Create test table
+        let _ = limbo_exec_rows(&db, &conn1, "CREATE TABLE t (x INTEGER)");
+
+        // Begin transaction on first connection
+        let _ = limbo_exec_rows(&db, &conn1, "BEGIN");
+        let ret = limbo_exec_rows(&db, &conn1, "SELECT x FROM t");
+        assert!(ret.is_empty(), "Expected 0 rows but got {ret:?}");
+
+        // Commit a value from the second connection
+        let conn2 = db.connect_limbo();
+        let _ = limbo_exec_rows(&db, &conn2, "BEGIN");
+        let _ = limbo_exec_rows(&db, &conn2, "INSERT INTO t VALUES (42)");
+        let _ = limbo_exec_rows(&db, &conn2, "COMMIT");
+
+        // First connection should not see the committed value
+        let ret = limbo_exec_rows(&db, &conn1, "SELECT x FROM t");
+        assert!(
+            ret.is_empty(),
+            "SNAPSHOT ISOLATION VIOLATION: Older txn saw committed changes from newer txn: {ret:?}"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    /// Test that a txn can write a row, flush to WAL without committing, then rollback, and finally commit a second row.
+    /// Reopening database should show only the second row.
+    fn test_tx_isolation_cacheflush_rollback_commit() -> anyhow::Result<()> {
+        let path = TempDir::new()
+            .unwrap()
+            .keep()
+            .join("temp_transaction_isolation");
+        let db = TempDatabase::new_with_existent(&path, true);
+
+        let conn = db.connect_limbo();
+
+        // Create test table
+        let _ = limbo_exec_rows(&db, &conn, "CREATE TABLE t (x INTEGER)");
+
+        // Begin transaction on first connection and insert a value
+        let _ = limbo_exec_rows(&db, &conn, "BEGIN");
+        let _ = limbo_exec_rows(&db, &conn, "INSERT INTO t VALUES (42)");
+        do_flush(&conn, &db)?;
+
+        // Rollback the transaction
+        let _ = limbo_exec_rows(&db, &conn, "ROLLBACK");
+
+        // Now actually commit a row
+        let _ = limbo_exec_rows(&db, &conn, "INSERT INTO t VALUES (69)");
+
+        // Reopen the database
+        let db = TempDatabase::new_with_existent(&path, true);
+        let conn = db.connect_limbo();
+
+        // Should only see the last committed value
+        let ret = limbo_exec_rows(&db, &conn, "SELECT x FROM t");
+        assert_eq!(
+            ret,
+            vec![vec![Value::Integer(69)]],
+            "Expected 1 row but got {ret:?}"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    /// Test that a txn can write a row and flush to WAL without committing, then reopen DB and not see the row
+    fn test_tx_isolation_cacheflush_reopen() -> anyhow::Result<()> {
+        let path = TempDir::new()
+            .unwrap()
+            .keep()
+            .join("temp_transaction_isolation");
+        let db = TempDatabase::new_with_existent(&path, true);
+
+        let conn = db.connect_limbo();
+
+        // Create test table
+        let _ = limbo_exec_rows(&db, &conn, "CREATE TABLE t (x INTEGER)");
+
+        // Begin transaction and insert a value
+        let _ = limbo_exec_rows(&db, &conn, "BEGIN");
+        let _ = limbo_exec_rows(&db, &conn, "INSERT INTO t VALUES (42)");
+
+        // Flush to WAL but don't commit
+        do_flush(&conn, &db)?;
+
+        // Reopen the database without committing
+        let db = TempDatabase::new_with_existent(&path, true);
+        let conn = db.connect_limbo();
+
+        // Should see no rows since transaction was never committed
+        let ret = limbo_exec_rows(&db, &conn, "SELECT x FROM t");
+        assert!(ret.is_empty(), "Expected 0 rows but got {ret:?}");
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_multi_connection_table_drop_persistence() -> Result<(), Box<dyn std::error::Error>> {
+        // Create a temporary database file
+        let temp_file = NamedTempFile::new()?;
+        let db_path = temp_file.path().to_string_lossy().to_string();
+
+        // Open database
+        #[allow(clippy::arc_with_non_send_sync)]
+        let io: Arc<dyn IO> = Arc::new(turso_core::PlatformIO::new().unwrap());
+        let db = Database::open_file(io, &db_path, false, false)?;
+
+        const NUM_CONNECTIONS: usize = 5;
+        let mut connections = Vec::new();
+
+        // Create a new connection to verify persistence
+        let verification_conn = db.connect()?;
+        // Create multiple connections and create a table from each
+
+        for i in 0..NUM_CONNECTIONS {
+            let conn = db.connect()?;
+            connections.push(conn);
+
+            // Create a unique table name for this connection
+            let table_name = format!("test_table_{i}");
+            let create_sql = format!(
+                "CREATE TABLE {table_name} (id INTEGER PRIMARY KEY, name TEXT, value INTEGER)"
+            );
+
+            // Execute CREATE TABLE
+            verification_conn.execute(&create_sql)?;
+        }
+
+        for (i, conn) in connections.iter().enumerate().take(NUM_CONNECTIONS) {
+            // Create a unique table name for this connection
+            let table_name = format!("test_table_{i}");
+            let create_sql = format!("DROP TABLE {table_name}");
+
+            // Execute DROP TABLE
+            conn.execute(&create_sql)?;
+        }
+
+        // Also verify via sqlite_schema table that all tables are present
+        let stmt = verification_conn.query("SELECT name FROM sqlite_schema WHERE type='table' AND name LIKE 'test_table_%' ORDER BY name")?;
+
+        assert!(stmt.is_some(), "Should be able to query sqlite_schema");
+        let mut stmt = stmt.unwrap();
+
+        let mut found_tables = Vec::new();
+        loop {
+            match stmt.step()? {
+                StepResult::Row => {
+                    let row = stmt.row().unwrap();
+                    let table_name = row.get::<String>(0)?;
+                    found_tables.push(table_name);
+                }
+                StepResult::Done => break,
+                _ => {}
+            }
+        }
+
+        // Verify we found all expected tables
+        assert_eq!(found_tables.len(), 0, "Should find no tables in schema");
 
         Ok(())
     }

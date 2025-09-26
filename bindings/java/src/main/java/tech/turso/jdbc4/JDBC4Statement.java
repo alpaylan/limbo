@@ -2,18 +2,36 @@ package tech.turso.jdbc4;
 
 import static java.util.Objects.requireNonNull;
 
+import java.sql.BatchUpdateException;
 import java.sql.Connection;
 import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.sql.SQLWarning;
 import java.sql.Statement;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.concurrent.locks.ReentrantLock;
+import java.util.regex.Pattern;
 import tech.turso.annotations.Nullable;
 import tech.turso.annotations.SkipNullableCheck;
 import tech.turso.core.TursoResultSet;
 import tech.turso.core.TursoStatement;
 
 public class JDBC4Statement implements Statement {
+
+  private static final Pattern BATCH_COMPATIBLE_PATTERN =
+      Pattern.compile(
+          "^\\s*"
+              + // Leading whitespace
+              "(?:/\\*.*?\\*/\\s*)*"
+              + // Optional C-style comments
+              "(?:--[^\\n]*\\n\\s*)*"
+              + // Optional SQL line comments
+              "(?:"
+              + // Start of keywords group
+              "INSERT|UPDATE|DELETE"
+              + ")\\b",
+          Pattern.CASE_INSENSITIVE | Pattern.DOTALL);
 
   private final JDBC4Connection connection;
 
@@ -32,6 +50,12 @@ public class JDBC4Statement implements Statement {
   private int queryTimeoutSeconds;
 
   private ReentrantLock connectionLock = new ReentrantLock();
+
+  /**
+   * List of SQL statements to be executed as a batch. Used for batch processing as per JDBC
+   * specification.
+   */
+  private List<String> batchCommands = new ArrayList<>();
 
   public JDBC4Statement(JDBC4Connection connection) {
     this(
@@ -232,18 +256,82 @@ public class JDBC4Statement implements Statement {
 
   @Override
   public void addBatch(String sql) throws SQLException {
-    // TODO
+    ensureOpen();
+    if (sql == null) {
+      throw new SQLException("SQL command cannot be null");
+    }
+    batchCommands.add(sql);
   }
 
   @Override
   public void clearBatch() throws SQLException {
-    // TODO
+    ensureOpen();
+    batchCommands.clear();
   }
 
+  // TODO: let's make this batch operation atomic
   @Override
   public int[] executeBatch() throws SQLException {
-    // TODO
-    return new int[0];
+    ensureOpen();
+
+    int[] updateCounts = new int[batchCommands.size()];
+    List<String> failedCommands = new ArrayList<>();
+
+    // Execute each command in the batch
+    for (int i = 0; i < batchCommands.size(); i++) {
+      String sql = batchCommands.get(i);
+      try {
+        if (!isBatchCompatibleStatement(sql)) {
+          failedCommands.add(sql);
+          updateCounts[i] = EXECUTE_FAILED;
+          BatchUpdateException bue =
+              new BatchUpdateException(
+                  "Batch entry "
+                      + i
+                      + " ("
+                      + sql
+                      + ") was aborted. "
+                      + "Batch commands cannot return result sets.",
+                  "HY000", // General error SQL state
+                  0,
+                  updateCounts);
+          // Clear the batch after failure
+          clearBatch();
+          throw bue;
+        }
+
+        execute(sql);
+        // For DML statements, get the update count
+        updateCounts[i] = getUpdateCount();
+      } catch (SQLException e) {
+        failedCommands.add(sql);
+        updateCounts[i] = EXECUTE_FAILED;
+
+        // Create a BatchUpdateException with the partial results
+        BatchUpdateException bue =
+            new BatchUpdateException(
+                "Batch entry " + i + " (" + sql + ") failed: " + e.getMessage(),
+                e.getSQLState(),
+                e.getErrorCode(),
+                updateCounts,
+                e.getCause());
+        // Clear the batch after failure
+        clearBatch();
+        throw bue;
+      }
+    }
+
+    // Clear the batch after successful execution
+    clearBatch();
+    return updateCounts;
+  }
+
+  boolean isBatchCompatibleStatement(String sql) {
+    if (sql == null || sql.trim().isEmpty()) {
+      return false;
+    }
+
+    return BATCH_COMPATIBLE_PATTERN.matcher(sql).find();
   }
 
   @Override

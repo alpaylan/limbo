@@ -1,4 +1,5 @@
 use crate::json::error::{Error as PError, Result as PResult};
+use crate::json::Conv;
 use crate::{bail_parse_error, LimboError, Result};
 use std::{
     borrow::Cow,
@@ -197,6 +198,12 @@ pub enum ElementType {
     RESERVED1 = 13,
     RESERVED2 = 14,
     RESERVED3 = 15,
+}
+
+pub enum IteratorState {
+    Array(ArrayIteratorState),
+    Object(ObjectIteratorState),
+    Primitive(Jsonb),
 }
 
 pub enum JsonIndentation<'a> {
@@ -742,7 +749,15 @@ impl JsonbHeader {
         Self(ElementType::OBJECT, 0)
     }
 
-    fn from_slice(cursor: usize, slice: &[u8]) -> Result<(Self, usize)> {
+    pub(super) fn element_type(&self) -> ElementType {
+        self.0
+    }
+
+    pub(super) fn payload_size(&self) -> PayloadSize {
+        self.1
+    }
+
+    pub(super) fn from_slice(cursor: usize, slice: &[u8]) -> Result<(Self, usize)> {
         match slice.get(cursor) {
             Some(header_byte) => {
                 // Extract first 4 bits (values 0-15)
@@ -841,6 +856,18 @@ impl JsonbHeader {
     }
 }
 
+pub struct ArrayIteratorState {
+    cursor: usize,
+    end: usize,
+    index: usize,
+}
+
+pub struct ObjectIteratorState {
+    cursor: usize,
+    end: usize,
+    index: usize,
+}
+
 impl Jsonb {
     pub fn new(capacity: usize, data: Option<&[u8]>) -> Self {
         if let Some(data) = data {
@@ -896,7 +923,7 @@ impl Jsonb {
         Ok((header, offset))
     }
 
-    pub fn is_valid(&self) -> Result<ElementType> {
+    pub fn element_type(&self) -> Result<ElementType> {
         match self.read_header(0) {
             Ok((header, offset)) => {
                 if self.data.get(offset..offset + header.1).is_some() {
@@ -909,12 +936,103 @@ impl Jsonb {
         }
     }
 
-    pub fn to_string(&self) -> Result<String> {
+    pub fn is_valid(&self) -> bool {
+        self.validate_element(0, self.data.len(), 0).is_ok()
+    }
+
+    fn validate_element(&self, start: usize, end: usize, depth: usize) -> Result<()> {
+        if depth > MAX_JSON_DEPTH {
+            bail_parse_error!("Too deep");
+        }
+
+        if start >= end {
+            bail_parse_error!("Empty element");
+        }
+
+        let (header, header_offset) = self.read_header(start)?;
+        let payload_start = start + header_offset;
+        let payload_size = header.payload_size();
+        let payload_end = payload_start + payload_size;
+
+        if payload_end != end {
+            bail_parse_error!("Size mismatch");
+        }
+
+        match header.element_type() {
+            ElementType::NULL | ElementType::TRUE | ElementType::FALSE => {
+                if payload_size == 0 {
+                    Ok(())
+                } else {
+                    bail_parse_error!("Invalid payload for primitive")
+                }
+            }
+            ElementType::INT | ElementType::INT5 | ElementType::FLOAT | ElementType::FLOAT5 => {
+                if payload_size > 0 {
+                    Ok(())
+                } else {
+                    bail_parse_error!("Empty number payload")
+                }
+            }
+            ElementType::TEXT | ElementType::TEXTJ | ElementType::TEXT5 | ElementType::TEXTRAW => {
+                let payload = &self.data[payload_start..payload_end];
+                std::str::from_utf8(payload).map_err(|_| {
+                    LimboError::ParseError("Invalid UTF-8 in text payload".to_string())
+                })?;
+                Ok(())
+            }
+            ElementType::ARRAY => {
+                let mut pos = payload_start;
+                while pos < payload_end {
+                    if pos >= self.data.len() {
+                        bail_parse_error!("Array element out of bounds");
+                    }
+                    let (elem_header, elem_header_size) = self.read_header(pos)?;
+                    let elem_end = pos + elem_header_size + elem_header.payload_size();
+                    if elem_end > payload_end {
+                        bail_parse_error!("Array element exceeds bounds");
+                    }
+                    self.validate_element(pos, elem_end, depth + 1)?;
+                    pos = elem_end;
+                }
+                Ok(())
+            }
+            ElementType::OBJECT => {
+                let mut pos = payload_start;
+                let mut count = 0;
+                while pos < payload_end {
+                    if pos >= self.data.len() {
+                        bail_parse_error!("Object element out of bounds");
+                    }
+                    let (elem_header, elem_header_size) = self.read_header(pos)?;
+                    if count % 2 == 0 && !elem_header.element_type().is_valid_key() {
+                        bail_parse_error!("Object key must be text");
+                    }
+
+                    let elem_end = pos + elem_header_size + elem_header.payload_size();
+                    if elem_end > payload_end {
+                        bail_parse_error!("Object element exceeds bounds");
+                    }
+                    self.validate_element(pos, elem_end, depth + 1)?;
+                    pos = elem_end;
+                    count += 1;
+                }
+
+                if count % 2 != 0 {
+                    bail_parse_error!("Object must have even number of elements");
+                }
+                Ok(())
+            }
+            _ => bail_parse_error!("Invalid element type"),
+        }
+    }
+
+    #[expect(clippy::inherent_to_string)]
+    pub fn to_string(&self) -> String {
         let mut result = String::with_capacity(self.data.len() * 2);
 
-        self.write_to_string(&mut result, JsonIndentation::None)?;
+        self.write_to_string(&mut result, JsonIndentation::None);
 
-        Ok(result)
+        result
     }
 
     pub fn to_string_pretty(&self, indentation: Option<&str>) -> Result<String> {
@@ -924,16 +1042,15 @@ impl Jsonb {
         } else {
             JsonIndentation::Indentation(Cow::Borrowed("    "))
         };
-        self.write_to_string(&mut result, ind)?;
+        self.write_to_string(&mut result, ind);
 
         Ok(result)
     }
 
-    fn write_to_string(&self, string: &mut String, indentation: JsonIndentation) -> Result<()> {
+    fn write_to_string(&self, string: &mut String, indentation: JsonIndentation) {
         let cursor = 0;
         let ind = indentation;
         let _ = self.serialize_value(string, cursor, 0, &ind);
-        Ok(())
     }
 
     fn serialize_value(
@@ -2158,6 +2275,18 @@ impl Jsonb {
         Ok(result)
     }
 
+    pub fn from_str_with_mode(input: &str, mode: Conv) -> PResult<Self> {
+        // Parse directly as JSON if it's already JSON subtype or strict mode is on
+        if matches!(mode, Conv::ToString) {
+            let mut str = input.replace('"', "\\\"");
+            str.insert(0, '"');
+            str.push('"');
+            Jsonb::from_str(&str)
+        } else {
+            Jsonb::from_str(input)
+        }
+    }
+
     pub fn from_raw_data(data: &[u8]) -> Self {
         Self::new(data.len(), Some(data))
     }
@@ -2746,7 +2875,7 @@ impl Jsonb {
         Ok(pos)
     }
 
-    // Primitive implementation could be optimized.
+    // TODO Primitive implementation could be optimized.
     pub fn patch(&mut self, patch: &Jsonb) -> Result<()> {
         let (patch_header, _) = patch.read_header(0)?;
 
@@ -2871,6 +3000,166 @@ impl Jsonb {
         }
 
         Ok(())
+    }
+
+    pub fn array_iterator(&self) -> Result<ArrayIteratorState> {
+        let (hdr, off) = self.read_header(0)?;
+        match hdr {
+            JsonbHeader(ElementType::ARRAY, len) => Ok(ArrayIteratorState {
+                cursor: off,
+                end: off + len,
+                index: 0,
+            }),
+            _ => bail_parse_error!("jsonb.array_iterator(): not an array"),
+        }
+    }
+
+    pub fn array_iterator_next(
+        &self,
+        st: &ArrayIteratorState,
+    ) -> Option<((usize, Jsonb), ArrayIteratorState)> {
+        if st.cursor >= st.end {
+            return None;
+        }
+
+        let (JsonbHeader(_, payload_len), header_len) = self.read_header(st.cursor).ok()?;
+        let start = st.cursor;
+        let stop = start.checked_add(header_len + payload_len)?;
+
+        if stop > st.end || stop > self.data.len() {
+            return None;
+        }
+
+        let elem = Jsonb::new(stop - start, Some(&self.data[start..stop]));
+        let next = ArrayIteratorState {
+            cursor: stop,
+            end: st.end,
+            index: st.index + 1,
+        };
+
+        Some(((st.index, elem), next))
+    }
+
+    pub fn object_iterator(&self) -> Result<ObjectIteratorState> {
+        let (hdr, off) = self.read_header(0)?;
+        match hdr {
+            JsonbHeader(ElementType::OBJECT, len) => Ok(ObjectIteratorState {
+                cursor: off,
+                end: off + len,
+                index: 0,
+            }),
+            _ => bail_parse_error!("jsonb.object_iterator(): not an object"),
+        }
+    }
+
+    pub fn object_iterator_next(
+        &self,
+        st: &ObjectIteratorState,
+    ) -> Option<((usize, Jsonb, Jsonb), ObjectIteratorState)> {
+        if st.cursor >= st.end {
+            return None;
+        }
+
+        // key
+        let (JsonbHeader(key_ty, key_len), key_hdr_len) = self.read_header(st.cursor).ok()?;
+        if !key_ty.is_valid_key() {
+            return None;
+        }
+        let key_start = st.cursor;
+        let key_stop = key_start.checked_add(key_hdr_len + key_len)?;
+        if key_stop > st.end || key_stop > self.data.len() {
+            return None;
+        }
+
+        // value
+        let (JsonbHeader(_, val_len), val_hdr_len) = self.read_header(key_stop).ok()?;
+        let val_start = key_stop;
+        let val_stop = val_start.checked_add(val_hdr_len + val_len)?;
+        if val_stop > st.end || val_stop > self.data.len() {
+            return None;
+        }
+
+        let key = Jsonb::new(key_stop - key_start, Some(&self.data[key_start..key_stop]));
+        let value = Jsonb::new(val_stop - val_start, Some(&self.data[val_start..val_stop]));
+        let next = ObjectIteratorState {
+            cursor: val_stop,
+            end: st.end,
+            index: st.index + 1,
+        };
+
+        Some(((st.index, key, value), next))
+    }
+
+    /// If the iterator points at a container value, return an iterator for that container.
+    /// For arrays, we inspect the next element; for objects, we inspect the next property's *value*.
+    pub fn container_property_iterator(&self, it: &IteratorState) -> Option<IteratorState> {
+        match it {
+            IteratorState::Array(st) => {
+                if st.cursor >= st.end {
+                    return None;
+                }
+                let (JsonbHeader(ty, len), hdr_len) = self.read_header(st.cursor).ok()?;
+                let payload_cursor = st.cursor.checked_add(hdr_len)?;
+                let payload_end = payload_cursor.checked_add(len)?;
+                if payload_end > st.end || payload_end > self.data.len() {
+                    return None;
+                }
+
+                match ty {
+                    ElementType::ARRAY => Some(IteratorState::Array(ArrayIteratorState {
+                        cursor: payload_cursor,
+                        end: payload_end,
+                        index: 0,
+                    })),
+                    ElementType::OBJECT => Some(IteratorState::Object(ObjectIteratorState {
+                        cursor: payload_cursor,
+                        end: payload_end,
+                        index: 0,
+                    })),
+                    _ => None,
+                }
+            }
+
+            IteratorState::Object(st) => {
+                if st.cursor >= st.end {
+                    return None;
+                }
+
+                // key -> value
+                let (JsonbHeader(key_ty, key_len), key_hdr_len) =
+                    self.read_header(st.cursor).ok()?;
+                if !key_ty.is_valid_key() {
+                    return None;
+                }
+                let key_stop = st.cursor.checked_add(key_hdr_len + key_len)?;
+                if key_stop > st.end || key_stop > self.data.len() {
+                    return None;
+                }
+
+                let (JsonbHeader(val_ty, val_len), val_hdr_len) =
+                    self.read_header(key_stop).ok()?;
+                let payload_cursor = key_stop.checked_add(val_hdr_len)?;
+                let payload_end = payload_cursor.checked_add(val_len)?;
+                if payload_end > st.end || payload_end > self.data.len() {
+                    return None;
+                }
+
+                match val_ty {
+                    ElementType::ARRAY => Some(IteratorState::Array(ArrayIteratorState {
+                        cursor: payload_cursor,
+                        end: payload_end,
+                        index: 0,
+                    })),
+                    ElementType::OBJECT => Some(IteratorState::Object(ObjectIteratorState {
+                        cursor: payload_cursor,
+                        end: payload_end,
+                        index: 0,
+                    })),
+                    _ => None,
+                }
+            }
+            IteratorState::Primitive(_) => None,
+        }
     }
 }
 
@@ -3093,7 +3382,7 @@ mod tests {
         jsonb.data.push(ElementType::NULL as u8);
 
         // Test serialization
-        let json_str = jsonb.to_string().unwrap();
+        let json_str = jsonb.to_string();
         assert_eq!(json_str, "null");
 
         // Test round-trip
@@ -3106,12 +3395,12 @@ mod tests {
         // True
         let mut jsonb_true = Jsonb::new(10, None);
         jsonb_true.data.push(ElementType::TRUE as u8);
-        assert_eq!(jsonb_true.to_string().unwrap(), "true");
+        assert_eq!(jsonb_true.to_string(), "true");
 
         // False
         let mut jsonb_false = Jsonb::new(10, None);
         jsonb_false.data.push(ElementType::FALSE as u8);
-        assert_eq!(jsonb_false.to_string().unwrap(), "false");
+        assert_eq!(jsonb_false.to_string(), "false");
 
         // Round-trip
         let true_parsed = Jsonb::from_str("true").unwrap();
@@ -3125,15 +3414,15 @@ mod tests {
     fn test_integer_serialization() {
         // Standard integer
         let parsed = Jsonb::from_str("42").unwrap();
-        assert_eq!(parsed.to_string().unwrap(), "42");
+        assert_eq!(parsed.to_string(), "42");
 
         // Negative integer
         let parsed = Jsonb::from_str("-123").unwrap();
-        assert_eq!(parsed.to_string().unwrap(), "-123");
+        assert_eq!(parsed.to_string(), "-123");
 
         // Zero
         let parsed = Jsonb::from_str("0").unwrap();
-        assert_eq!(parsed.to_string().unwrap(), "0");
+        assert_eq!(parsed.to_string(), "0");
 
         // Verify correct type
         let header = JsonbHeader::from_slice(0, &parsed.data).unwrap().0;
@@ -3144,15 +3433,15 @@ mod tests {
     fn test_json5_integer_serialization() {
         // Hexadecimal notation
         let parsed = Jsonb::from_str("0x1A").unwrap();
-        assert_eq!(parsed.to_string().unwrap(), "26"); // Should convert to decimal
+        assert_eq!(parsed.to_string(), "26"); // Should convert to decimal
 
         // Positive sign (JSON5)
         let parsed = Jsonb::from_str("+42").unwrap();
-        assert_eq!(parsed.to_string().unwrap(), "42");
+        assert_eq!(parsed.to_string(), "42");
 
         // Negative hexadecimal
         let parsed = Jsonb::from_str("-0xFF").unwrap();
-        assert_eq!(parsed.to_string().unwrap(), "-255");
+        assert_eq!(parsed.to_string(), "-255");
 
         // Verify correct type
         let header = JsonbHeader::from_slice(0, &parsed.data).unwrap().0;
@@ -3163,15 +3452,15 @@ mod tests {
     fn test_float_serialization() {
         // Standard float
         let parsed = Jsonb::from_str("3.14159").unwrap();
-        assert_eq!(parsed.to_string().unwrap(), "3.14159");
+        assert_eq!(parsed.to_string(), "3.14159");
 
         // Negative float
         let parsed = Jsonb::from_str("-2.718").unwrap();
-        assert_eq!(parsed.to_string().unwrap(), "-2.718");
+        assert_eq!(parsed.to_string(), "-2.718");
 
         // Scientific notation
         let parsed = Jsonb::from_str("6.022e23").unwrap();
-        assert_eq!(parsed.to_string().unwrap(), "6.022e23");
+        assert_eq!(parsed.to_string(), "6.022e23");
 
         // Verify correct type
         let header = JsonbHeader::from_slice(0, &parsed.data).unwrap().0;
@@ -3182,23 +3471,23 @@ mod tests {
     fn test_json5_float_serialization() {
         // Leading decimal point
         let parsed = Jsonb::from_str(".123").unwrap();
-        assert_eq!(parsed.to_string().unwrap(), "0.123");
+        assert_eq!(parsed.to_string(), "0.123");
 
         // Trailing decimal point
         let parsed = Jsonb::from_str("42.").unwrap();
-        assert_eq!(parsed.to_string().unwrap(), "42.0");
+        assert_eq!(parsed.to_string(), "42.0");
 
         // Plus sign in exponent
         let parsed = Jsonb::from_str("1.5e+10").unwrap();
-        assert_eq!(parsed.to_string().unwrap(), "1.5e+10");
+        assert_eq!(parsed.to_string(), "1.5e+10");
 
         // Infinity
         let parsed = Jsonb::from_str("Infinity").unwrap();
-        assert_eq!(parsed.to_string().unwrap(), "9e999");
+        assert_eq!(parsed.to_string(), "9e999");
 
         // Negative Infinity
         let parsed = Jsonb::from_str("-Infinity").unwrap();
-        assert_eq!(parsed.to_string().unwrap(), "-9e999");
+        assert_eq!(parsed.to_string(), "-9e999");
 
         // Verify correct type
         let header = JsonbHeader::from_slice(0, &parsed.data).unwrap().0;
@@ -3209,15 +3498,15 @@ mod tests {
     fn test_string_serialization() {
         // Simple string
         let parsed = Jsonb::from_str(r#""hello world""#).unwrap();
-        assert_eq!(parsed.to_string().unwrap(), r#""hello world""#);
+        assert_eq!(parsed.to_string(), r#""hello world""#);
 
         // String with escaped characters
         let parsed = Jsonb::from_str(r#""hello\nworld""#).unwrap();
-        assert_eq!(parsed.to_string().unwrap(), r#""hello\nworld""#);
+        assert_eq!(parsed.to_string(), r#""hello\nworld""#);
 
         // Unicode escape
         let parsed = Jsonb::from_str(r#""hello\u0020world""#).unwrap();
-        assert_eq!(parsed.to_string().unwrap(), r#""hello\u0020world""#);
+        assert_eq!(parsed.to_string(), r#""hello\u0020world""#);
 
         // Verify correct type
         let header = JsonbHeader::from_slice(0, &parsed.data).unwrap().0;
@@ -3228,11 +3517,11 @@ mod tests {
     fn test_json5_string_serialization() {
         // Single quotes
         let parsed = Jsonb::from_str("'hello world'").unwrap();
-        assert_eq!(parsed.to_string().unwrap(), r#""hello world""#);
+        assert_eq!(parsed.to_string(), r#""hello world""#);
 
         // Hex escape
         let parsed = Jsonb::from_str(r#"'\x41\x42\x43'"#).unwrap();
-        assert_eq!(parsed.to_string().unwrap(), r#""\u0041\u0042\u0043""#);
+        assert_eq!(parsed.to_string(), r#""\u0041\u0042\u0043""#);
 
         // Multiline string with line continuation
         let parsed = Jsonb::from_str(
@@ -3240,11 +3529,11 @@ mod tests {
 world""#,
         )
         .unwrap();
-        assert_eq!(parsed.to_string().unwrap(), r#""hello world""#);
+        assert_eq!(parsed.to_string(), r#""hello world""#);
 
         // Escaped single quote
         let parsed = Jsonb::from_str(r#"'Don\'t worry'"#).unwrap();
-        assert_eq!(parsed.to_string().unwrap(), r#""Don't worry""#);
+        assert_eq!(parsed.to_string(), r#""Don't worry""#);
 
         // Verify correct type
         let header = JsonbHeader::from_slice(0, &parsed.data).unwrap().0;
@@ -3255,20 +3544,20 @@ world""#,
     fn test_array_serialization() {
         // Empty array
         let parsed = Jsonb::from_str("[]").unwrap();
-        assert_eq!(parsed.to_string().unwrap(), "[]");
+        assert_eq!(parsed.to_string(), "[]");
 
         // Simple array
         let parsed = Jsonb::from_str("[1,2,3]").unwrap();
-        assert_eq!(parsed.to_string().unwrap(), "[1,2,3]");
+        assert_eq!(parsed.to_string(), "[1,2,3]");
 
         // Nested array
         let parsed = Jsonb::from_str("[[1,2],[3,4]]").unwrap();
-        assert_eq!(parsed.to_string().unwrap(), "[[1,2],[3,4]]");
+        assert_eq!(parsed.to_string(), "[[1,2],[3,4]]");
 
         // Mixed types array
         let parsed = Jsonb::from_str(r#"[1,"text",true,null,{"key":"value"}]"#).unwrap();
         assert_eq!(
-            parsed.to_string().unwrap(),
+            parsed.to_string(),
             r#"[1,"text",true,null,{"key":"value"}]"#
         );
 
@@ -3281,44 +3570,41 @@ world""#,
     fn test_json5_array_serialization() {
         // Trailing comma
         let parsed = Jsonb::from_str("[1,2,3,]").unwrap();
-        assert_eq!(parsed.to_string().unwrap(), "[1,2,3]");
+        assert_eq!(parsed.to_string(), "[1,2,3]");
 
         // Comments in array
         let parsed = Jsonb::from_str("[1,/* comment */2,3]").unwrap();
-        assert_eq!(parsed.to_string().unwrap(), "[1,2,3]");
+        assert_eq!(parsed.to_string(), "[1,2,3]");
 
         // Line comment in array
         let parsed = Jsonb::from_str("[1,// line comment\n2,3]").unwrap();
-        assert_eq!(parsed.to_string().unwrap(), "[1,2,3]");
+        assert_eq!(parsed.to_string(), "[1,2,3]");
     }
 
     #[test]
     fn test_object_serialization() {
         // Empty object
         let parsed = Jsonb::from_str("{}").unwrap();
-        assert_eq!(parsed.to_string().unwrap(), "{}");
+        assert_eq!(parsed.to_string(), "{}");
 
         // Simple object
         let parsed = Jsonb::from_str(r#"{"key":"value"}"#).unwrap();
-        assert_eq!(parsed.to_string().unwrap(), r#"{"key":"value"}"#);
+        assert_eq!(parsed.to_string(), r#"{"key":"value"}"#);
 
         // Multiple properties
         let parsed = Jsonb::from_str(r#"{"a":1,"b":2,"c":3}"#).unwrap();
-        assert_eq!(parsed.to_string().unwrap(), r#"{"a":1,"b":2,"c":3}"#);
+        assert_eq!(parsed.to_string(), r#"{"a":1,"b":2,"c":3}"#);
 
         // Nested object
         let parsed = Jsonb::from_str(r#"{"outer":{"inner":"value"}}"#).unwrap();
-        assert_eq!(
-            parsed.to_string().unwrap(),
-            r#"{"outer":{"inner":"value"}}"#
-        );
+        assert_eq!(parsed.to_string(), r#"{"outer":{"inner":"value"}}"#);
 
         // Mixed values
         let parsed =
             Jsonb::from_str(r#"{"str":"text","num":42,"bool":true,"null":null,"arr":[1,2]}"#)
                 .unwrap();
         assert_eq!(
-            parsed.to_string().unwrap(),
+            parsed.to_string(),
             r#"{"str":"text","num":42,"bool":true,"null":null,"arr":[1,2]}"#
         );
 
@@ -3331,19 +3617,19 @@ world""#,
     fn test_json5_object_serialization() {
         // Unquoted keys
         let parsed = Jsonb::from_str("{key:\"value\"}").unwrap();
-        assert_eq!(parsed.to_string().unwrap(), r#"{"key":"value"}"#);
+        assert_eq!(parsed.to_string(), r#"{"key":"value"}"#);
 
         // Trailing comma
         let parsed = Jsonb::from_str(r#"{"a":1,"b":2,}"#).unwrap();
-        assert_eq!(parsed.to_string().unwrap(), r#"{"a":1,"b":2}"#);
+        assert_eq!(parsed.to_string(), r#"{"a":1,"b":2}"#);
 
         // Comments in object
         let parsed = Jsonb::from_str(r#"{"a":1,/*comment*/"b":2}"#).unwrap();
-        assert_eq!(parsed.to_string().unwrap(), r#"{"a":1,"b":2}"#);
+        assert_eq!(parsed.to_string(), r#"{"a":1,"b":2}"#);
 
         // Single quotes for keys and values
         let parsed = Jsonb::from_str("{'a':'value'}").unwrap();
-        assert_eq!(parsed.to_string().unwrap(), r#"{"a":"value"}"#);
+        assert_eq!(parsed.to_string(), r#"{"a":"value"}"#);
     }
 
     #[test]
@@ -3366,8 +3652,8 @@ world""#,
 
         let parsed = Jsonb::from_str(complex_json).unwrap();
         // Round-trip test
-        let reparsed = Jsonb::from_str(&parsed.to_string().unwrap()).unwrap();
-        assert_eq!(parsed.to_string().unwrap(), reparsed.to_string().unwrap());
+        let reparsed = Jsonb::from_str(&parsed.to_string()).unwrap();
+        assert_eq!(parsed.to_string(), reparsed.to_string());
     }
 
     #[test]
@@ -3486,11 +3772,11 @@ world""#,
     fn test_unicode_escapes() {
         // Basic unicode escape
         let parsed = Jsonb::from_str(r#""\u00A9""#).unwrap(); // Copyright symbol
-        assert_eq!(parsed.to_string().unwrap(), r#""\u00A9""#);
+        assert_eq!(parsed.to_string(), r#""\u00A9""#);
 
         // Non-BMP character (surrogate pair)
         let parsed = Jsonb::from_str(r#""\uD83D\uDE00""#).unwrap(); // Smiley emoji
-        assert_eq!(parsed.to_string().unwrap(), r#""\uD83D\uDE00""#);
+        assert_eq!(parsed.to_string(), r#""\uD83D\uDE00""#);
     }
 
     #[test]
@@ -3503,7 +3789,7 @@ world""#,
         }"#,
         )
         .unwrap();
-        assert_eq!(parsed.to_string().unwrap(), r#"{"key":"value"}"#);
+        assert_eq!(parsed.to_string(), r#"{"key":"value"}"#);
 
         // Block comments
         let parsed = Jsonb::from_str(
@@ -3514,7 +3800,7 @@ world""#,
         }"#,
         )
         .unwrap();
-        assert_eq!(parsed.to_string().unwrap(), r#"{"key":"value"}"#);
+        assert_eq!(parsed.to_string(), r#"{"key":"value"}"#);
 
         // Comments inside array
         let parsed = Jsonb::from_str(
@@ -3522,7 +3808,7 @@ world""#,
                                        2, /* Another comment */ 3]"#,
         )
         .unwrap();
-        assert_eq!(parsed.to_string().unwrap(), "[1,2,3]");
+        assert_eq!(parsed.to_string(), "[1,2,3]");
     }
 
     #[test]
@@ -3540,7 +3826,7 @@ world""#,
 
         let parsed = Jsonb::from_str(json_with_whitespace).unwrap();
         assert_eq!(
-            parsed.to_string().unwrap(),
+            parsed.to_string(),
             r#"{"key1":"value1","key2":[1,2,3],"key3":{"nested":true}}"#
         );
     }
@@ -3554,7 +3840,7 @@ world""#,
 
         // Create a new Jsonb from the binary data
         let from_binary = Jsonb::new(0, Some(&binary_data));
-        assert_eq!(from_binary.to_string().unwrap(), original);
+        assert_eq!(from_binary.to_string(), original);
     }
 
     #[test]
@@ -3570,22 +3856,22 @@ world""#,
         large_array.push(']');
 
         let parsed = Jsonb::from_str(&large_array).unwrap();
-        assert!(parsed.to_string().unwrap().starts_with("[0,1,2,"));
-        assert!(parsed.to_string().unwrap().ends_with("998,999]"));
+        assert!(parsed.to_string().starts_with("[0,1,2,"));
+        assert!(parsed.to_string().ends_with("998,999]"));
     }
 
     #[test]
     fn test_jsonb_is_valid() {
         // Valid JSONB
         let jsonb = Jsonb::from_str(r#"{"test":"value"}"#).unwrap();
-        assert!(jsonb.is_valid().is_ok());
+        assert!(jsonb.element_type().is_ok());
 
         // Invalid JSONB (manually corrupted)
         let mut invalid = jsonb.data.clone();
         if !invalid.is_empty() {
             invalid[0] = 0xFF; // Invalid element type
             let jsonb = Jsonb::new(0, Some(&invalid));
-            assert!(jsonb.is_valid().is_err());
+            assert!(jsonb.element_type().is_err());
         }
     }
 
@@ -3600,7 +3886,7 @@ world""#,
         }"#;
 
         let parsed = Jsonb::from_str(json).unwrap();
-        let result = parsed.to_string().unwrap();
+        let result = parsed.to_string();
 
         assert!(result.contains(r#""escaped_quotes":"He said \"Hello\"""#));
         assert!(result.contains(r#""backslashes":"C:\\Windows\\System32""#));
@@ -3767,7 +4053,7 @@ mod path_operations_tests {
         assert!(result.is_ok());
 
         // Verify the value was updated
-        let updated_json = jsonb.to_string().unwrap();
+        let updated_json = jsonb.to_string();
         assert_eq!(updated_json, r#"{"name":"Jane","age":30}"#);
     }
 
@@ -3791,7 +4077,7 @@ mod path_operations_tests {
         assert!(result.is_ok());
 
         // Verify the value was inserted
-        let updated_json = jsonb.to_string().unwrap();
+        let updated_json = jsonb.to_string();
         assert_eq!(updated_json, r#"{"name":"John","age":30}"#);
     }
 
@@ -3814,7 +4100,7 @@ mod path_operations_tests {
         assert!(result.is_ok());
 
         // Verify the property was deleted
-        let updated_json = jsonb.to_string().unwrap();
+        let updated_json = jsonb.to_string();
         assert_eq!(updated_json, r#"{"name":"John"}"#);
     }
 
@@ -3839,7 +4125,7 @@ mod path_operations_tests {
         assert!(result.is_ok());
 
         // Verify the value was replaced
-        let updated_json = jsonb.to_string().unwrap();
+        let updated_json = jsonb.to_string();
         assert_eq!(updated_json, r#"{"items":[10,50,30]}"#);
     }
 
@@ -3863,7 +4149,7 @@ mod path_operations_tests {
 
         // Get the search result
         let search_result = operation.result();
-        let result_str = search_result.to_string().unwrap();
+        let result_str = search_result.to_string();
 
         // Verify the search found the correct value
         assert_eq!(result_str, r#"{"name":"John","age":30}"#);
@@ -3912,7 +4198,7 @@ mod path_operations_tests {
         assert!(result.is_ok());
 
         // Verify the deep value was updated
-        let updated_json = jsonb.to_string().unwrap();
+        let updated_json = jsonb.to_string();
         assert_eq!(
             updated_json,
             r#"{"level1":{"level2":{"level3":{"value":100}}}}"#
@@ -3953,7 +4239,7 @@ mod path_operations_tests {
         let result = jsonb.operate_on_path(&path, &mut operation);
         assert!(result.is_ok());
 
-        let updated_json = jsonb.to_string().unwrap();
+        let updated_json = jsonb.to_string();
         assert_eq!(updated_json, r#"{"name":"John","age":30}"#);
 
         // 3. InsertNew mode - should fail when path already exists
@@ -3991,7 +4277,7 @@ mod path_operations_tests {
         let result = jsonb.operate_on_path(&path, &mut operation);
         assert!(result.is_ok());
 
-        let updated_json = jsonb.to_string().unwrap();
+        let updated_json = jsonb.to_string();
         assert_eq!(updated_json, r#"{"name":"John","age":31,"surname":"Doe"}"#);
     }
 }

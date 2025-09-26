@@ -392,7 +392,7 @@ ifcapable floatingpoint {
 
 ifcapable check {
   do_execsql_test func4-3.1 {
-    CREATE TABLE t1(
+    CREATE TABLE t1 (
       x INTEGER CHECK(tointeger(x) IS NOT NULL)
     );
   } {}
@@ -494,7 +494,7 @@ ifcapable check {
 
   ifcapable floatingpoint {
     do_execsql_test func4-4.1 {
-      CREATE TABLE t2(
+      CREATE TABLE t2 (
         x REAL CHECK(toreal(x) IS NOT NULL)
       );
     } {}

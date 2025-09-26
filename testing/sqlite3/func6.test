@@ -30,12 +30,12 @@ ifcapable null_trim {
 do_execsql_test func6-100 {
   PRAGMA page_size=4096;
   PRAGMA auto_vacuum=NONE;
-  CREATE TABLE t1(a,b,c,d);
+  CREATE TABLE t1 (a,b,c,d);
   WITH RECURSIVE c(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM c WHERE x<100)
    INSERT INTO t1(a,b,c,d) SELECT printf('abc%03x',x), x, 1000-x, NULL FROM c;
   CREATE INDEX t1a ON t1(a);
   CREATE INDEX t1bc ON t1(b,c);
-  CREATE TABLE t2(x TEXT PRIMARY KEY, y) WITHOUT ROWID;
+  CREATE TABLE t2 (x TEXT PRIMARY KEY, y) WITHOUT ROWID;
   INSERT INTO t2(x,y) SELECT a, b FROM t1;
 }
 
@@ -174,9 +174,9 @@ do_execsql_test func6-200 {
 # 2022-03-14 dbsqlfuzz 474499f3977d95fdf2dbcd99c50be1d0082e4c92
 reset_db
 do_execsql_test func6-300 {
-  CREATE TABLE t2(a INT, b INT PRIMARY KEY) WITHOUT ROWID;
+  CREATE TABLE t2 (a INT, b INT PRIMARY KEY) WITHOUT ROWID;
   CREATE INDEX x3 ON t2(b);
-  CREATE TABLE t1(a INT PRIMARY KEY, b TEXT);
+  CREATE TABLE t1 (a INT PRIMARY KEY, b TEXT);
   SELECT * FROM t1 WHERE a IN (SELECT sqlite_offset(b) FROM t2);
 } {}
 

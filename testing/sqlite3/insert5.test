@@ -36,8 +36,8 @@ proc uses_temp_table {sql} {
 do_test insert5-1.0 {
   forcedelete test2.db test2.db-journal
   execsql {
-    CREATE TABLE MAIN(Id INTEGER, Id1 INTEGER); 
-    CREATE TABLE B(Id INTEGER, Id1 INTEGER); 
+    CREATE TABLE MAIN (Id INTEGER, Id1 INTEGER); 
+    CREATE TABLE B (Id INTEGER, Id1 INTEGER); 
     CREATE VIEW v1 AS SELECT * FROM B;
     CREATE VIEW v2 AS SELECT * FROM MAIN;
     INSERT INTO MAIN(Id,Id1) VALUES(2,3); 

@@ -19,7 +19,7 @@ set testprefix selectC
 # Ticket #
 do_test selectC-1.1 {
   execsql {
-    CREATE TABLE t1(a, b, c);
+    CREATE TABLE t1 (a, b, c);
     INSERT INTO t1 VALUES(1,'aaa','bbb');
     INSERT INTO t1 SELECT * FROM t1;
     INSERT INTO t1 VALUES(2,'ccc','ddd');
@@ -155,9 +155,9 @@ do_test selectC-1.14.2 {
 ifcapable trigger&&compound {
   do_test selectC-2.1 {
     catchsql {
-      CREATE TABLE t21a(a,b);
+      CREATE TABLE t21a (a,b);
       INSERT INTO t21a VALUES(1,2);
-      CREATE TABLE t21b(n);
+      CREATE TABLE t21b (n);
       CREATE TRIGGER r21 AFTER INSERT ON t21b BEGIN
         SELECT a FROM t21a WHERE a>new.x UNION ALL
         SELECT b FROM t21a WHERE b>new.x ORDER BY 1 LIMIT 2;
@@ -199,7 +199,7 @@ do_test selectC-3.1 {
 } {acorn 1 lakeside 1 meyers 3 smith 2}
 do_test selectC-3.2 {
   execsql {
-    CREATE TABLE t2(a PRIMARY KEY, b);
+    CREATE TABLE t2 (a PRIMARY KEY, b);
     INSERT INTO t2 VALUES('abc', 'xxx');
     INSERT INTO t2 VALUES('def', 'yyy');
     SELECT a, max(b || a) FROM t2 WHERE (b||b||b)!='value' GROUP BY a;
@@ -245,9 +245,9 @@ do_execsql_test selectC-4.3 {
 #
 # TODO: Views are not supported.
 #do_execsql_test 5.0 {
-#  CREATE TABLE x1(a);
-#  CREATE TABLE x2(b);
-#  CREATE TABLE x3(c);
+#  CREATE TABLE x1 (a);
+#  CREATE TABLE x2 (b);
+#  CREATE TABLE x3 (c);
 #  CREATE VIEW vvv AS SELECT b FROM x2 ORDER BY 1;
 #
 #  INSERT INTO x1 VALUES('a'), ('b');

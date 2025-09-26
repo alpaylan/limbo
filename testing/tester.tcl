@@ -2,6 +2,32 @@ set sqlite_exec [expr {[info exists env(SQLITE_EXEC)] ? $env(SQLITE_EXEC) : "sql
 set test_dbs [list "testing/testing.db" "testing/testing_norowidalias.db"]
 set test_small_dbs [list "testing/testing_small.db" ]
 
+# Array storing loaded extensions
+array set extensions {}
+
+# Mapping of extension names to their respective library paths per database type
+set extension_map {
+    test_ext {
+        sqlite "./target/debug/liblimbo_sqlite_test_ext"
+        turso  "./target/debug/libturso_ext_tests"
+    }
+}
+
+proc load_extension {extension_name} {
+    global extension_map
+    global extensions
+
+    set version_output [exec $::sqlite_exec --version]
+
+    set is_turso [string match "*Turso*" $version_output]
+    set db_type [expr {$is_turso ? "turso" : "sqlite"}]
+
+    set ext_info [dict get $extension_map $extension_name]
+    set ext_path [dict get $ext_info $db_type]
+
+    set extensions($extension_name) $ext_path
+}
+
 proc error_put {sql} {
     puts [format "\033\[1;31mTest FAILED:\033\[0m %s" $sql ]
 }
@@ -11,8 +37,15 @@ proc test_put {msg db test_name} {
 }
 
 proc evaluate_sql {sqlite_exec db_name sql} {
-    set command [list $sqlite_exec $db_name $sql]
-    set output [exec {*}$command]
+    global extensions
+    set load_commands ""
+    foreach name [array names extensions] {
+        append load_commands ".load $extensions($name)\n"
+    }
+    set statements "${load_commands}${sql}"
+
+    set command [list $sqlite_exec $db_name]
+    set output [exec echo $statements | {*}$command]
     return $output
 }
 
@@ -69,6 +102,26 @@ proc do_execsql_test_on_specific_db {db_name test_name sql_statements expected_o
     run_test $::sqlite_exec $db_name $combined_sql $combined_expected_output
 }
 
+proc run_test_skip_lines {sqlite_exec skip_lines db_name sql expected_output} {
+    set actual_output [evaluate_sql $sqlite_exec $db_name $sql]
+    set lines [split $actual_output "\n"]
+    set actual_without_skipped [join [lrange $lines $skip_lines end] "\n"]
+    if {$actual_without_skipped ne $expected_output} {
+        error_put $sql
+        puts "returned '$actual_without_skipped'"
+        puts "expected '$expected_output'"
+        exit 1
+    }
+}
+
+proc do_execsql_test_skip_lines_on_specific_db {skip_lines db_name test_name sql_statements expected_outputs} {
+    test_put "Running test" $db_name $test_name
+    set combined_sql [string trim $sql_statements]
+    set combined_expected_output [join $expected_outputs "\n"]
+    run_test_skip_lines $::sqlite_exec $skip_lines $db_name $combined_sql $combined_expected_output
+}
+
+
 proc within_tolerance {actual expected tolerance} {
     expr {abs($actual - $expected) <= $tolerance}
 }
@@ -107,11 +160,8 @@ proc do_execsql_test_tolerance {test_name sql_statements expected_outputs tolera
 }
 # This procedure passes the test if the output contains error messages
 proc run_test_expecting_any_error {sqlite_exec db_name sql} {
-    # Execute the SQL command and capture output
-    set command [list $sqlite_exec $db_name $sql]
-
     # Use catch to handle both successful and error cases
-    catch {exec {*}$command} result options
+    catch {evaluate_sql $sqlite_exec $db_name $sql} result options
 
     # Check if the output contains error indicators (×, error, syntax error, etc.)
     if {[regexp {(error|ERROR|Error|×|syntax error|failed)} $result]} {
@@ -128,11 +178,8 @@ proc run_test_expecting_any_error {sqlite_exec db_name sql} {
 
 # This procedure passes if error matches a specific pattern
 proc run_test_expecting_error {sqlite_exec db_name sql expected_error_pattern} {
-    # Execute the SQL command and capture output
-    set command [list $sqlite_exec $db_name $sql]
-
     # Capture output whether command succeeds or fails
-    catch {exec {*}$command} result options
+    catch {evaluate_sql $sqlite_exec $db_name $sql} result options
 
     # Check if the output contains error indicators first
     if {![regexp {(error|ERROR|Error|×|syntax error|failed)} $result]} {
@@ -157,11 +204,8 @@ proc run_test_expecting_error {sqlite_exec db_name sql expected_error_pattern} {
 
 # This version accepts exact error text, ignoring formatting
 proc run_test_expecting_error_content {sqlite_exec db_name sql expected_error_text} {
-    # Execute the SQL command and capture output
-    set command [list $sqlite_exec $db_name $sql]
-
     # Capture output whether command succeeds or fails
-    catch {exec {*}$command} result options
+    catch {evaluate_sql $sqlite_exec $db_name $sql} result options
 
     # Check if the output contains error indicators first
     if {![regexp {(error|ERROR|Error|×|syntax error|failed)} $result]} {
@@ -171,9 +215,13 @@ proc run_test_expecting_error_content {sqlite_exec db_name sql expected_error_te
         exit 1
     }
 
+    # Remove box-drawing characters, multiplication signs, and other non-ASCII junk
+    set cleaned_result [regsub -all {[\u2500-\u257F\u00D7]} $result ""]
+    #TODO any other possible cleanups?
+    
     # Normalize both the actual and expected error messages
     # Remove all whitespace, newlines, and special characters for comparison
-    set normalized_actual [regsub -all {[[:space:]]|[[:punct:]]} $result ""]
+    set normalized_actual [regsub -all {[[:space:]]|[[:punct:]]} $cleaned_result ""]
     set normalized_expected [regsub -all {[[:space:]]|[[:punct:]]} $expected_error_text ""]
 
     # Convert to lowercase for case-insensitive comparison
@@ -235,4 +283,14 @@ proc do_execsql_test_in_memory_error_content {test_name sql_statements expected_
 
     set combined_sql [string trim $sql_statements]
     run_test_expecting_error_content $::sqlite_exec $db_name $combined_sql $expected_error_text
+}
+
+proc do_execsql_test_in_memory_error {test_name sql_statements expected_error_pattern} {
+    test_put "Running error test" in-memory $test_name
+
+    # Use ":memory:" special filename for in-memory database
+    set db_name ":memory:"
+
+    set combined_sql [string trim $sql_statements]
+    run_test_expecting_error $::sqlite_exec $db_name $combined_sql $expected_error_pattern
 }

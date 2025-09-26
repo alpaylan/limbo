@@ -104,13 +104,17 @@ do_execsql_test pragma-vtab-table-info-invalid-table {
   SELECT * FROM pragma_table_info WHERE arg = 'pekka'
 } {}
 
-# temporarily skip this test case. The issue is detailed in #1407
-#do_execsql_test_on_specific_db ":memory:" pragma-page-count-empty {
-#  PRAGMA page_count
-#} {0}
+do_execsql_test_on_specific_db ":memory:" pragma-page-count-empty {
+  PRAGMA page_count
+} {0}
+
+do_execsql_test_on_specific_db ":memory:" pragma-page-count-empty {
+  PRAGMA user_version=1;
+  PRAGMA page_count
+} {1}
 
 do_execsql_test_on_specific_db ":memory:" pragma-page-count-table {
-  CREATE TABLE foo(bar);
+  CREATE TABLE foo (bar);
   PRAGMA page_count
 } {2}
 
@@ -136,6 +140,35 @@ do_execsql_test_on_specific_db ":memory:" pragma-user-version-float-value {
   PRAGMA user_version = 10.9;
   PRAGMA user_version;
 } {10}
+
+do_execsql_test_on_specific_db ":memory:" pragma-application-id-default {
+  PRAGMA application_id
+} {0}
+
+do_execsql_test_on_specific_db ":memory:" pragma-application-id-update {
+  PRAGMA application_id = 12345;
+  PRAGMA application_id;
+} {12345}
+
+do_execsql_test_on_specific_db ":memory:" pragma-application-id-float-value {
+  PRAGMA application_id = 10.9;
+  PRAGMA application_id;
+} {10}
+
+do_execsql_test_on_specific_db ":memory:" pragma-application-id-large-value {
+  PRAGMA application_id = 2147483647;
+  PRAGMA application_id;
+} {2147483647}
+
+do_execsql_test_on_specific_db ":memory:" pragma-application-id-negative-value {
+  PRAGMA application_id = -23;
+  PRAGMA application_id;
+} {-23}
+
+do_execsql_test_on_specific_db ":memory:" pragma-application-id-zero {
+  PRAGMA application_id = 0;
+  PRAGMA application_id;
+} {0}
 
 do_execsql_test pragma-legacy-file-format {
   PRAGMA legacy_file_format
@@ -185,14 +218,14 @@ do_execsql_test_on_specific_db ":memory:" pragma-function-argument-with-space {
 } {0|c0||0||0}
 
 # If the argument passed to the first function call were simply concatenated with the underlying PRAGMA statement,
-# we would end up with: PRAGMA table_info='sqlite_schema';CREATE TABLE foo(c0);SELECT 'bar'. Depending on how many
+# we would end up with: PRAGMA table_info='sqlite_schema';CREATE TABLE foo (c0);SELECT 'bar'. Depending on how many
 # statements are executed at once, at least one of the following would run:
 # - PRAGMA table_info='sqlite_schema';
-# - CREATE TABLE foo(c0);
+# - CREATE TABLE foo (c0);
 # - SELECT 'bar';
 # No output means that none of them were executed.
 do_execsql_test pragma-function-sql-injection {
-  SELECT * FROM pragma_table_info('sqlite_schema'';CREATE TABLE foo(c0);SELECT ''bar');
+  SELECT * FROM pragma_table_info('sqlite_schema'';CREATE TABLE foo (c0);SELECT ''bar');
   SELECT * FROM pragma_table_info('foo');
 } {}
 
@@ -229,3 +262,70 @@ do_execsql_test_on_specific_db $test_pragma_page_size_db pragma-page-size-set-un
 } {1024}
 catch {file delete -force $test_pragma_page_size_db}
 catch {file delete -force "${test_pragma_page_size_db}-wal"}
+
+do_execsql_test pragma-vtab-join {
+  SELECT s.name, ti.name FROM sqlite_schema AS s, pragma_table_info(s.name) AS ti;
+} {users|id
+users|first_name
+users|last_name
+users|email
+users|phone_number
+users|address
+users|city
+users|state
+users|zipcode
+users|age
+products|id
+products|name
+products|price
+}
+
+do_execsql_test pragma-vtab-reversed-join-order {
+  SELECT s.name, ti.name FROM pragma_table_info(s.name) AS ti, sqlite_schema AS s;
+} {users|id
+users|first_name
+users|last_name
+users|email
+users|phone_number
+users|address
+users|city
+users|state
+users|zipcode
+users|age
+products|id
+products|name
+products|price
+}
+
+do_execsql_test_on_specific_db ":memory:" pragma-max-page-count-default {
+  PRAGMA max_page_count
+} {4294967294}
+
+do_execsql_test_on_specific_db ":memory:" pragma-max-page-count-set-large {
+  PRAGMA max_page_count = 1000;
+  PRAGMA max_page_count
+} {1000
+1000}
+
+do_execsql_test_on_specific_db ":memory:" pragma-max-page-count-set-zero-ignored {
+  PRAGMA max_page_count = 0;
+  PRAGMA max_page_count
+} {4294967294
+4294967294
+}
+
+do_execsql_test_on_specific_db ":memory:" pragma-max-page-count-clamping-with-data {
+  CREATE TABLE test (id INTEGER);
+  PRAGMA page_count;
+  PRAGMA max_page_count = 1;
+} {2
+2}
+
+do_execsql_test_in_memory_any_error pragma-max-page-count-enforcement-error {
+  PRAGMA max_page_count = 1;
+  CREATE TABLE test (id INTEGER)
+}
+
+do_execsql_test_regex pragma-module-list-nonempty {
+  SELECT * FROM pragma_module_list;
+} {\ngenerate_series\n|^generate_series\n|\ngenerate_series$|^generate_series$}

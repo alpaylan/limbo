@@ -4,7 +4,7 @@ import json
 
 import turso
 from antithesis.random import get_random
-from utils import generate_random_value
+from helper_utils import generate_random_value
 
 # Get initial state
 try:
@@ -15,9 +15,16 @@ except Exception as e:
 
 cur_init = con_init.cursor()
 
-tbl_len = cur_init.execute("SELECT count FROM tables").fetchone()[0]
-selected_tbl = get_random() % tbl_len
-tbl_schema = json.loads(cur_init.execute(f"SELECT schema FROM schemas WHERE tbl = {selected_tbl}").fetchone()[0])
+# Get all existing tables from schemas
+existing_schemas = cur_init.execute("SELECT tbl, schema FROM schemas").fetchall()
+if not existing_schemas:
+    print("No tables found in schemas")
+    exit(0)
+
+# Select a random table
+selected_idx = get_random() % len(existing_schemas)
+selected_tbl, schema_json = existing_schemas[selected_idx]
+tbl_schema = json.loads(schema_json)
 cols = ", ".join([f"col_{col}" for col in range(tbl_schema["colCount"])])
 
 try:

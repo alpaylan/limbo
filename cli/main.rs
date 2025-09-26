@@ -4,14 +4,21 @@ mod commands;
 mod config;
 mod helper;
 mod input;
+mod manual;
+mod mcp_server;
 mod opcodes_dictionary;
 
 use config::CONFIG_DIR;
+use mcp_server::TursoMcpServer;
 use rustyline::{error::ReadlineError, Config, Editor};
 use std::{
     path::PathBuf,
     sync::{atomic::Ordering, LazyLock},
 };
+
+#[cfg(not(target_family = "wasm"))]
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 fn rustyline_config() -> Config {
     Config::builder()
@@ -25,8 +32,20 @@ pub static HOME_DIR: LazyLock<PathBuf> =
 
 pub static HISTORY_FILE: LazyLock<PathBuf> = LazyLock::new(|| HOME_DIR.join(".limbo_history"));
 
+fn run_mcp_server(app: app::Limbo) -> anyhow::Result<()> {
+    let conn = app.get_connection();
+    let interrupt_count = app.get_interrupt_count();
+    let mcp_server = TursoMcpServer::new(conn, interrupt_count);
+
+    mcp_server.run()
+}
+
 fn main() -> anyhow::Result<()> {
     let (mut app, _guard) = app::Limbo::new()?;
+
+    if app.is_mcp_mode() {
+        return run_mcp_server(app);
+    }
 
     if std::io::IsTerminal::is_terminal(&std::io::stdin()) {
         let mut rl = Editor::with_config(rustyline_config())?;
@@ -45,14 +64,8 @@ fn main() -> anyhow::Result<()> {
     }
 
     loop {
-        let readline = app.readline();
-        match readline {
-            Ok(line) => match app.handle_input_line(line.trim()) {
-                Ok(_) => {}
-                Err(e) => {
-                    eprintln!("{e}");
-                }
-            },
+        match app.readline() {
+            Ok(_) => app.consume(false),
             Err(ReadlineError::Interrupted) => {
                 // At prompt, increment interrupt count
                 if app.interrupt_count.fetch_add(1, Ordering::SeqCst) >= 1 {
@@ -65,7 +78,8 @@ fn main() -> anyhow::Result<()> {
                 continue;
             }
             Err(ReadlineError::Eof) => {
-                app.handle_remaining_input();
+                // consume remaining input before exit
+                app.consume(true);
                 let _ = app.close_conn();
                 break;
             }

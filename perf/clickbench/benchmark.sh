@@ -12,16 +12,16 @@ if ! command -v sqlite3 >/dev/null 2>&1; then
     exit 1
 fi
 
-# Build Limbo in release mode if it's not already built
+# Build tursodb in release mode if it's not already built
 if [ ! -f "$RELEASE_BUILD_DIR/tursodb" ]; then
-    echo "Building Limbo..."
+    echo "Building tursodb..."
     cargo build --bin tursodb --release
 fi
 
 # Clean up any existing DB
 rm "$CLICKBENCH_DIR/mydb"* || true
 
-# Create DB using Limbo
+# Create DB using tursodb
 echo "Creating DB..."
 "$RELEASE_BUILD_DIR/tursodb" --quiet "$CLICKBENCH_DIR/mydb" < "$CLICKBENCH_DIR/create.sql"
 
@@ -41,7 +41,7 @@ else
     echo "Using existing hits.csv file"
 fi
 
-# Import the dataset into the DB using sqlite (not Limbo, because Limbo doesn't have index insert yet)
+# Import the dataset into the DB using sqlite (not tursodb, because tursodb doesn't have index insert yet)
 echo "Importing dataset..."
 sqlite3 "$CLICKBENCH_DIR/mydb" ".import --csv $CLICKBENCH_DIR/hits.csv hits"
 

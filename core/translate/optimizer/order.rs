@@ -1,8 +1,9 @@
 use std::cell::RefCell;
 
-use turso_sqlite3_parser::ast::{self, SortOrder, TableInternalId};
+use turso_parser::ast::{self, SortOrder, TableInternalId};
 
 use crate::{
+    translate::optimizer::access_method::AccessMethodParams,
     translate::plan::{GroupBy, IterationDirection, JoinedTable},
     util::exprs_are_equivalent,
 };
@@ -70,19 +71,19 @@ impl OrderTarget {
 /// TODO: this does not currently handle the case where we definitely cannot eliminate
 /// the ORDER BY sorter, but we could still eliminate the GROUP BY sorter.
 pub fn compute_order_target(
-    order_by_opt: &mut Option<Vec<(ast::Expr, SortOrder)>>,
+    order_by: &mut Vec<(Box<ast::Expr>, SortOrder)>,
     group_by_opt: Option<&mut GroupBy>,
 ) -> Option<OrderTarget> {
-    match (&order_by_opt, group_by_opt) {
+    match (order_by.is_empty(), group_by_opt) {
         // No ordering demands - we don't care what order the joined result rows are in
-        (None, None) => None,
+        (true, None) => None,
         // Only ORDER BY - we would like the joined result rows to be in the order specified by the ORDER BY
-        (Some(order_by), None) => OrderTarget::maybe_from_iterator(
-            order_by.iter().map(|(expr, order)| (expr, *order)),
+        (false, None) => OrderTarget::maybe_from_iterator(
+            order_by.iter().map(|(expr, order)| (expr.as_ref(), *order)),
             EliminatesSortBy::Order,
         ),
         // Only GROUP BY - we would like the joined result rows to be in the order specified by the GROUP BY
-        (None, Some(group_by)) => OrderTarget::maybe_from_iterator(
+        (true, Some(group_by)) => OrderTarget::maybe_from_iterator(
             group_by.exprs.iter().map(|expr| (expr, SortOrder::Asc)),
             EliminatesSortBy::Group,
         ),
@@ -95,7 +96,7 @@ pub fn compute_order_target(
         // If the GROUP BY contains all the expressions in the ORDER BY,
         // then we again can use the GROUP BY expressions as the target order for the join;
         // however in this case we must take the ASC/DESC from ORDER BY into account.
-        (Some(order_by), Some(group_by)) => {
+        (false, Some(group_by)) => {
             // Does the group by contain all expressions in the order by?
             let group_by_contains_all = order_by.iter().all(|(expr, _)| {
                 group_by
@@ -132,7 +133,7 @@ pub fn compute_order_target(
                     *order_by_dir;
             }
             // Now we can remove the ORDER BY from the query.
-            order_by_opt.take();
+            order_by.clear();
 
             OrderTarget::maybe_from_iterator(
                 group_by
@@ -172,62 +173,68 @@ pub fn plan_satisfies_order_target(
 
         // Check if this table has an access method that provides the right ordering.
         let access_method = &access_methods_arena.borrow()[*access_method_index];
-        let iter_dir = access_method.iter_dir;
-        let index = access_method.index.as_ref();
-        match index {
-            None => {
-                // No index, so the next required column must be the rowid alias column.
-                let rowid_alias_col = table_ref
-                    .table
-                    .columns()
-                    .iter()
-                    .position(|c| c.is_rowid_alias);
-                let Some(rowid_alias_col) = rowid_alias_col else {
-                    return false;
-                };
-                let correct_column = target_col.column_no == rowid_alias_col;
-                if !correct_column {
-                    return false;
-                }
+        match &access_method.params {
+            AccessMethodParams::BTreeTable {
+                iter_dir, index, ..
+            } => {
+                match index {
+                    None => {
+                        // No index, so the next required column must be the rowid alias column.
+                        let rowid_alias_col = table_ref
+                            .table
+                            .columns()
+                            .iter()
+                            .position(|c| c.is_rowid_alias);
+                        let Some(rowid_alias_col) = rowid_alias_col else {
+                            return false;
+                        };
+                        let correct_column = target_col.column_no == rowid_alias_col;
+                        if !correct_column {
+                            return false;
+                        }
 
-                // Btree table rows are always in ascending order of rowid.
-                let correct_order = if iter_dir == IterationDirection::Forwards {
-                    target_col.order == SortOrder::Asc
-                } else {
-                    target_col.order == SortOrder::Desc
-                };
-                if !correct_order {
-                    return false;
-                }
-                target_col_idx += 1;
-                // All order columns matched.
-                if target_col_idx == num_cols_in_order_target {
-                    return true;
+                        // Btree table rows are always in ascending order of rowid.
+                        let correct_order = if *iter_dir == IterationDirection::Forwards {
+                            target_col.order == SortOrder::Asc
+                        } else {
+                            target_col.order == SortOrder::Desc
+                        };
+                        if !correct_order {
+                            return false;
+                        }
+                        target_col_idx += 1;
+                        // All order columns matched.
+                        if target_col_idx == num_cols_in_order_target {
+                            return true;
+                        }
+                    }
+                    Some(index) => {
+                        // All of the index columns must match the next required columns in the order target.
+                        for index_col in index.columns.iter() {
+                            let target_col = &order_target.0[target_col_idx];
+                            let correct_column = target_col.column_no == index_col.pos_in_table;
+                            if !correct_column {
+                                return false;
+                            }
+                            let correct_order = if *iter_dir == IterationDirection::Forwards {
+                                target_col.order == index_col.order
+                            } else {
+                                target_col.order != index_col.order
+                            };
+                            if !correct_order {
+                                return false;
+                            }
+                            target_col_idx += 1;
+                            // All order columns matched.
+                            if target_col_idx == num_cols_in_order_target {
+                                return true;
+                            }
+                        }
+                    }
                 }
             }
-            Some(index) => {
-                // All of the index columns must match the next required columns in the order target.
-                for index_col in index.columns.iter() {
-                    let target_col = &order_target.0[target_col_idx];
-                    let correct_column = target_col.column_no == index_col.pos_in_table;
-                    if !correct_column {
-                        return false;
-                    }
-                    let correct_order = if iter_dir == IterationDirection::Forwards {
-                        target_col.order == index_col.order
-                    } else {
-                        target_col.order != index_col.order
-                    };
-                    if !correct_order {
-                        return false;
-                    }
-                    target_col_idx += 1;
-                    // All order columns matched.
-                    if target_col_idx == num_cols_in_order_target {
-                        return true;
-                    }
-                }
-            }
+            AccessMethodParams::VirtualTable { .. } => return false,
+            AccessMethodParams::Subquery => return false,
         }
     }
     false

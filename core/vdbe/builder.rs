@@ -1,15 +1,16 @@
-use std::{cell::Cell, cmp::Ordering, rc::Rc, sync::Arc};
+use std::{cell::Cell, cmp::Ordering, sync::Arc};
 
 use tracing::{instrument, Level};
-use turso_sqlite3_parser::ast::{self, TableInternalId};
+use turso_parser::ast::{self, TableInternalId};
 
 use crate::{
     numeric::Numeric,
     parameters::Parameters,
-    schema::{BTreeTable, Index, PseudoCursorType, Table},
+    schema::{BTreeTable, Index, PseudoCursorType, Schema, Table},
     translate::{
         collate::CollationSeq,
         emitter::TransactionMode,
+        expr::ParamState,
         plan::{ResultSetColumn, TableReferences},
     },
     CaptureDataChangesMode, Connection, Value, VirtualTable,
@@ -17,7 +18,7 @@ use crate::{
 
 #[derive(Default)]
 pub struct TableRefIdCounter {
-    next_free: TableInternalId,
+    next_free: ast::TableInternalId,
 }
 
 impl TableRefIdCounter {
@@ -34,7 +35,7 @@ impl TableRefIdCounter {
     }
 }
 
-use super::{BranchOffset, CursorID, Insn, InsnFunction, InsnReference, JumpTarget, Program};
+use super::{BranchOffset, CursorID, Insn, InsnReference, JumpTarget, Program};
 
 /// A key that uniquely identifies a cursor.
 /// The key is a pair of table reference id and index.
@@ -85,7 +86,7 @@ pub struct ProgramBuilder {
     next_free_register: usize,
     next_free_cursor_id: usize,
     /// Instruction, the function to execute it with, and its original index in the vector.
-    insns: Vec<(Insn, InsnFunction, usize)>,
+    insns: Vec<(Insn, usize)>,
     /// A span of instructions from (offset_start_inclusive, offset_end_exclusive),
     /// that are deemed to be compile-time constant and can be hoisted out of loops
     /// so that they get evaluated only once at the start of the program.
@@ -100,7 +101,7 @@ pub struct ProgramBuilder {
     // Bitmask of cursors that have emitted a SeekRowid instruction.
     seekrowid_emitted_bitmask: u64,
     // map of instruction index to manual comment (used in EXPLAIN only)
-    comments: Option<Vec<(InsnReference, &'static str)>>,
+    comments: Vec<(InsnReference, &'static str)>,
     pub parameters: Parameters,
     pub result_columns: Vec<ResultSetColumn>,
     pub table_references: TableReferences,
@@ -111,15 +112,27 @@ pub struct ProgramBuilder {
     init_label: BranchOffset,
     start_offset: BranchOffset,
     capture_data_changes_mode: CaptureDataChangesMode,
+    // TODO: when we support multiple dbs, this should be a write mask to track which DBs need to be written
+    txn_mode: TransactionMode,
+    rollback: bool,
+    /// The mode in which the query is being executed.
+    query_mode: QueryMode,
+    /// Current parent explain address, if any.
+    current_parent_explain_idx: Option<usize>,
+    pub param_ctx: ParamState,
 }
 
 #[derive(Debug, Clone)]
 pub enum CursorType {
-    BTreeTable(Rc<BTreeTable>),
+    BTreeTable(Arc<BTreeTable>),
     BTreeIndex(Arc<Index>),
     Pseudo(PseudoCursorType),
     Sorter,
-    VirtualTable(Rc<VirtualTable>),
+    VirtualTable(Arc<VirtualTable>),
+    MaterializedView(
+        Arc<BTreeTable>,
+        Arc<std::sync::Mutex<crate::incremental::view::IncrementalView>>,
+    ),
 }
 
 impl CursorType {
@@ -132,13 +145,15 @@ impl CursorType {
 pub enum QueryMode {
     Normal,
     Explain,
+    ExplainQueryPlan,
 }
 
-impl From<ast::Cmd> for QueryMode {
-    fn from(stmt: ast::Cmd) -> Self {
-        match stmt {
-            ast::Cmd::ExplainQueryPlan(_) | ast::Cmd::Explain(_) => QueryMode::Explain,
-            _ => QueryMode::Normal,
+impl QueryMode {
+    pub fn new(cmd: &ast::Cmd) -> Self {
+        match cmd {
+            ast::Cmd::ExplainQueryPlan(_) => QueryMode::ExplainQueryPlan,
+            ast::Cmd::Explain(_) => QueryMode::Explain,
+            ast::Cmd::Stmt(_) => QueryMode::Normal,
         }
     }
 }
@@ -147,6 +162,18 @@ pub struct ProgramBuilderOpts {
     pub num_cursors: usize,
     pub approx_num_insns: usize,
     pub approx_num_labels: usize,
+}
+
+/// Use this macro to emit an OP_Explain instruction.
+/// Please use this macro instead of calling emit_explain() directly,
+/// because we want to avoid allocating a String if we are not in explain mode.
+#[macro_export]
+macro_rules! emit_explain {
+    ($builder:expr, $push:expr, $detail:expr) => {
+        if let QueryMode::ExplainQueryPlan = $builder.get_query_mode() {
+            $builder.emit_explain($push, $detail);
+        }
+    };
 }
 
 impl ProgramBuilder {
@@ -164,11 +191,7 @@ impl ProgramBuilder {
             constant_spans: Vec::new(),
             label_to_resolved_offset: Vec::with_capacity(opts.approx_num_labels),
             seekrowid_emitted_bitmask: 0,
-            comments: if query_mode == QueryMode::Explain {
-                Some(Vec::new())
-            } else {
-                None
-            },
+            comments: Vec::new(),
             parameters: Parameters::new(),
             result_columns: Vec::new(),
             table_references: TableReferences::new(vec![], vec![]),
@@ -178,6 +201,11 @@ impl ProgramBuilder {
             init_label: BranchOffset::Placeholder,
             start_offset: BranchOffset::Placeholder,
             capture_data_changes_mode,
+            txn_mode: TransactionMode::None,
+            rollback: false,
+            query_mode,
+            current_parent_explain_idx: None,
+            param_ctx: ParamState::default(),
         }
     }
 
@@ -293,7 +321,7 @@ impl ProgramBuilder {
     pub fn add_pragma_result_column(&mut self, col_name: String) {
         // TODO figure out a better type definition for ResultSetColumn
         // or invent another way to set pragma result columns
-        let expr = ast::Expr::Id(ast::Id("".to_string()));
+        let expr = ast::Expr::Id(ast::Name::Ident("".to_string()));
         self.result_columns.push(ResultSetColumn {
             expr,
             alias: Some(col_name),
@@ -303,10 +331,9 @@ impl ProgramBuilder {
 
     #[instrument(skip(self), level = Level::DEBUG)]
     pub fn emit_insn(&mut self, insn: Insn) {
-        let function = insn.to_function();
         // This seemingly empty trace here is needed so that a function span is emmited with it
         tracing::trace!("");
-        self.insns.push((insn, function, self.insns.len()));
+        self.insns.push((insn, self.insns.len()));
     }
 
     pub fn close_cursors(&mut self, cursors: &[CursorID]) {
@@ -367,8 +394,40 @@ impl ProgramBuilder {
     }
 
     pub fn add_comment(&mut self, insn_index: BranchOffset, comment: &'static str) {
-        if let Some(comments) = &mut self.comments {
-            comments.push((insn_index.as_offset_int(), comment));
+        if let QueryMode::Explain | QueryMode::ExplainQueryPlan = self.query_mode {
+            self.comments.push((insn_index.as_offset_int(), comment));
+        }
+    }
+
+    pub fn get_query_mode(&self) -> QueryMode {
+        self.query_mode
+    }
+
+    /// use emit_explain macro instead, because we don't want to allocate
+    /// String if we are not in explain mode
+    pub fn emit_explain(&mut self, push: bool, detail: String) {
+        if let QueryMode::ExplainQueryPlan = self.query_mode {
+            self.emit_insn(Insn::Explain {
+                p1: self.insns.len(),
+                p2: self.current_parent_explain_idx,
+                detail,
+            });
+            if push {
+                self.current_parent_explain_idx = Some(self.insns.len() - 1);
+            }
+        }
+    }
+
+    pub fn pop_current_parent_explain(&mut self) {
+        if let QueryMode::ExplainQueryPlan = self.query_mode {
+            if let Some(current) = self.current_parent_explain_idx {
+                let (Insn::Explain { p2, .. }, _) = &self.insns[current] else {
+                    unreachable!("current_parent_explain_idx must point to an Explain insn");
+                };
+                self.current_parent_explain_idx = *p2;
+            }
+        } else {
+            debug_assert!(self.current_parent_explain_idx.is_none())
         }
     }
 
@@ -390,7 +449,7 @@ impl ProgramBuilder {
         // 1. if insn not in any constant span, it stays where it is
         // 2. if insn is in a constant span, it is after other insns, except those that are in a later constant span
         // 3. within a single constant span the order is preserver
-        self.insns.sort_by(|(_, _, index_a), (_, _, index_b)| {
+        self.insns.sort_by(|(_, index_a), (_, index_b)| {
             let a_span = self
                 .constant_spans
                 .iter()
@@ -414,21 +473,49 @@ impl ProgramBuilder {
                 let new_offset = self
                     .insns
                     .iter()
-                    .position(|(_, _, index)| *old_offset == *index as u32)
+                    .position(|(_, index)| *old_offset == *index as u32)
                     .unwrap() as u32;
                 *resolved_offset = Some((new_offset, *target));
             }
         }
 
         // Fix comments to refer to new locations
-        if let Some(comments) = &mut self.comments {
-            for (old_offset, _) in comments.iter_mut() {
-                let new_offset = self
-                    .insns
-                    .iter()
-                    .position(|(_, _, index)| *old_offset == *index as u32)
-                    .expect("comment must exist") as u32;
-                *old_offset = new_offset;
+        for (old_offset, _) in self.comments.iter_mut() {
+            let new_offset = self
+                .insns
+                .iter()
+                .position(|(_, index)| *old_offset == *index as u32)
+                .expect("comment must exist") as u32;
+            *old_offset = new_offset;
+        }
+
+        if let QueryMode::ExplainQueryPlan = self.query_mode {
+            self.current_parent_explain_idx =
+                if let Some(old_parent) = self.current_parent_explain_idx {
+                    self.insns
+                        .iter()
+                        .position(|(_, index)| old_parent == *index)
+                } else {
+                    None
+                };
+
+            for i in 0..self.insns.len() {
+                let (Insn::Explain { p2, .. }, _) = &self.insns[i] else {
+                    continue;
+                };
+
+                let new_p2 = if p2.is_some() {
+                    self.insns.iter().position(|(_, index)| *p2 == Some(*index))
+                } else {
+                    None
+                };
+
+                let (Insn::Explain { p1, p2, .. }, _) = &mut self.insns[i] else {
+                    unreachable!();
+                };
+
+                *p1 = i;
+                *p2 = new_p2;
             }
         }
     }
@@ -504,7 +591,7 @@ impl ProgramBuilder {
                 );
             }
         };
-        for (insn, _, _) in self.insns.iter_mut() {
+        for (insn, _) in self.insns.iter_mut() {
             match insn {
                 Insn::Init { target_pc } => {
                     resolve(target_pc, "Init");
@@ -751,26 +838,44 @@ impl ProgramBuilder {
         }
     }
 
-    /// Clean up and finalize the program, resolving any remaining labels
-    /// Note that although these are the final instructions, typically an SQLite
-    /// query will jump to the Transaction instruction via init_label.
-    pub fn epilogue(&mut self, txn_mode: TransactionMode) {
-        self.epilogue_maybe_rollback(txn_mode, false);
+    /// Tries to mirror: https://github.com/sqlite/sqlite/blob/e77e589a35862f6ac9c4141cfd1beb2844b84c61/src/build.c#L5379
+    /// TODO: as we currently do not support multiple dbs
+    /// this function just sets a write operation/transaction for the current db
+    pub fn begin_write_operation(&mut self) {
+        self.txn_mode = TransactionMode::Write;
+    }
+
+    pub fn begin_read_operation(&mut self) {
+        // Just override the transaction mode when it is None
+        if matches!(self.txn_mode, TransactionMode::None) {
+            self.txn_mode = TransactionMode::Read;
+        }
+    }
+
+    pub fn begin_concurrent_operation(&mut self) {
+        self.txn_mode = TransactionMode::Concurrent;
+    }
+
+    /// Indicates the rollback behvaiour for the halt instruction in epilogue
+    pub fn rollback(&mut self) {
+        self.rollback = true;
     }
 
     /// Clean up and finalize the program, resolving any remaining labels
     /// Note that although these are the final instructions, typically an SQLite
     /// query will jump to the Transaction instruction via init_label.
-    /// "rollback" flag is used to determine if halt should rollback the transaction.
-    pub fn epilogue_maybe_rollback(&mut self, txn_mode: TransactionMode, rollback: bool) {
+    pub fn epilogue(&mut self, schema: &Schema) {
         if self.nested_level == 0 {
-            self.emit_halt(rollback);
+            // "rollback" flag is used to determine if halt should rollback the transaction.
+            self.emit_halt(self.rollback);
             self.preassign_label_to_next_insn(self.init_label);
 
-            match txn_mode {
-                TransactionMode::Read => self.emit_insn(Insn::Transaction { write: false }),
-                TransactionMode::Write => self.emit_insn(Insn::Transaction { write: true }),
-                TransactionMode::None => {}
+            if !matches!(self.txn_mode, TransactionMode::None) {
+                self.emit_insn(Insn::Transaction {
+                    db: 0,
+                    tx_mode: self.txn_mode,
+                    schema_cookie: schema.schema_version,
+                });
             }
 
             self.emit_constant_insns();
@@ -817,7 +922,27 @@ impl ProgramBuilder {
         self.preassign_label_to_next_insn(loop_end);
     }
 
-    pub fn emit_column(&mut self, cursor_id: CursorID, column: usize, out: usize) {
+    pub fn emit_column_or_rowid(&mut self, cursor_id: CursorID, column: usize, out: usize) {
+        let (_, cursor_type) = self.cursor_ref.get(cursor_id).unwrap();
+        if let CursorType::BTreeTable(btree) = cursor_type {
+            let column_def = btree
+                .columns
+                .get(column)
+                .expect("column index out of bounds");
+            if column_def.is_rowid_alias {
+                self.emit_insn(Insn::RowId {
+                    cursor_id,
+                    dest: out,
+                });
+            } else {
+                self.emit_column(cursor_id, column, out);
+            }
+        } else {
+            self.emit_column(cursor_id, column, out);
+        }
+    }
+
+    fn emit_column(&mut self, cursor_id: CursorID, column: usize, out: usize) {
         let (_, cursor_type) = self.cursor_ref.get(cursor_id).unwrap();
 
         use crate::translate::expr::sanitize_string;
@@ -826,10 +951,11 @@ impl ProgramBuilder {
             let default = match cursor_type {
                 CursorType::BTreeTable(btree) => &btree.columns[column].default,
                 CursorType::BTreeIndex(index) => &index.columns[column].default,
+                CursorType::MaterializedView(btree, _) => &btree.columns[column].default,
                 _ => break 'value None,
             };
 
-            let Some(ast::Expr::Literal(ref literal)) = default else {
+            let Some(ast::Expr::Literal(ref literal)) = default.as_ref().map(|v| v.as_ref()) else {
                 break 'value None;
             };
 
@@ -865,17 +991,13 @@ impl ProgramBuilder {
         });
     }
 
-    pub fn build(mut self, connection: Arc<Connection>, change_cnt_on: bool) -> Program {
+    pub fn build(mut self, connection: Arc<Connection>, change_cnt_on: bool, sql: &str) -> Program {
         self.resolve_labels();
 
         self.parameters.list.dedup();
         Program {
             max_registers: self.next_free_register,
-            insns: self
-                .insns
-                .into_iter()
-                .map(|(insn, function, _)| (insn, function))
-                .collect(),
+            insns: self.insns,
             cursor_ref: self.cursor_ref,
             comments: self.comments,
             connection,
@@ -884,6 +1006,8 @@ impl ProgramBuilder {
             change_cnt_on,
             result_columns: self.result_columns,
             table_references: self.table_references,
+            sql: sql.to_string(),
+            accesses_db: !matches!(self.txn_mode, TransactionMode::None),
         }
     }
 }

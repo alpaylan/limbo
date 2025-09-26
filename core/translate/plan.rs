@@ -1,10 +1,9 @@
-use std::{cell::Cell, cmp::Ordering, rc::Rc, sync::Arc};
-use turso_ext::{ConstraintInfo, ConstraintOp};
-use turso_sqlite3_parser::ast::{self, SortOrder};
+use std::{cmp::Ordering, sync::Arc};
+use turso_parser::ast::{self, FrameBound, FrameClause, FrameExclude, FrameMode, SortOrder};
 
 use crate::{
     function::AggFunc,
-    schema::{BTreeTable, Column, FromClauseSubquery, Index, Table},
+    schema::{BTreeTable, Column, FromClauseSubquery, Index, Schema, Table},
     vdbe::{
         builder::{CursorKey, CursorType, ProgramBuilder},
         insn::{IdxInsertFlags, Insn},
@@ -12,9 +11,9 @@ use crate::{
     },
     Result, VirtualTable,
 };
-use crate::{schema::Type, types::SeekOp, util::can_pushdown_predicate};
+use crate::{schema::Type, types::SeekOp};
 
-use turso_sqlite3_parser::ast::TableInternalId;
+use turso_parser::ast::TableInternalId;
 
 use super::{emitter::OperationMode, planner::determine_where_to_eval_term};
 
@@ -85,16 +84,12 @@ pub struct WhereTerm {
     /// A term may have been consumed e.g. if:
     /// - it has been converted into a constraint in a seek key
     /// - it has been removed due to being trivially true or false
-    ///
-    /// FIXME: this can be made into a simple `bool` once we move the virtual table constraint resolution
-    /// code out of `init_loop()`, because that's the only place that requires a mutable reference to the where clause
-    /// that causes problems to other code that needs immutable references to the where clause.
-    pub consumed: Cell<bool>,
+    pub consumed: bool,
 }
 
 impl WhereTerm {
     pub fn should_eval_before_loop(&self, join_order: &[JoinOrderMember]) -> bool {
-        if self.consumed.get() {
+        if self.consumed {
             return false;
         }
         let Ok(eval_at) = self.eval_at(join_order) else {
@@ -104,7 +99,7 @@ impl WhereTerm {
     }
 
     pub fn should_eval_at_loop(&self, loop_idx: usize, join_order: &[JoinOrderMember]) -> bool {
-        if self.consumed.get() {
+        if self.consumed {
             return false;
         }
         let Ok(eval_at) = self.eval_at(join_order) else {
@@ -118,142 +113,19 @@ impl WhereTerm {
     }
 }
 
-use crate::ast::{Expr, Operator};
-
-// This function takes an operator and returns the operator you would obtain if the operands were swapped.
-// e.g. "literal < column"
-// which is not the canonical order for constraint pushdown.
-// This function will return > so that the expression can be treated as if it were written "column > literal"
-fn reverse_operator(op: &Operator) -> Option<Operator> {
-    match op {
-        Operator::Equals => Some(Operator::Equals),
-        Operator::Less => Some(Operator::Greater),
-        Operator::LessEquals => Some(Operator::GreaterEquals),
-        Operator::Greater => Some(Operator::Less),
-        Operator::GreaterEquals => Some(Operator::LessEquals),
-        Operator::NotEquals => Some(Operator::NotEquals),
-        Operator::Is => Some(Operator::Is),
-        Operator::IsNot => Some(Operator::IsNot),
-        _ => None,
+impl From<Expr> for WhereTerm {
+    fn from(value: Expr) -> Self {
+        Self {
+            expr: value,
+            from_outer_join: None,
+            consumed: false,
+        }
     }
 }
 
-fn to_ext_constraint_op(op: &Operator) -> Option<ConstraintOp> {
-    match op {
-        Operator::Equals => Some(ConstraintOp::Eq),
-        Operator::Less => Some(ConstraintOp::Lt),
-        Operator::LessEquals => Some(ConstraintOp::Le),
-        Operator::Greater => Some(ConstraintOp::Gt),
-        Operator::GreaterEquals => Some(ConstraintOp::Ge),
-        Operator::NotEquals => Some(ConstraintOp::Ne),
-        _ => None,
-    }
-}
+use crate::ast::Expr;
+use crate::util::exprs_are_equivalent;
 
-/// This function takes a WhereTerm for a select involving a VTab at index 'table_index'.
-/// It determines whether or not it involves the given table and whether or not it can
-/// be converted into a ConstraintInfo which can be passed to the vtab module's xBestIndex
-/// method, which will possibly calculate some information to improve the query plan, that we can send
-/// back to it as arguments for the VFilter operation.
-/// is going to be filtered against: e.g:
-/// 'SELECT key, value FROM vtab WHERE key = 'some_key';
-/// we need to send the Value('some_key') as an argument to VFilter, and possibly omit it from
-/// the filtration in the vdbe layer.
-pub fn convert_where_to_vtab_constraint(
-    term: &WhereTerm,
-    table_idx: usize,
-    pred_idx: usize,
-    join_order: &[JoinOrderMember],
-) -> Result<Option<ConstraintInfo>> {
-    if term.from_outer_join.is_some() {
-        return Ok(None);
-    }
-    let Expr::Binary(lhs, op, rhs) = &term.expr else {
-        return Ok(None);
-    };
-    let expr_is_ready =
-        |e: &Expr| -> Result<bool> { can_pushdown_predicate(e, table_idx, join_order) };
-    let (vcol_idx, op_for_vtab, usable, is_rhs) = match (&**lhs, &**rhs) {
-        (
-            Expr::Column {
-                table: tbl_l,
-                column: col_l,
-                ..
-            },
-            Expr::Column {
-                table: tbl_r,
-                column: col_r,
-                ..
-            },
-        ) => {
-            // one side must be the virtual table
-            let tbl_l_idx = join_order
-                .iter()
-                .position(|j| j.table_id == *tbl_l)
-                .unwrap();
-            let tbl_r_idx = join_order
-                .iter()
-                .position(|j| j.table_id == *tbl_r)
-                .unwrap();
-            let vtab_on_l = tbl_l_idx == table_idx;
-            let vtab_on_r = tbl_r_idx == table_idx;
-            if vtab_on_l == vtab_on_r {
-                return Ok(None); // either both or none -> not convertible
-            }
-
-            if vtab_on_l {
-                // vtab on left side: operator unchanged
-                let usable = tbl_r_idx < table_idx; // usable if the other table is already positioned
-                (col_l, op, usable, false)
-            } else {
-                // vtab on right side of the expr: reverse operator
-                let usable = tbl_l_idx < table_idx;
-                (col_r, &reverse_operator(op).unwrap_or(*op), usable, true)
-            }
-        }
-        (Expr::Column { table, column, .. }, other)
-            if join_order
-                .iter()
-                .position(|j| j.table_id == *table)
-                .unwrap()
-                == table_idx =>
-        {
-            (
-                column,
-                op,
-                expr_is_ready(other)?, // literal / earlier‑table / deterministic func ?
-                false,
-            )
-        }
-        (other, Expr::Column { table, column, .. })
-            if join_order
-                .iter()
-                .position(|j| j.table_id == *table)
-                .unwrap()
-                == table_idx =>
-        {
-            (
-                column,
-                &reverse_operator(op).unwrap_or(*op),
-                expr_is_ready(other)?,
-                true,
-            )
-        }
-
-        _ => return Ok(None), // does not involve the virtual table at all
-    };
-
-    let Some(op) = to_ext_constraint_op(op_for_vtab) else {
-        return Ok(None);
-    };
-
-    Ok(Some(ConstraintInfo {
-        column_index: *vcol_idx as u32,
-        op,
-        usable,
-        plan_info: ConstraintInfo::pack_plan_info(pred_idx as u32, is_rhs),
-    }))
-}
 /// The loop index where to evaluate the condition.
 /// For example, in `SELECT * FROM u JOIN p WHERE u.id = 5`, the condition can already be evaluated at the first loop (idx 0),
 /// because that is the rightmost table that it references.
@@ -293,8 +165,8 @@ pub enum Plan {
     CompoundSelect {
         left: Vec<(SelectPlan, ast::CompoundOperator)>,
         right_most: SelectPlan,
-        limit: Option<isize>,
-        offset: Option<isize>,
+        limit: Option<Box<Expr>>,
+        offset: Option<Box<Expr>>,
         order_by: Option<Vec<(ast::Expr, SortOrder)>>,
     },
     Delete(DeletePlan),
@@ -333,8 +205,17 @@ pub enum QueryDestination {
         /// The cursor ID of the ephemeral table that will be used to store the results.
         cursor_id: CursorID,
         /// The table that will be used to store the results.
-        table: Rc<BTreeTable>,
+        table: Arc<BTreeTable>,
     },
+}
+
+impl QueryDestination {
+    pub fn placeholder_for_subquery() -> Self {
+        QueryDestination::CoroutineYield {
+            yield_reg: usize::MAX, // will be set later in bytecode emission
+            coroutine_implementation_start: BranchOffset::Placeholder, // will be set later in bytecode emission
+        }
+    }
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -403,6 +284,7 @@ impl DistinctCtx {
             count: num_regs,
             dest_reg: record_reg,
             index_name: Some(self.ephemeral_index_name.to_string()),
+            affinity_str: None,
         });
         program.emit_insn(Insn::IdxInsert {
             cursor_id: self.cursor_id,
@@ -427,13 +309,13 @@ pub struct SelectPlan {
     /// group by clause
     pub group_by: Option<GroupBy>,
     /// order by clause
-    pub order_by: Option<Vec<(ast::Expr, SortOrder)>>,
+    pub order_by: Vec<(Box<ast::Expr>, SortOrder)>,
     /// all the aggregates collected from the result columns, order by, and (TODO) having clauses
     pub aggregates: Vec<Aggregate>,
     /// limit clause
-    pub limit: Option<isize>,
+    pub limit: Option<Box<Expr>>,
     /// offset clause
-    pub offset: Option<isize>,
+    pub offset: Option<Box<Expr>>,
     /// query contains a constant condition that is always false
     pub contains_constant_false_condition: bool,
     /// the destination of the resulting rows from this plan.
@@ -442,6 +324,9 @@ pub struct SelectPlan {
     pub distinctness: Distinctness,
     /// values: https://sqlite.org/syntax/select-core.html
     pub values: Vec<Vec<Expr>>,
+    /// The window definition and all window functions associated with it. There is at most one
+    /// window per SELECT. If the original query contains more, they are pushed down into subqueries.
+    pub window: Option<Window>,
 }
 
 impl SelectPlan {
@@ -464,7 +349,7 @@ impl SelectPlan {
                 QueryDestination::CoroutineYield { .. }
             )
             || self.table_references.joined_tables().len() != 1
-            || self.table_references.outer_query_refs().is_empty()
+            || !self.table_references.outer_query_refs().is_empty()
             || self.result_columns.len() != 1
             || self.group_by.is_some()
             || self.contains_constant_false_condition
@@ -481,16 +366,22 @@ impl SelectPlan {
             return false;
         }
 
-        let count = turso_sqlite3_parser::ast::Expr::FunctionCall {
-            name: turso_sqlite3_parser::ast::Id("count".to_string()),
+        let count = ast::Expr::FunctionCall {
+            name: ast::Name::Ident("count".to_string()),
             distinctness: None,
-            args: None,
-            order_by: None,
-            filter_over: None,
+            args: vec![],
+            order_by: vec![],
+            filter_over: ast::FunctionTail {
+                filter_clause: None,
+                over_clause: None,
+            },
         };
-        let count_star = turso_sqlite3_parser::ast::Expr::FunctionCallStar {
-            name: turso_sqlite3_parser::ast::Id("count".to_string()),
-            filter_over: None,
+        let count_star = ast::Expr::FunctionCallStar {
+            name: ast::Name::Ident("count".to_string()),
+            filter_over: ast::FunctionTail {
+                filter_clause: None,
+                over_clause: None,
+            },
         };
         let result_col_expr = &self.result_columns.first().unwrap().expr;
         if *result_col_expr != count && *result_col_expr != count_star {
@@ -509,11 +400,11 @@ pub struct DeletePlan {
     /// where clause split into a vec at 'AND' boundaries.
     pub where_clause: Vec<WhereTerm>,
     /// order by clause
-    pub order_by: Option<Vec<(ast::Expr, SortOrder)>>,
+    pub order_by: Vec<(Box<ast::Expr>, SortOrder)>,
     /// limit clause
-    pub limit: Option<isize>,
+    pub limit: Option<Box<Expr>>,
     /// offset clause
-    pub offset: Option<isize>,
+    pub offset: Option<Box<Expr>>,
     /// query contains a constant condition that is always false
     pub contains_constant_false_condition: bool,
     /// Indexes that must be updated by the delete operation.
@@ -524,11 +415,11 @@ pub struct DeletePlan {
 pub struct UpdatePlan {
     pub table_references: TableReferences,
     // (colum index, new value) pairs
-    pub set_clauses: Vec<(usize, ast::Expr)>,
+    pub set_clauses: Vec<(usize, Box<ast::Expr>)>,
     pub where_clause: Vec<WhereTerm>,
-    pub order_by: Option<Vec<(ast::Expr, SortOrder)>>,
-    pub limit: Option<isize>,
-    pub offset: Option<isize>,
+    pub order_by: Vec<(Box<ast::Expr>, SortOrder)>,
+    pub limit: Option<Box<Expr>>,
+    pub offset: Option<Box<Expr>>,
     // TODO: optional RETURNING clause
     pub returning: Option<Vec<ResultSetColumn>>,
     // whether the WHERE clause is always false
@@ -536,6 +427,9 @@ pub struct UpdatePlan {
     pub indexes_to_update: Vec<Arc<Index>>,
     // If the table's rowid alias is used, gather all the target rowids into an ephemeral table, and then use that table as the single JoinedTable for the actual UPDATE loop.
     pub ephemeral_plan: Option<SelectPlan>,
+    // For ALTER TABLE turso-db emits appropriate DDL statement in the "updates" cell of CDC table
+    // This field is present only for update plan created for ALTER TABLE when CDC mode has "updates" values
+    pub cdc_update_alter_statement: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -546,10 +440,6 @@ pub enum IterationDirection {
 
 pub fn select_star(tables: &[JoinedTable], out_columns: &mut Vec<ResultSetColumn>) {
     for table in tables.iter() {
-        let maybe_using_cols = table
-            .join_info
-            .as_ref()
-            .and_then(|join_info| join_info.using.as_ref());
         out_columns.extend(
             table
                 .columns()
@@ -559,11 +449,11 @@ pub fn select_star(tables: &[JoinedTable], out_columns: &mut Vec<ResultSetColumn
                 .filter(|(_, col)| {
                     // If we are joining with USING, we need to deduplicate the columns from the right table
                     // that are also present in the USING clause.
-                    if let Some(using_cols) = maybe_using_cols {
-                        !using_cols.iter().any(|using_col| {
+                    if let Some(join_info) = &table.join_info {
+                        !join_info.using.iter().any(|using_col| {
                             col.name
                                 .as_ref()
-                                .is_some_and(|name| name.eq_ignore_ascii_case(&using_col.0))
+                                .is_some_and(|name| name.eq_ignore_ascii_case(using_col.as_str()))
                         })
                     } else {
                         true
@@ -589,7 +479,7 @@ pub struct JoinInfo {
     /// Whether this is an OUTER JOIN.
     pub outer: bool,
     /// The USING clause for the join, if any. NATURAL JOIN is transformed into USING (col1, col2, ...).
-    pub using: Option<ast::DistinctNames>,
+    pub using: Vec<ast::Name>,
 }
 
 /// A joined table in the query plan.
@@ -617,6 +507,8 @@ pub struct JoinedTable {
     /// Bitmask of columns that are referenced in the query.
     /// Used to decide whether a covering index can be used.
     pub col_used_mask: ColumnUsedMask,
+    /// The index of the database. "main" is always zero.
+    pub database_id: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -684,6 +576,16 @@ impl TableReferences {
             joined_tables,
             outer_query_refs,
         }
+    }
+    pub fn new_empty() -> Self {
+        Self {
+            joined_tables: Vec::new(),
+            outer_query_refs: Vec::new(),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.joined_tables.is_empty() && self.outer_query_refs.is_empty()
     }
 
     /// Add a new [JoinedTable] to the query plan.
@@ -861,12 +763,7 @@ impl ColumnUsedMask {
 pub enum Operation {
     // Scan operation
     // This operation is used to scan a table.
-    // The iter_dir is used to indicate the direction of the iterator.
-    Scan {
-        iter_dir: IterationDirection,
-        /// The index that we are using to scan the table, if any.
-        index: Option<Arc<Index>>,
-    },
+    Scan(Scan),
     // Search operation
     // This operation is used to search for a row in a table using an index
     // (i.e. a primary key or a secondary index)
@@ -874,24 +771,53 @@ pub enum Operation {
 }
 
 impl Operation {
+    pub fn default_scan_for(table: &Table) -> Self {
+        match table {
+            Table::BTree(_) => Operation::Scan(Scan::BTreeTable {
+                iter_dir: IterationDirection::Forwards,
+                index: None,
+            }),
+            Table::Virtual(_) => Operation::Scan(Scan::VirtualTable {
+                idx_num: -1,
+                idx_str: None,
+                constraints: Vec::new(),
+            }),
+            Table::FromClauseSubquery(_) => Operation::Scan(Scan::Subquery),
+        }
+    }
+
     pub fn index(&self) -> Option<&Arc<Index>> {
         match self {
-            Operation::Scan { index, .. } => index.as_ref(),
+            Operation::Scan(Scan::BTreeTable { index, .. }) => index.as_ref(),
+            Operation::Scan(_) => None,
             Operation::Search(Search::RowidEq { .. }) => None,
             Operation::Search(Search::Seek { index, .. }) => index.as_ref(),
+        }
+    }
+
+    pub fn returns_max_1_row(&self) -> bool {
+        match self {
+            Operation::Scan(_) => false,
+            Operation::Search(Search::RowidEq { .. }) => true,
+            Operation::Search(Search::Seek { index, seek_def }) => {
+                let Some(index) = index else {
+                    return false;
+                };
+                index.unique && seek_def.seek.as_ref().is_some_and(|seek| seek.op.eq_only())
+            }
         }
     }
 }
 
 impl JoinedTable {
     /// Returns the btree table for this table reference, if it is a BTreeTable.
-    pub fn btree(&self) -> Option<Rc<BTreeTable>> {
+    pub fn btree(&self) -> Option<Arc<BTreeTable>> {
         match &self.table {
             Table::BTree(_) => self.table.btree(),
             _ => None,
         }
     }
-    pub fn virtual_table(&self) -> Option<Rc<VirtualTable>> {
+    pub fn virtual_table(&self) -> Option<Arc<VirtualTable>> {
         match &self.table {
             Table::Virtual(_) => self.table.virtual_table(),
             _ => None,
@@ -929,15 +855,13 @@ impl JoinedTable {
             result_columns_start_reg: None,
         });
         Self {
-            op: Operation::Scan {
-                iter_dir: IterationDirection::Forwards,
-                index: None,
-            },
+            op: Operation::default_scan_for(&table),
             table,
             identifier,
             internal_id,
             join_info,
             col_used_mask: ColumnUsedMask::default(),
+            database_id: 0,
         }
     }
 
@@ -958,6 +882,7 @@ impl JoinedTable {
         &self,
         program: &mut ProgramBuilder,
         mode: OperationMode,
+        schema: &Schema,
     ) -> Result<(Option<CursorID>, Option<CursorID>)> {
         let index = self.op.index();
         match &self.table {
@@ -969,10 +894,17 @@ impl JoinedTable {
                 let table_cursor_id = if table_not_required {
                     None
                 } else {
-                    Some(program.alloc_cursor_id_keyed(
-                        CursorKey::table(self.internal_id),
-                        CursorType::BTreeTable(btree.clone()),
-                    ))
+                    // Check if this is a materialized view
+                    let cursor_type =
+                        if let Some(view_mutex) = schema.get_materialized_view(&btree.name) {
+                            CursorType::MaterializedView(btree.clone(), view_mutex)
+                        } else {
+                            CursorType::BTreeTable(btree.clone())
+                        };
+                    Some(
+                        program
+                            .alloc_cursor_id_keyed(CursorKey::table(self.internal_id), cursor_type),
+                    )
                 };
                 let index_cursor_id = index.map(|index| {
                     program.alloc_cursor_id_keyed(
@@ -1107,6 +1039,30 @@ pub struct TerminationKey {
     pub op: SeekOp,
 }
 
+/// Represents the type of table scan performed during query execution.
+#[derive(Clone, Debug)]
+pub enum Scan {
+    /// A scan of a B-tree–backed table, optionally using an index, and with an iteration direction.
+    BTreeTable {
+        /// The iter_dir is used to indicate the direction of the iterator.
+        iter_dir: IterationDirection,
+        /// The index that we are using to scan the table, if any.
+        index: Option<Arc<Index>>,
+    },
+    /// A scan of a virtual table, delegated to the table’s `filter` and related methods.
+    VirtualTable {
+        /// Index identifier returned by the table's `best_index` method.
+        idx_num: i32,
+        /// Optional index name returned by the table’s `best_index` method.
+        idx_str: Option<String>,
+        /// Constraining expressions to be passed to the table’s `filter` method.
+        /// The order of expressions matches the argument order expected by the virtual table.
+        constraints: Vec<Expr>,
+    },
+    /// A scan of a subquery in the `FROM` clause.
+    Subquery,
+}
+
 /// An enum that represents a search operation that can be used to search for a row in a table using an index
 /// (i.e. a primary key or a secondary index)
 #[allow(clippy::enum_variant_names)]
@@ -1130,7 +1086,125 @@ pub struct Aggregate {
 }
 
 impl Aggregate {
+    pub fn new(func: AggFunc, args: &[Box<Expr>], expr: &Expr, distinctness: Distinctness) -> Self {
+        Aggregate {
+            func,
+            args: args.iter().map(|arg| *arg.clone()).collect(),
+            original_expr: expr.clone(),
+            distinctness,
+        }
+    }
+
     pub fn is_distinct(&self) -> bool {
         self.distinctness.is_distinct()
     }
+}
+
+/// Represents the window definition and all window functions associated with a single SELECT.
+#[derive(Debug, Clone)]
+pub struct Window {
+    /// The window name, either provided in the original statement or synthetically generated by
+    /// the planner. This is optional because it can be assigned at different stages of query
+    /// processing, but it should eventually always be set.
+    pub name: Option<String>,
+    /// Expressions from the PARTITION BY clause.
+    pub partition_by: Vec<Expr>,
+    /// The number of unique expressions in the PARTITION BY clause. This determines how many of
+    /// the leftmost columns in the subquery output make up the partition key.
+    pub deduplicated_partition_by_len: Option<usize>,
+    /// Expressions from the ORDER BY clause.
+    pub order_by: Vec<(Expr, SortOrder)>,
+    /// All window functions associated with this window.
+    pub functions: Vec<WindowFunction>,
+}
+
+impl Window {
+    const DEFAULT_SORT_ORDER: SortOrder = SortOrder::Asc;
+
+    pub fn new(name: Option<String>, ast: &ast::Window) -> Result<Self> {
+        if !Self::is_default_frame_spec(&ast.frame_clause) {
+            crate::bail_parse_error!("Custom frame specifications are not supported yet");
+        }
+
+        Ok(Window {
+            name,
+            partition_by: ast.partition_by.iter().map(|arg| *arg.clone()).collect(),
+            deduplicated_partition_by_len: None,
+            order_by: ast
+                .order_by
+                .iter()
+                .map(|col| {
+                    (
+                        *col.expr.clone(),
+                        col.order.unwrap_or(Self::DEFAULT_SORT_ORDER),
+                    )
+                })
+                .collect(),
+            functions: vec![],
+        })
+    }
+
+    pub fn is_equivalent(&self, ast: &ast::Window) -> bool {
+        if !Self::is_default_frame_spec(&ast.frame_clause) {
+            return false;
+        }
+
+        if self.partition_by.len() != ast.partition_by.len() {
+            return false;
+        }
+        if !self
+            .partition_by
+            .iter()
+            .zip(&ast.partition_by)
+            .all(|(a, b)| exprs_are_equivalent(a, b))
+        {
+            return false;
+        }
+
+        if self.order_by.len() != ast.order_by.len() {
+            return false;
+        }
+        self.order_by
+            .iter()
+            .zip(&ast.order_by)
+            .all(|((expr_a, order_a), col_b)| {
+                exprs_are_equivalent(expr_a, &col_b.expr)
+                    && *order_a == col_b.order.unwrap_or(Self::DEFAULT_SORT_ORDER)
+            })
+    }
+
+    fn is_default_frame_spec(frame: &Option<FrameClause>) -> bool {
+        if let Some(frame_clause) = frame {
+            let FrameClause {
+                mode,
+                start,
+                end,
+                exclude,
+            } = frame_clause;
+            if *mode != FrameMode::Range {
+                return false;
+            }
+            if *start != FrameBound::UnboundedPreceding {
+                return false;
+            }
+            if *end != Some(FrameBound::CurrentRow) {
+                return false;
+            }
+            if let Some(exclude) = exclude {
+                if *exclude != FrameExclude::NoOthers {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct WindowFunction {
+    /// The resolved function. Currently, only regular aggregate functions are supported.
+    /// In the future, more specialized window functions such as `RANK()`, `ROW_NUMBER()`, etc. will be added.
+    pub func: AggFunc,
+    /// The expression from which the function was resolved.
+    pub original_expr: Expr,
 }

@@ -2,8 +2,8 @@ use crate::{Connection, LimboError, Statement, StepResult, Value};
 use bitflags::bitflags;
 use std::sync::Arc;
 use strum::IntoEnumIterator;
-use turso_ext::{ConstraintInfo, ConstraintOp, ConstraintUsage, IndexInfo};
-use turso_sqlite3_parser::ast::PragmaName;
+use turso_ext::{ConstraintInfo, ConstraintOp, ConstraintUsage, IndexInfo, ResultCode};
+use turso_parser::ast::PragmaName;
 
 bitflags! {
     // Flag names match those used in SQLite:
@@ -35,12 +35,25 @@ pub fn pragma_for(pragma: &PragmaName) -> Pragma {
     use PragmaName::*;
 
     match pragma {
+        ApplicationId => Pragma::new(
+            PragmaFlags::NoColumns1 | PragmaFlags::Result0,
+            &["application_id"],
+        ),
         CacheSize => Pragma::new(
             PragmaFlags::NeedSchema
                 | PragmaFlags::Result0
                 | PragmaFlags::SchemaReq
                 | PragmaFlags::NoColumns1,
             &["cache_size"],
+        ),
+        DataSyncRetry => Pragma::new(
+            PragmaFlags::Result0 | PragmaFlags::NoColumns1,
+            &["data_sync_retry"],
+        ),
+        DatabaseList => Pragma::new(PragmaFlags::Result0, &["seq", "name", "file"]),
+        Encoding => Pragma::new(
+            PragmaFlags::Result0 | PragmaFlags::NoColumns1,
+            &["encoding"],
         ),
         JournalMode => Pragma::new(
             PragmaFlags::NeedSchema | PragmaFlags::Result0 | PragmaFlags::SchemaReq,
@@ -49,6 +62,10 @@ pub fn pragma_for(pragma: &PragmaName) -> Pragma {
         LegacyFileFormat => {
             unreachable!("pragma_for() called with LegacyFileFormat, which is unsupported")
         }
+        ModuleList => Pragma::new(
+            PragmaFlags::NeedSchema | PragmaFlags::Result0 | PragmaFlags::SchemaReq,
+            &["module_list"],
+        ),
         PageCount => Pragma::new(
             PragmaFlags::NeedSchema | PragmaFlags::Result0 | PragmaFlags::SchemaReq,
             &["page_count"],
@@ -57,9 +74,20 @@ pub fn pragma_for(pragma: &PragmaName) -> Pragma {
             PragmaFlags::Result0 | PragmaFlags::SchemaReq | PragmaFlags::NoColumns1,
             &["page_size"],
         ),
+        MaxPageCount => Pragma::new(
+            PragmaFlags::NeedSchema
+                | PragmaFlags::Result0
+                | PragmaFlags::SchemaReq
+                | PragmaFlags::NoColumns1,
+            &["max_page_count"],
+        ),
         SchemaVersion => Pragma::new(
             PragmaFlags::NoColumns1 | PragmaFlags::Result0,
             &["schema_version"],
+        ),
+        Synchronous => Pragma::new(
+            PragmaFlags::NoColumns1 | PragmaFlags::Result0,
+            &["synchronous"],
         ),
         TableInfo => Pragma::new(
             PragmaFlags::NeedSchema | PragmaFlags::Result1 | PragmaFlags::SchemaOpt,
@@ -74,6 +102,10 @@ pub fn pragma_for(pragma: &PragmaName) -> Pragma {
             PragmaFlags::NoColumns1 | PragmaFlags::Result0,
             &["auto_vacuum"],
         ),
+        BusyTimeout => Pragma::new(
+            PragmaFlags::NoColumns1 | PragmaFlags::Result0,
+            &["busy_timeout"],
+        ),
         IntegrityCheck => Pragma::new(
             PragmaFlags::NeedSchema | PragmaFlags::ReadOnly | PragmaFlags::Result0,
             &["message"],
@@ -81,6 +113,19 @@ pub fn pragma_for(pragma: &PragmaName) -> Pragma {
         UnstableCaptureDataChangesConn => Pragma::new(
             PragmaFlags::NeedSchema | PragmaFlags::Result0 | PragmaFlags::SchemaReq,
             &["mode", "table"],
+        ),
+        QueryOnly => Pragma::new(
+            PragmaFlags::Result0 | PragmaFlags::NoColumns1,
+            &["query_only"],
+        ),
+        FreelistCount => Pragma::new(PragmaFlags::Result0, &["freelist_count"]),
+        EncryptionKey => Pragma::new(
+            PragmaFlags::Result0 | PragmaFlags::SchemaReq | PragmaFlags::NoColumns1,
+            &["hexkey"],
+        ),
+        EncryptionCipher => Pragma::new(
+            PragmaFlags::Result0 | PragmaFlags::SchemaReq | PragmaFlags::NoColumns1,
+            &["cipher"],
         ),
     }
 }
@@ -115,7 +160,7 @@ impl PragmaVirtualTable {
         let mut max_arg_count = 0;
         let mut has_pragma_arg = false;
 
-        let mut sql = String::from("CREATE TABLE x(");
+        let mut sql = String::from("CREATE TABLE x (");
         let col_defs = pragma
             .columns
             .iter()
@@ -161,17 +206,23 @@ impl PragmaVirtualTable {
         })
     }
 
-    pub(crate) fn best_index(&self, constraints: &[ConstraintInfo]) -> IndexInfo {
+    pub(crate) fn best_index(
+        &self,
+        constraints: &[ConstraintInfo],
+    ) -> Result<IndexInfo, ResultCode> {
         let mut arg0_idx = None;
         let mut arg1_idx = None;
 
         for (i, c) in constraints.iter().enumerate() {
-            if !c.usable || c.op != ConstraintOp::Eq {
+            if c.op != ConstraintOp::Eq {
                 continue;
             }
             let visible_count = self.visible_column_count as u32;
             if c.column_index < visible_count {
                 continue;
+            }
+            if !c.usable {
+                return Err(ResultCode::ConstraintViolation);
             }
             let hidden_idx = c.column_index - visible_count;
             match hidden_idx {
@@ -181,31 +232,31 @@ impl PragmaVirtualTable {
             }
         }
 
-        let mut argv_idx = 1;
+        let argv_arg0_idx = arg0_idx.map_or(0, |_| 1);
+        let argv_arg1_idx = arg1_idx.map_or(argv_arg0_idx, |_| argv_arg0_idx + 1);
+
         let constraint_usages = constraints
             .iter()
             .enumerate()
             .map(|(i, _)| {
-                if Some(i) == arg0_idx || Some(i) == arg1_idx {
-                    let usage = ConstraintUsage {
-                        argv_index: Some(argv_idx),
-                        omit: true,
-                    };
-                    argv_idx += 1;
-                    usage
+                let argv_index = if Some(i) == arg0_idx {
+                    Some(argv_arg0_idx)
+                } else if Some(i) == arg1_idx {
+                    Some(argv_arg1_idx)
                 } else {
-                    ConstraintUsage {
-                        argv_index: Some(0),
-                        omit: false,
-                    }
+                    None
+                };
+                ConstraintUsage {
+                    argv_index,
+                    omit: argv_index.is_some(),
                 }
             })
             .collect();
 
-        IndexInfo {
+        Ok(IndexInfo {
             constraint_usages,
             ..Default::default()
-        }
+        })
     }
 }
 
@@ -298,5 +349,151 @@ impl PragmaVirtualTableCursor {
         self.stmt = Some(self.conn.prepare(sql)?);
 
         self.next()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_best_index_argv_order_both_hidden_constraints() {
+        // Test when both hidden constraints are present (arg and schema)
+        let pragma_vtab = PragmaVirtualTable {
+            pragma_name: "table_info".to_string(),
+            visible_column_count: 6,
+            max_arg_count: 2,
+            has_pragma_arg: true,
+        };
+
+        let constraints = vec![
+            usable_constraint(6), // arg (first hidden column)
+            usable_constraint(7), // schema (second hidden column)
+        ];
+
+        let index_info = pragma_vtab.best_index(&constraints).unwrap();
+
+        // Verify arg gets argv_index 1, schema gets argv_index 2
+        assert_eq!(index_info.constraint_usages[0].argv_index, Some(1)); // arg
+        assert_eq!(index_info.constraint_usages[1].argv_index, Some(2)); // schema
+        assert!(index_info.constraint_usages[0].omit);
+        assert!(index_info.constraint_usages[1].omit);
+    }
+
+    #[test]
+    fn test_best_index_argv_order_only_arg() {
+        let pragma_vtab = PragmaVirtualTable {
+            pragma_name: "table_info".to_string(),
+            visible_column_count: 6,
+            max_arg_count: 2,
+            has_pragma_arg: true,
+        };
+
+        let constraints = vec![
+            usable_constraint(6), // arg (first hidden column)
+        ];
+
+        let index_info = pragma_vtab.best_index(&constraints).unwrap();
+
+        // Verify arg gets argv_index 1
+        assert_eq!(index_info.constraint_usages[0].argv_index, Some(1)); // arg
+        assert!(index_info.constraint_usages[0].omit);
+    }
+
+    #[test]
+    fn test_best_index_argv_order_only_schema() {
+        let pragma_vtab = PragmaVirtualTable {
+            pragma_name: "table_info".to_string(),
+            visible_column_count: 1,
+            max_arg_count: 1,
+            has_pragma_arg: false,
+        };
+
+        let constraints = vec![
+            usable_constraint(1), // schema (first hidden column after visible columns)
+        ];
+
+        let index_info = pragma_vtab.best_index(&constraints).unwrap();
+
+        // Verify schema gets argv_index 1
+        assert_eq!(index_info.constraint_usages[0].argv_index, Some(1)); // schema
+        assert!(index_info.constraint_usages[0].omit);
+    }
+
+    #[test]
+    fn test_best_index_argv_order_reverse_constraint_order() {
+        // Test when constraints are provided in reverse order (schema first, then arg)
+        let pragma_vtab = PragmaVirtualTable {
+            pragma_name: "table_info".to_string(),
+            visible_column_count: 6,
+            max_arg_count: 2,
+            has_pragma_arg: true,
+        };
+
+        let constraints = vec![
+            usable_constraint(7), // schema (second hidden column)
+            usable_constraint(6), // arg (first hidden column)
+        ];
+
+        let index_info = pragma_vtab.best_index(&constraints).unwrap();
+
+        // Verify arg still gets argv_index 1, schema gets argv_index 2 regardless of constraint order
+        assert_eq!(index_info.constraint_usages[0].argv_index, Some(2)); // schema
+        assert_eq!(index_info.constraint_usages[1].argv_index, Some(1)); // arg
+        assert!(index_info.constraint_usages[0].omit);
+        assert!(index_info.constraint_usages[1].omit);
+    }
+
+    #[test]
+    fn test_best_index_visible_columns_ignored() {
+        let pragma_vtab = PragmaVirtualTable {
+            pragma_name: "table_info".to_string(),
+            visible_column_count: 6,
+            max_arg_count: 2,
+            has_pragma_arg: true,
+        };
+
+        let constraints = vec![
+            usable_constraint(0), // visible column (cid)
+            usable_constraint(6), // arg (hidden)
+        ];
+
+        let index_info = pragma_vtab.best_index(&constraints).unwrap();
+
+        // Verify visible column constraint is ignored, arg gets argv_index 1
+        assert_eq!(index_info.constraint_usages[0].argv_index, None); // visible column
+        assert_eq!(index_info.constraint_usages[1].argv_index, Some(1)); // arg
+        assert!(!index_info.constraint_usages[0].omit); // visible column not omitted
+        assert!(index_info.constraint_usages[1].omit); // arg omitted
+    }
+
+    #[test]
+    fn test_best_index_no_usable_constraints() {
+        let pragma_vtab = PragmaVirtualTable {
+            pragma_name: "table_info".to_string(),
+            visible_column_count: 6,
+            max_arg_count: 2,
+            has_pragma_arg: true,
+        };
+
+        let constraints = vec![ConstraintInfo {
+            column_index: 6,
+            op: ConstraintOp::Eq,
+            usable: false,
+            index: 0,
+        }];
+
+        let result = pragma_vtab.best_index(&constraints);
+
+        assert!(matches!(result, Err(ResultCode::ConstraintViolation)));
+    }
+
+    fn usable_constraint(column_index: u32) -> ConstraintInfo {
+        ConstraintInfo {
+            column_index,
+            op: ConstraintOp::Eq,
+            usable: true,
+            index: 0,
+        }
     }
 }

@@ -1,7 +1,7 @@
 use crate::{types::Value, vdbe::Register};
 
 use super::{
-    convert_dbtype_to_jsonb, curry_convert_dbtype_to_jsonb, json_path_from_owned_value,
+    convert_dbtype_to_jsonb, curry_convert_dbtype_to_jsonb, json_path_from_db_value,
     json_string_to_db_type,
     jsonb::{DeleteOperation, InsertOperation, ReplaceOperation},
     Conv, JsonCacheCell, OutputVariant,
@@ -25,7 +25,7 @@ pub fn json_patch(target: &Value, patch: &Value, cache: &JsonCacheCell) -> crate
 
     target.patch(&patch)?;
 
-    let element_type = target.is_valid()?;
+    let element_type = target.element_type()?;
 
     json_string_to_db_type(target, element_type, OutputVariant::ElementType)
 }
@@ -43,7 +43,7 @@ pub fn jsonb_patch(target: &Value, patch: &Value, cache: &JsonCacheCell) -> crat
 
     target.patch(&patch)?;
 
-    let element_type = target.is_valid()?;
+    let element_type = target.element_type()?;
 
     json_string_to_db_type(target, element_type, OutputVariant::Binary)
 }
@@ -54,15 +54,15 @@ pub fn json_remove(args: &[Register], json_cache: &JsonCacheCell) -> crate::Resu
     }
 
     let make_jsonb_fn = curry_convert_dbtype_to_jsonb(Conv::Strict);
-    let mut json = json_cache.get_or_insert_with(args[0].get_owned_value(), make_jsonb_fn)?;
+    let mut json = json_cache.get_or_insert_with(args[0].get_value(), make_jsonb_fn)?;
     for arg in &args[1..] {
-        if let Some(path) = json_path_from_owned_value(arg.get_owned_value(), true)? {
+        if let Some(path) = json_path_from_db_value(arg.get_value(), true)? {
             let mut op = DeleteOperation::new();
             let _ = json.operate_on_path(&path, &mut op);
         }
     }
 
-    let el_type = json.is_valid()?;
+    let el_type = json.element_type()?;
 
     json_string_to_db_type(json, el_type, OutputVariant::String)
 }
@@ -73,9 +73,9 @@ pub fn jsonb_remove(args: &[Register], json_cache: &JsonCacheCell) -> crate::Res
     }
 
     let make_jsonb_fn = curry_convert_dbtype_to_jsonb(Conv::Strict);
-    let mut json = json_cache.get_or_insert_with(args[0].get_owned_value(), make_jsonb_fn)?;
+    let mut json = json_cache.get_or_insert_with(args[0].get_value(), make_jsonb_fn)?;
     for arg in &args[1..] {
-        if let Some(path) = json_path_from_owned_value(arg.get_owned_value(), true)? {
+        if let Some(path) = json_path_from_db_value(arg.get_value(), true)? {
             let mut op = DeleteOperation::new();
             let _ = json.operate_on_path(&path, &mut op);
         }
@@ -90,12 +90,12 @@ pub fn json_replace(args: &[Register], json_cache: &JsonCacheCell) -> crate::Res
     }
 
     let make_jsonb_fn = curry_convert_dbtype_to_jsonb(Conv::Strict);
-    let mut json = json_cache.get_or_insert_with(args[0].get_owned_value(), make_jsonb_fn)?;
+    let mut json = json_cache.get_or_insert_with(args[0].get_value(), make_jsonb_fn)?;
     let other = args[1..].chunks_exact(2);
     for chunk in other {
-        let path = json_path_from_owned_value(chunk[0].get_owned_value(), true)?;
+        let path = json_path_from_db_value(chunk[0].get_value(), true)?;
 
-        let value = convert_dbtype_to_jsonb(chunk[1].get_owned_value(), Conv::NotStrict)?;
+        let value = convert_dbtype_to_jsonb(chunk[1].get_value(), Conv::NotStrict)?;
         if let Some(path) = path {
             let mut op = ReplaceOperation::new(value);
 
@@ -103,7 +103,7 @@ pub fn json_replace(args: &[Register], json_cache: &JsonCacheCell) -> crate::Res
         }
     }
 
-    let el_type = json.is_valid()?;
+    let el_type = json.element_type()?;
 
     json_string_to_db_type(json, el_type, super::OutputVariant::String)
 }
@@ -114,11 +114,11 @@ pub fn jsonb_replace(args: &[Register], json_cache: &JsonCacheCell) -> crate::Re
     }
 
     let make_jsonb_fn = curry_convert_dbtype_to_jsonb(Conv::Strict);
-    let mut json = json_cache.get_or_insert_with(args[0].get_owned_value(), make_jsonb_fn)?;
+    let mut json = json_cache.get_or_insert_with(args[0].get_value(), make_jsonb_fn)?;
     let other = args[1..].chunks_exact(2);
     for chunk in other {
-        let path = json_path_from_owned_value(chunk[0].get_owned_value(), true)?;
-        let value = convert_dbtype_to_jsonb(chunk[1].get_owned_value(), Conv::NotStrict)?;
+        let path = json_path_from_db_value(chunk[0].get_value(), true)?;
+        let value = convert_dbtype_to_jsonb(chunk[1].get_value(), Conv::NotStrict)?;
         if let Some(path) = path {
             let mut op = ReplaceOperation::new(value);
 
@@ -126,7 +126,7 @@ pub fn jsonb_replace(args: &[Register], json_cache: &JsonCacheCell) -> crate::Re
         }
     }
 
-    let el_type = json.is_valid()?;
+    let el_type = json.element_type()?;
 
     json_string_to_db_type(json, el_type, OutputVariant::Binary)
 }
@@ -137,11 +137,11 @@ pub fn json_insert(args: &[Register], json_cache: &JsonCacheCell) -> crate::Resu
     }
 
     let make_jsonb_fn = curry_convert_dbtype_to_jsonb(Conv::Strict);
-    let mut json = json_cache.get_or_insert_with(args[0].get_owned_value(), make_jsonb_fn)?;
+    let mut json = json_cache.get_or_insert_with(args[0].get_value(), make_jsonb_fn)?;
     let other = args[1..].chunks_exact(2);
     for chunk in other {
-        let path = json_path_from_owned_value(chunk[0].get_owned_value(), true)?;
-        let value = convert_dbtype_to_jsonb(chunk[1].get_owned_value(), Conv::NotStrict)?;
+        let path = json_path_from_db_value(chunk[0].get_value(), true)?;
+        let value = convert_dbtype_to_jsonb(chunk[1].get_value(), Conv::NotStrict)?;
         if let Some(path) = path {
             let mut op = InsertOperation::new(value);
 
@@ -149,7 +149,7 @@ pub fn json_insert(args: &[Register], json_cache: &JsonCacheCell) -> crate::Resu
         }
     }
 
-    let el_type = json.is_valid()?;
+    let el_type = json.element_type()?;
 
     json_string_to_db_type(json, el_type, OutputVariant::String)
 }
@@ -160,11 +160,11 @@ pub fn jsonb_insert(args: &[Register], json_cache: &JsonCacheCell) -> crate::Res
     }
 
     let make_jsonb_fn = curry_convert_dbtype_to_jsonb(Conv::Strict);
-    let mut json = json_cache.get_or_insert_with(args[0].get_owned_value(), make_jsonb_fn)?;
+    let mut json = json_cache.get_or_insert_with(args[0].get_value(), make_jsonb_fn)?;
     let other = args[1..].chunks_exact(2);
     for chunk in other {
-        let path = json_path_from_owned_value(chunk[0].get_owned_value(), true)?;
-        let value = convert_dbtype_to_jsonb(chunk[1].get_owned_value(), Conv::NotStrict)?;
+        let path = json_path_from_db_value(chunk[0].get_value(), true)?;
+        let value = convert_dbtype_to_jsonb(chunk[1].get_value(), Conv::NotStrict)?;
         if let Some(path) = path {
             let mut op = InsertOperation::new(value);
 
@@ -172,7 +172,7 @@ pub fn jsonb_insert(args: &[Register], json_cache: &JsonCacheCell) -> crate::Res
         }
     }
 
-    let el_type = json.is_valid()?;
+    let el_type = json.element_type()?;
 
     json_string_to_db_type(json, el_type, OutputVariant::Binary)
 }

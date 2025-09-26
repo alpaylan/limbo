@@ -1,186 +1,27 @@
+use super::{Completion, File, OpenFlags, IO};
 use crate::error::LimboError;
+use crate::io::clock::{Clock, Instant};
 use crate::io::common;
 use crate::Result;
-
-use super::{Completion, File, MemoryIO, OpenFlags, IO};
-use crate::io::clock::{Clock, Instant};
-use polling::{Event, Events, Poller};
+use parking_lot::Mutex;
 use rustix::{
     fd::{AsFd, AsRawFd},
-    fs::{self, FlockOperation, OFlags, OpenOptionsExt},
-    io::Errno,
+    fs::{self, FlockOperation},
 };
-use std::{
-    cell::{RefCell, UnsafeCell},
-    mem::MaybeUninit,
-};
-use std::{
-    io::{ErrorKind, Read, Seek, Write},
-    sync::Arc,
-};
-use tracing::{debug, instrument, trace, Level};
+use std::os::fd::RawFd;
 
-struct OwnedCallbacks(UnsafeCell<Callbacks>);
-// We assume we locking on IO level is done by user.
-unsafe impl Send for OwnedCallbacks {}
-unsafe impl Sync for OwnedCallbacks {}
-struct BorrowedCallbacks<'io>(UnsafeCell<&'io mut Callbacks>);
+use std::{io::ErrorKind, sync::Arc};
+#[cfg(feature = "fs")]
+use tracing::debug;
+use tracing::{instrument, trace, Level};
 
-impl OwnedCallbacks {
-    fn new() -> Self {
-        Self(UnsafeCell::new(Callbacks::new()))
-    }
-    fn as_mut<'io>(&self) -> &'io mut Callbacks {
-        unsafe { &mut *self.0.get() }
-    }
-
-    fn is_empty(&self) -> bool {
-        self.as_mut().inline_count == 0
-    }
-
-    fn remove(&self, fd: usize) -> Option<CompletionCallback> {
-        let callbacks = unsafe { &mut *self.0.get() };
-        callbacks.remove(fd)
-    }
-}
-
-impl BorrowedCallbacks<'_> {
-    fn insert(&self, fd: usize, callback: CompletionCallback) {
-        let callbacks = unsafe { &mut *self.0.get() };
-        callbacks.insert(fd, callback);
-    }
-}
-
-struct EventsHandler(UnsafeCell<Events>);
-
-impl EventsHandler {
-    fn new() -> Self {
-        Self(UnsafeCell::new(Events::new()))
-    }
-
-    fn clear(&self) {
-        let events = unsafe { &mut *self.0.get() };
-        events.clear();
-    }
-
-    fn iter(&self) -> impl Iterator<Item = Event> {
-        let events = unsafe { &*self.0.get() };
-        events.iter()
-    }
-
-    fn as_mut<'io>(&self) -> &'io mut Events {
-        unsafe { &mut *self.0.get() }
-    }
-}
-struct PollHandler(UnsafeCell<Poller>);
-struct BorrowedPollHandler<'io>(UnsafeCell<&'io mut Poller>);
-
-impl BorrowedPollHandler<'_> {
-    fn add(&self, fd: &rustix::fd::BorrowedFd, event: Event) -> Result<()> {
-        let poller = unsafe { &mut *self.0.get() };
-        unsafe { poller.add(fd, event)? }
-        Ok(())
-    }
-}
-
-impl PollHandler {
-    fn new() -> Self {
-        Self(UnsafeCell::new(Poller::new().unwrap()))
-    }
-    fn wait(&self, events: &mut Events, timeout: Option<std::time::Duration>) -> Result<()> {
-        let poller = unsafe { &mut *self.0.get() };
-        poller.wait(events, timeout)?;
-        Ok(())
-    }
-
-    fn as_mut<'io>(&self) -> &'io mut Poller {
-        unsafe { &mut *self.0.get() }
-    }
-}
-
-type CallbackEntry = (usize, CompletionCallback);
-
-const FD_INLINE_SIZE: usize = 32;
-
-struct Callbacks {
-    inline_entries: [MaybeUninit<(usize, CompletionCallback)>; FD_INLINE_SIZE],
-    heap_entries: Vec<CallbackEntry>,
-    inline_count: usize,
-}
-
-impl Callbacks {
-    fn new() -> Self {
-        Self {
-            inline_entries: [const { MaybeUninit::uninit() }; FD_INLINE_SIZE],
-            heap_entries: Vec::new(),
-            inline_count: 0,
-        }
-    }
-
-    fn insert(&mut self, fd: usize, callback: CompletionCallback) {
-        if self.inline_count < FD_INLINE_SIZE {
-            self.inline_entries[self.inline_count].write((fd, callback));
-            self.inline_count += 1;
-        } else {
-            self.heap_entries.push((fd, callback));
-        }
-    }
-
-    fn remove(&mut self, fd: usize) -> Option<CompletionCallback> {
-        if let Some(pos) = self.find_inline(fd) {
-            let (_, callback) = unsafe { self.inline_entries[pos].assume_init_read() };
-
-            // if not the last element, move the last valid entry into this position
-            if pos < self.inline_count - 1 {
-                let last_valid =
-                    unsafe { self.inline_entries[self.inline_count - 1].assume_init_read() };
-                self.inline_entries[pos].write(last_valid);
-            }
-
-            self.inline_count -= 1;
-            return Some(callback);
-        }
-
-        if let Some(pos) = self.heap_entries.iter().position(|&(k, _)| k == fd) {
-            return Some(self.heap_entries.swap_remove(pos).1);
-        }
-        None
-    }
-
-    fn find_inline(&self, fd: usize) -> Option<usize> {
-        (0..self.inline_count)
-            .find(|&i| unsafe { self.inline_entries[i].assume_init_ref().0 == fd })
-    }
-}
-
-impl Drop for Callbacks {
-    fn drop(&mut self) {
-        for i in 0..self.inline_count {
-            unsafe { self.inline_entries[i].assume_init_drop() };
-        }
-    }
-}
-
-/// UnixIO lives longer than any of the files it creates, so it is
-/// safe to store references to it's internals in the UnixFiles
-pub struct UnixIO {
-    poller: PollHandler,
-    events: EventsHandler,
-    callbacks: OwnedCallbacks,
-}
-
-unsafe impl Send for UnixIO {}
-unsafe impl Sync for UnixIO {}
+pub struct UnixIO {}
 
 impl UnixIO {
     #[cfg(feature = "fs")]
     pub fn new() -> Result<Self> {
         debug!("Using IO backend 'syscall'");
-        Ok(Self {
-            poller: PollHandler::new(),
-            events: EventsHandler::new(),
-            callbacks: OwnedCallbacks::new(),
-        })
+        Ok(Self {})
     }
 }
 
@@ -194,11 +35,64 @@ impl Clock for UnixIO {
     }
 }
 
+fn try_pwritev_raw(
+    fd: RawFd,
+    off: u64,
+    bufs: &[Arc<crate::Buffer>],
+    start_idx: usize,
+    start_off: usize,
+) -> std::io::Result<usize> {
+    const MAX_IOV: usize = 1024;
+    let iov_len = std::cmp::min(bufs.len() - start_idx, MAX_IOV);
+    let mut iov: Vec<libc::iovec> = Vec::with_capacity(iov_len);
+
+    let mut last_end: Option<(*const u8, usize)> = None;
+    let mut iov_count = 0;
+    for (i, b) in bufs.iter().enumerate().skip(start_idx).take(iov_len) {
+        let s = b.as_slice();
+        let ptr = if i == start_idx { &s[start_off..] } else { s }.as_ptr();
+        let len = b.len();
+
+        if let Some((last_ptr, last_len)) = last_end {
+            // Check if this buffer is adjacent to the last
+            if unsafe { last_ptr.add(last_len) } == ptr {
+                // Extend the last iovec instead of adding new
+                iov[iov_count - 1].iov_len += len;
+                last_end = Some((last_ptr, last_len + len));
+                continue;
+            }
+        }
+        last_end = Some((ptr, len));
+        iov_count += 1;
+        iov.push(libc::iovec {
+            iov_base: ptr as *mut libc::c_void,
+            iov_len: len,
+        });
+    }
+    let n = if iov.len().eq(&1) {
+        unsafe {
+            libc::pwrite(
+                fd,
+                iov[0].iov_base as *const libc::c_void,
+                iov[0].iov_len,
+                off as i64,
+            )
+        }
+    } else {
+        unsafe { libc::pwritev(fd, iov.as_ptr(), iov.len() as i32, off as i64) }
+    };
+    if n < 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(n as usize)
+    }
+}
+
 impl IO for UnixIO {
     fn open_file(&self, path: &str, flags: OpenFlags, _direct: bool) -> Result<Arc<dyn File>> {
         trace!("open_file(path = {})", path);
         let mut file = std::fs::File::options();
-        file.read(true).custom_flags(OFlags::NONBLOCK.bits() as i32);
+        file.read(true);
 
         if !flags.contains(OpenFlags::ReadOnly) {
             file.write(true);
@@ -209,9 +103,7 @@ impl IO for UnixIO {
 
         #[allow(clippy::arc_with_non_send_sync)]
         let unix_file = Arc::new(UnixFile {
-            file: Arc::new(RefCell::new(file)),
-            poller: BorrowedPollHandler(self.poller.as_mut().into()),
-            callbacks: BorrowedCallbacks(self.callbacks.as_mut().into()),
+            file: Arc::new(Mutex::new(file)),
         });
         if std::env::var(common::ENV_DISABLE_FILE_LOCK).is_err() {
             unix_file.lock_file(!flags.contains(OpenFlags::ReadOnly))?;
@@ -219,84 +111,24 @@ impl IO for UnixIO {
         Ok(unix_file)
     }
 
+    fn remove_file(&self, path: &str) -> Result<()> {
+        std::fs::remove_file(path)?;
+        Ok(())
+    }
+
     #[instrument(err, skip_all, level = Level::TRACE)]
-    fn run_once(&self) -> Result<()> {
-        if self.callbacks.is_empty() {
-            return Ok(());
-        }
-        self.events.clear();
-        trace!("run_once() waits for events");
-        self.poller.wait(self.events.as_mut(), None)?;
-
-        for event in self.events.iter() {
-            if let Some(cf) = self.callbacks.remove(event.key) {
-                let result = match cf {
-                    CompletionCallback::Read(ref file, ref c, pos) => {
-                        let mut file = file.borrow_mut();
-                        let r = c.as_read();
-                        let mut buf = r.buf_mut();
-                        file.seek(std::io::SeekFrom::Start(pos as u64))?;
-                        file.read(buf.as_mut_slice())
-                    }
-                    CompletionCallback::Write(ref file, _, ref buf, pos) => {
-                        let mut file = file.borrow_mut();
-                        let buf = buf.borrow();
-                        file.seek(std::io::SeekFrom::Start(pos as u64))?;
-                        file.write(buf.as_slice())
-                    }
-                };
-                match result {
-                    Ok(n) => match &cf {
-                        CompletionCallback::Read(_, ref c, _) => c.complete(0),
-                        CompletionCallback::Write(_, ref c, _, _) => c.complete(n as i32),
-                    },
-                    Err(e) => return Err(e.into()),
-                }
-            }
-        }
+    fn step(&self) -> Result<()> {
         Ok(())
     }
-
-    fn wait_for_completion(&self, c: Arc<Completion>) -> Result<()> {
-        while !c.is_completed() {
-            self.run_once()?;
-        }
-        Ok(())
-    }
-
-    fn generate_random_number(&self) -> i64 {
-        let mut buf = [0u8; 8];
-        getrandom::getrandom(&mut buf).unwrap();
-        i64::from_ne_bytes(buf)
-    }
-
-    fn get_memory_io(&self) -> Arc<MemoryIO> {
-        Arc::new(MemoryIO::new())
-    }
 }
 
-enum CompletionCallback {
-    Read(Arc<RefCell<std::fs::File>>, Arc<Completion>, usize),
-    Write(
-        Arc<RefCell<std::fs::File>>,
-        Arc<Completion>,
-        Arc<RefCell<crate::Buffer>>,
-        usize,
-    ),
+pub struct UnixFile {
+    file: Arc<Mutex<std::fs::File>>,
 }
 
-pub struct UnixFile<'io> {
-    #[allow(clippy::arc_with_non_send_sync)]
-    file: Arc<RefCell<std::fs::File>>,
-    poller: BorrowedPollHandler<'io>,
-    callbacks: BorrowedCallbacks<'io>,
-}
-unsafe impl Send for UnixFile<'_> {}
-unsafe impl Sync for UnixFile<'_> {}
-
-impl File for UnixFile<'_> {
+impl File for UnixFile {
     fn lock_file(&self, exclusive: bool) -> Result<()> {
-        let fd = self.file.borrow();
+        let fd = self.file.lock();
         let fd = fd.as_fd();
         // F_SETLK is a non-blocking lock. The lock will be released when the file is closed
         // or the process exits or after an explicit unlock.
@@ -323,7 +155,7 @@ impl File for UnixFile<'_> {
     }
 
     fn unlock_file(&self) -> Result<()> {
-        let fd = self.file.borrow();
+        let fd = self.file.lock();
         let fd = fd.as_fd();
         fs::fcntl_lock(fd, FlockOperation::NonBlockingUnlock).map_err(|e| {
             LimboError::LockingError(format!(
@@ -335,95 +167,196 @@ impl File for UnixFile<'_> {
     }
 
     #[instrument(err, skip_all, level = Level::TRACE)]
-    fn pread(&self, pos: usize, c: Arc<Completion>) -> Result<Arc<Completion>> {
-        let file = self.file.borrow();
-        let result = {
+    fn pread(&self, pos: u64, c: Completion) -> Result<Completion> {
+        let file = self.file.lock();
+        let result = unsafe {
             let r = c.as_read();
-            let mut buf = r.buf_mut();
-            rustix::io::pread(file.as_fd(), buf.as_mut_slice(), pos as u64)
+            let buf = r.buf();
+            let slice = buf.as_mut_slice();
+            libc::pread(
+                file.as_raw_fd(),
+                slice.as_mut_ptr() as *mut libc::c_void,
+                slice.len(),
+                pos as libc::off_t,
+            )
         };
-        match result {
-            Ok(n) => {
-                trace!("pread n: {}", n);
-                // Read succeeded immediately
-                c.complete(n as i32);
-                Ok(c)
+        if result == -1 {
+            let e = std::io::Error::last_os_error();
+            Err(e.into())
+        } else {
+            trace!("pread n: {}", result);
+            // Read succeeded immediately
+            c.complete(result as i32);
+            Ok(c)
+        }
+    }
+
+    #[instrument(err, skip_all, level = Level::TRACE)]
+    fn pwrite(&self, pos: u64, buffer: Arc<crate::Buffer>, c: Completion) -> Result<Completion> {
+        let file = self.file.lock();
+        let buf_slice = buffer.as_slice();
+        let total_size = buf_slice.len();
+
+        let mut total_written = 0usize;
+        let mut current_pos = pos;
+
+        while total_written < total_size {
+            let remaining_slice = &buf_slice[total_written..];
+            let result = unsafe {
+                libc::pwrite(
+                    file.as_raw_fd(),
+                    remaining_slice.as_ptr() as *const libc::c_void,
+                    remaining_slice.len(),
+                    current_pos as libc::off_t,
+                )
+            };
+            if result == -1 {
+                let e = std::io::Error::last_os_error();
+                if e.kind() == ErrorKind::Interrupted {
+                    // EINTR, retry without advancing
+                    continue;
+                }
+                return Err(e.into());
             }
-            Err(Errno::AGAIN) => {
-                trace!("pread blocks");
-                // Would block, set up polling
-                let fd = file.as_raw_fd();
-                self.poller
-                    .add(&file.as_fd(), Event::readable(fd as usize))?;
-                {
-                    self.callbacks.insert(
-                        fd as usize,
-                        CompletionCallback::Read(self.file.clone(), c.clone(), pos),
+            let written = result as usize;
+            if written == 0 {
+                // Unexpected EOF for regular files
+                return Err(std::io::Error::new(
+                    ErrorKind::UnexpectedEof,
+                    "pwrite returned 0 bytes written",
+                )
+                .into());
+            }
+
+            total_written += written;
+            current_pos += written as u64;
+            trace!("pwrite iteration: wrote {written}, total {total_written}/{total_size}");
+        }
+        trace!("pwrite complete: wrote {total_written} bytes");
+        c.complete(total_written as i32);
+        Ok(c)
+    }
+
+    #[instrument(err, skip_all, level = Level::TRACE)]
+    fn pwritev(
+        &self,
+        pos: u64,
+        buffers: Vec<Arc<crate::Buffer>>,
+        c: Completion,
+    ) -> Result<Completion> {
+        if buffers.len().eq(&1) {
+            // use `pwrite` for single buffer
+            return self.pwrite(pos, buffers[0].clone(), c);
+        }
+
+        let file = self.file.lock();
+        let mut total_written = 0usize;
+        let mut current_pos = pos;
+        let mut buf_idx = 0;
+        let mut buf_offset = 0;
+
+        let total_size: usize = buffers.iter().map(|b| b.len()).sum();
+        while total_written < total_size {
+            match try_pwritev_raw(file.as_raw_fd(), current_pos, &buffers, buf_idx, buf_offset) {
+                Ok(written) => {
+                    if written == 0 {
+                        // Unexpected EOF
+                        return Err(std::io::Error::new(
+                            ErrorKind::UnexpectedEof,
+                            "pwritev returned 0 bytes written",
+                        )
+                        .into());
+                    }
+                    total_written += written;
+                    current_pos += written as u64;
+
+                    let mut remaining = written;
+                    while remaining > 0 && buf_idx < buffers.len() {
+                        let buf_remaining = buffers[buf_idx].len() - buf_offset;
+
+                        if remaining >= buf_remaining {
+                            // Consumed rest of current buffer
+                            remaining -= buf_remaining;
+                            buf_idx += 1;
+                            buf_offset = 0;
+                        } else {
+                            // Partial write within current buffer
+                            buf_offset += remaining;
+                            remaining = 0;
+                        }
+                    }
+
+                    trace!(
+                        "pwritev iteration: wrote {written}, total {total_written}/{total_size}"
                     );
                 }
-                Ok(c)
+                Err(e) if e.kind() == ErrorKind::Interrupted => {
+                    // EINTR - retry without advancing
+                    continue;
+                }
+                Err(e) => {
+                    return Err(e.into());
+                }
             }
-            Err(e) => Err(e.into()),
         }
+        trace!("pwritev complete: wrote {total_written} bytes");
+        c.complete(total_written as i32);
+        Ok(c)
     }
 
     #[instrument(err, skip_all, level = Level::TRACE)]
-    fn pwrite(
-        &self,
-        pos: usize,
-        buffer: Arc<RefCell<crate::Buffer>>,
-        c: Arc<Completion>,
-    ) -> Result<Arc<Completion>> {
-        let file = self.file.borrow();
-        let result = {
-            let buf = buffer.borrow();
-            rustix::io::pwrite(file.as_fd(), buf.as_slice(), pos as u64)
+    fn sync(&self, c: Completion) -> Result<Completion> {
+        let file = self.file.lock();
+
+        let result = unsafe {
+            #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+            {
+                libc::fsync(file.as_raw_fd())
+            }
+
+            #[cfg(any(target_os = "macos", target_os = "ios"))]
+            {
+                libc::fcntl(file.as_raw_fd(), libc::F_FULLFSYNC)
+            }
         };
-        match result {
-            Ok(n) => {
-                trace!("pwrite n: {}", n);
-                // Read succeeded immediately
-                c.complete(n as i32);
-                Ok(c)
-            }
-            Err(Errno::AGAIN) => {
-                trace!("pwrite blocks");
-                // Would block, set up polling
-                let fd = file.as_raw_fd();
-                self.poller
-                    .add(&file.as_fd(), Event::readable(fd as usize))?;
-                self.callbacks.insert(
-                    fd as usize,
-                    CompletionCallback::Write(self.file.clone(), c.clone(), buffer.clone(), pos),
-                );
-                Ok(c)
-            }
-            Err(e) => Err(e.into()),
+
+        if result == -1 {
+            let e = std::io::Error::last_os_error();
+            Err(e.into())
+        } else {
+            #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+            trace!("fsync");
+
+            #[cfg(any(target_os = "macos", target_os = "ios"))]
+            trace!("fcntl(F_FULLSYNC)");
+
+            c.complete(0);
+            Ok(c)
         }
     }
 
     #[instrument(err, skip_all, level = Level::TRACE)]
-    fn sync(&self, c: Arc<Completion>) -> Result<Arc<Completion>> {
-        let file = self.file.borrow();
-        let result = fs::fsync(file.as_fd());
+    fn size(&self) -> Result<u64> {
+        let file = self.file.lock();
+        Ok(file.metadata()?.len())
+    }
+
+    #[instrument(err, skip_all, level = Level::INFO)]
+    fn truncate(&self, len: u64, c: Completion) -> Result<Completion> {
+        let file = self.file.lock();
+        let result = file.set_len(len);
         match result {
             Ok(()) => {
-                trace!("fsync");
+                trace!("file truncated to len=({})", len);
                 c.complete(0);
                 Ok(c)
             }
             Err(e) => Err(e.into()),
         }
     }
-
-    #[instrument(err, skip_all, level = Level::TRACE)]
-    fn size(&self) -> Result<u64> {
-        let file = self.file.borrow();
-        Ok(file.metadata()?.len())
-    }
 }
 
-impl Drop for UnixFile<'_> {
+impl Drop for UnixFile {
     fn drop(&mut self) {
         self.unlock_file().expect("Failed to unlock file");
     }

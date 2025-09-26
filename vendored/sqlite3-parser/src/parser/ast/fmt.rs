@@ -89,8 +89,8 @@ impl<T: fmt::Write> TokenStream for WriteTokenStream<'_, T> {
 struct BlankContext;
 
 impl ToSqlContext for BlankContext {
-    fn get_column_name(&self, _table_id: crate::ast::TableInternalId, _col_idx: usize) -> &str {
-        ""
+    fn get_column_name(&self, _table_id: crate::ast::TableInternalId, _col_idx: usize) -> String {
+        "".to_string()
     }
 
     fn get_table_name(&self, _id: crate::ast::TableInternalId) -> &str {
@@ -376,6 +376,29 @@ impl ToTokens for Stmt {
                 if *temporary {
                     s.append(TK_TEMP, None)?;
                 }
+                s.append(TK_VIEW, None)?;
+                if *if_not_exists {
+                    s.append(TK_IF, None)?;
+                    s.append(TK_NOT, None)?;
+                    s.append(TK_EXISTS, None)?;
+                }
+                view_name.to_tokens_with_context(s, context)?;
+                if let Some(columns) = columns {
+                    s.append(TK_LP, None)?;
+                    comma(columns, s, context)?;
+                    s.append(TK_RP, None)?;
+                }
+                s.append(TK_AS, None)?;
+                select.to_tokens_with_context(s, context)
+            }
+            Self::CreateMaterializedView {
+                if_not_exists,
+                view_name,
+                columns,
+                select,
+            } => {
+                s.append(TK_CREATE, None)?;
+                s.append(TK_MATERIALIZED, None)?;
                 s.append(TK_VIEW, None)?;
                 if *if_not_exists {
                     s.append(TK_IF, None)?;
@@ -758,7 +781,7 @@ impl ToTokens for Expr {
             Self::Column { table, column, .. } => {
                 s.append(TK_ID, Some(context.get_table_name(*table)))?;
                 s.append(TK_DOT, None)?;
-                s.append(TK_ID, Some(context.get_column_name(*table, *column)))
+                s.append(TK_ID, Some(&context.get_column_name(*table, *column)))
             }
             Self::InList { lhs, not, rhs } => {
                 lhs.to_tokens_with_context(s, context)?;
@@ -867,6 +890,11 @@ impl ToTokens for Expr {
                 Some(_) => s.append(TK_VARIABLE, Some(&("?".to_owned() + var))),
                 None => s.append(TK_VARIABLE, Some("?")),
             },
+            Self::Register(reg) => {
+                // This is for internal use only, not part of SQL syntax
+                // Use a special notation that won't conflict with SQL
+                s.append(TK_VARIABLE, Some(&format!("$r{reg}")))
+            }
         }
     }
 }
@@ -1326,23 +1354,13 @@ impl ToTokens for GroupBy {
     }
 }
 
-impl ToTokens for Id {
-    fn to_tokens_with_context<S: TokenStream + ?Sized, C: ToSqlContext>(
-        &self,
-        s: &mut S,
-        _: &C,
-    ) -> Result<(), S::Error> {
-        double_quote(&self.0, s)
-    }
-}
-
 impl ToTokens for Name {
     fn to_tokens_with_context<S: TokenStream + ?Sized, C: ToSqlContext>(
         &self,
         s: &mut S,
         _: &C,
     ) -> Result<(), S::Error> {
-        double_quote(self.0.as_str(), s)
+        double_quote(self.as_str(), s)
     }
 }
 

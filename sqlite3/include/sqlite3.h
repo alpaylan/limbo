@@ -41,9 +41,22 @@
 
 #define SQLITE_CHECKPOINT_TRUNCATE 3
 
+#define SQLITE_INTEGER  1
+#define SQLITE_FLOAT    2
+#define SQLITE_BLOB     4
+#define SQLITE_NULL     5
+#define SQLITE_TEXT     3
+#define SQLITE3_TEXT     3
+
+typedef void (*sqlite3_destructor_type)(void*);
+#define SQLITE_STATIC    ((sqlite3_destructor_type)0)
+#define SQLITE_TRANSIENT ((sqlite3_destructor_type)-1)
+
 typedef struct sqlite3 sqlite3;
 
 typedef struct sqlite3_stmt sqlite3_stmt;
+typedef int64_t sqlite3_int64;
+typedef sqlite3_int64 sqlite_int64;
 
 typedef int (*exec_callback)(void *context, int n_column, char **argv, char **colv);
 
@@ -62,6 +75,8 @@ int sqlite3_open_v2(const char *filename, sqlite3 **db_out, int _flags, const ch
 int sqlite3_close(sqlite3 *db);
 
 int sqlite3_close_v2(sqlite3 *db);
+
+const char *sqlite3_db_filename(sqlite3 *db, const char *db_name);
 
 int sqlite3_trace_v2(sqlite3 *_db,
                      unsigned int _mask,
@@ -88,9 +103,13 @@ int sqlite3_reset(sqlite3_stmt *stmt);
 
 int sqlite3_changes(sqlite3 *_db);
 
+int64_t sqlite3_changes64(sqlite3 *_db);
+
 int sqlite3_stmt_readonly(sqlite3_stmt *_stmt);
 
 int sqlite3_stmt_busy(sqlite3_stmt *_stmt);
+
+sqlite3_stmt *sqlite3_next_stmt(sqlite3 *db, sqlite3_stmt *stmt);
 
 int sqlite3_serialize(sqlite3 *_db, const char *_schema, void **_out, int *_out_bytes, unsigned int _flags);
 
@@ -140,6 +159,8 @@ int sqlite3_bind_parameter_count(sqlite3_stmt *_stmt);
 
 const char *sqlite3_bind_parameter_name(sqlite3_stmt *_stmt, int _idx);
 
+int sqlite3_bind_parameter_index(sqlite3_stmt *_stmt, const char *_name);
+
 int sqlite3_bind_null(sqlite3_stmt *_stmt, int _idx);
 
 int sqlite3_bind_int64(sqlite3_stmt *_stmt, int _idx, int64_t _val);
@@ -157,6 +178,8 @@ int sqlite3_column_count(sqlite3_stmt *_stmt);
 const char *sqlite3_column_decltype(sqlite3_stmt *_stmt, int _idx);
 
 const char *sqlite3_column_name(sqlite3_stmt *_stmt, int _idx);
+
+const char *sqlite3_column_table_name(sqlite3_stmt *_stmt, int _idx);
 
 int64_t sqlite3_column_int64(sqlite3_stmt *_stmt, int _idx);
 
@@ -287,6 +310,32 @@ int sqlite3_wal_checkpoint_v2(sqlite3 *db, const char *_db_name, int _mode, int 
  *   the number of frames in the WAL file.
  */
 int libsql_wal_frame_count(sqlite3 *db, uint32_t *p_frame_count);
+
+/**
+ * Return meta information about a specific column of a database table.
+ * 
+ * @param db Connection handle
+ * @param zDbName Database name or NULL for main database
+ * @param zTableName Table name
+ * @param zColumnName Column name
+ * @param pzDataType OUTPUT: Declared data type
+ * @param pzCollSeq OUTPUT: Collation sequence name
+ * @param pNotNull OUTPUT: True if NOT NULL constraint exists
+ * @param pPrimaryKey OUTPUT: True if column part of PK
+ * @param pAutoinc OUTPUT: True if column is auto-increment
+ * @return SQLITE_OK on success, SQLITE_ERROR on error
+ */
+int sqlite3_table_column_metadata(
+    sqlite3 *db,
+    const char *zDbName,
+    const char *zTableName,
+    const char *zColumnName,
+    char const **pzDataType,
+    char const **pzCollSeq,
+    int *pNotNull,
+    int *pPrimaryKey,
+    int *pAutoinc
+);
 
 #ifdef __cplusplus
 }  // extern "C"

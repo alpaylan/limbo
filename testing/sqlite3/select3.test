@@ -21,7 +21,7 @@ source $testdir/tester.tcl
 #
 do_test select3-1.0 {
   execsql {
-    CREATE TABLE t1(n int, log int);
+    CREATE TABLE t1 (n int, log int);
     BEGIN;
   }
   for {set i 1} {$i<32} {incr i} {
@@ -233,7 +233,7 @@ do_test select3-6.8 {
 #
 do_test select3-7.1 {
   execsql {
-    CREATE TABLE t2(a,b);
+    CREATE TABLE t2 (a,b);
     INSERT INTO t2 VALUES(1,2);
     SELECT a, sum(b) FROM t2 WHERE b=5 GROUP BY a;
   }
@@ -316,15 +316,15 @@ foreach {id x} {
 # 2020-03-10 ticket e0c2ad1aa8a9c691
 reset_db
 do_execsql_test select3-9.100 {
-  CREATE TABLE t0(c0 REAL, c1 REAL GENERATED ALWAYS AS (c0));
+  CREATE TABLE t0 (c0 REAL, c1 REAL GENERATED ALWAYS AS (c0));
   INSERT INTO t0(c0) VALUES (1);
   SELECT * FROM t0 GROUP BY c0;
 } {1.0 1.0}
 
 reset_db
 do_execsql_test select3.10.100 {
-  CREATE TABLE t1(a, b);
-  CREATE TABLE t2(c, d);
+  CREATE TABLE t1 (a, b);
+  CREATE TABLE t2 (c, d);
   SELECT max(t1.a), 
          (SELECT 'xyz' FROM (SELECT * FROM t2 WHERE 0) WHERE t1.b=1) 
   FROM t1;
@@ -336,19 +336,19 @@ do_execsql_test select3.10.100 {
 #
 foreach {tn sql} {
   1 {
-    CREATE TABLE t1(a TEXT);
-    CREATE TABLE t2(x INT);
+    CREATE TABLE t1 (a TEXT);
+    CREATE TABLE t2 (x INT);
     CREATE INDEX t2x ON t2(x);
     INSERT INTO t1 VALUES('abc');
   }
   2 {
-    CREATE TABLE t1(a TEXT);
-    CREATE TABLE t2(x INT);
+    CREATE TABLE t1 (a TEXT);
+    CREATE TABLE t2 (x INT);
     INSERT INTO t1 VALUES('abc');
   }
   3 {
-    CREATE TABLE t1(a TEXT);
-    CREATE TABLE t2(x INT);
+    CREATE TABLE t1 (a TEXT);
+    CREATE TABLE t2 (x INT);
     INSERT INTO t1 VALUES('abc');
     PRAGMA automatic_index=OFF;
   }
@@ -376,8 +376,8 @@ foreach {tn sql} {
 
 reset_db
 do_execsql_test 12.0 {
-  CREATE TABLE t1(a);
-  CREATE TABLE t2(x);
+  CREATE TABLE t1 (a);
+  CREATE TABLE t2 (x);
 }
 do_execsql_test 12.1 {
   SELECT count(x), m FROM t1 LEFT JOIN (SELECT x, 59 AS m FROM t2) GROUP BY a;

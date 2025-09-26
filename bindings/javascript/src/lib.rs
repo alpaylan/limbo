@@ -1,727 +1,779 @@
-#![deny(clippy::all)]
+//! JavaScript bindings for the Turso library.
+//!
+//! These bindings provide a thin layer that exposes Turso's Rust API to JavaScript,
+//! maintaining close alignment with the underlying implementation while offering
+//! the following core database operations:
+//!
+//! - Opening and closing database connections
+//! - Preparing SQL statements
+//! - Binding parameters to prepared statements
+//! - Iterating through query results
+//! - Managing the I/O event loop
 
-use std::cell::{RefCell, RefMut};
-use std::num::{NonZero, NonZeroUsize};
+#[cfg(feature = "browser")]
+pub mod browser;
 
-use std::rc::Rc;
-use std::sync::Arc;
-
-use napi::iterator::Generator;
-use napi::{bindgen_prelude::ObjectFinalize, Env, JsUnknown};
+use napi::bindgen_prelude::*;
+use napi::{Env, Task};
 use napi_derive::napi;
-use turso_core::{LimboError, StepResult};
+use std::sync::{Mutex, OnceLock};
+use std::{
+    cell::{Cell, RefCell},
+    num::NonZeroUsize,
+    sync::Arc,
+};
+use tracing_subscriber::filter::LevelFilter;
+use tracing_subscriber::fmt::format::FmtSpan;
+use turso_core::storage::database::DatabaseFile;
 
-#[derive(Default)]
-#[napi(object)]
-pub struct OpenDatabaseOptions {
-    pub readonly: Option<bool>,
-    pub file_must_exist: Option<bool>,
-    pub timeout: Option<u32>,
-    // verbose => Callback,
+/// Step result constants
+const STEP_ROW: u32 = 1;
+const STEP_DONE: u32 = 2;
+const STEP_IO: u32 = 3;
+
+/// The presentation mode for rows.
+#[derive(Debug, Clone)]
+enum PresentationMode {
+    Expanded,
+    Raw,
+    Pluck,
 }
 
-impl OpenDatabaseOptions {
-    fn readonly(&self) -> bool {
-        self.readonly.unwrap_or(false)
-    }
-}
-
-#[napi(object)]
-pub struct PragmaOptions {
-    pub simple: bool,
-}
-
-#[napi(object)]
-pub struct RunResult {
-    pub changes: i64,
-    pub last_insert_rowid: i64,
-}
-
-#[napi(custom_finalize)]
+/// A database connection.
+#[napi]
 #[derive(Clone)]
 pub struct Database {
-    #[napi(writable = false)]
-    pub memory: bool,
-
-    #[napi(writable = false)]
-    pub readonly: bool,
-    // #[napi(writable = false)]
-    // pub in_transaction: bool,
-    #[napi(writable = false)]
-    pub open: bool,
-    #[napi(writable = false)]
-    pub name: String,
-    _db: Arc<turso_core::Database>,
-    conn: Arc<turso_core::Connection>,
-    _io: Arc<dyn turso_core::IO>,
+    inner: Option<Arc<DatabaseInner>>,
 }
 
-impl ObjectFinalize for Database {
-    // TODO: check if something more is required
-    fn finalize(self, _env: Env) -> napi::Result<()> {
-        self.conn.close().map_err(into_napi_error)?;
-        Ok(())
+/// database inner is Send to the worker for initial connection
+/// that's why we use OnceLock here - in order to make DatabaseInner Send and Sync
+pub struct DatabaseInner {
+    path: String,
+    opts: Option<DatabaseOpts>,
+    io: Arc<dyn turso_core::IO>,
+    db: OnceLock<Option<Arc<turso_core::Database>>>,
+    conn: OnceLock<Option<Arc<turso_core::Connection>>>,
+    is_connected: OnceLock<bool>,
+    default_safe_integers: Mutex<bool>,
+}
+
+pub(crate) fn is_memory(path: &str) -> bool {
+    path == ":memory:"
+}
+
+static TRACING_INIT: OnceLock<()> = OnceLock::new();
+pub(crate) fn init_tracing(level_filter: &Option<String>) {
+    let Some(level_filter) = level_filter else {
+        return;
+    };
+    let level_filter = match level_filter.as_ref() {
+        "error" => LevelFilter::ERROR,
+        "warn" => LevelFilter::WARN,
+        "info" => LevelFilter::INFO,
+        "debug" => LevelFilter::DEBUG,
+        "trace" => LevelFilter::TRACE,
+        _ => return,
+    };
+    TRACING_INIT.get_or_init(|| {
+        tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_thread_ids(true)
+            .with_span_events(FmtSpan::ACTIVE)
+            .with_max_level(level_filter)
+            .init();
+    });
+}
+
+// for now we make DbTask unsound as turso_core::Database and turso_core::Connection are not fully thread-safe
+unsafe impl Send for DbTask {}
+
+pub enum DbTask {
+    Connect { db: Arc<DatabaseInner> },
+}
+
+impl Task for DbTask {
+    type Output = u32;
+    type JsValue = u32;
+
+    fn compute(&mut self) -> Result<Self::Output> {
+        match self {
+            DbTask::Connect { db } => {
+                connect_sync(db)?;
+                Ok(0)
+            }
+        }
     }
+
+    fn resolve(&mut self, _: Env, output: Self::Output) -> Result<Self::JsValue> {
+        Ok(output)
+    }
+}
+
+/// Most of the options are aligned with better-sqlite API
+/// (see https://github.com/WiseLibs/better-sqlite3/blob/master/docs/api.md#new-databasepath-options)
+#[napi(object)]
+#[derive(Clone)]
+pub struct DatabaseOpts {
+    pub readonly: Option<bool>,
+    pub timeout: Option<u32>,
+    pub file_must_exist: Option<bool>,
+    pub tracing: Option<String>,
+}
+
+fn step_sync(stmt: &Arc<RefCell<turso_core::Statement>>) -> napi::Result<u32> {
+    let mut stmt = stmt.borrow_mut();
+    match stmt.step() {
+        Ok(turso_core::StepResult::Row) => Ok(STEP_ROW),
+        Ok(turso_core::StepResult::IO) => Ok(STEP_IO),
+        Ok(turso_core::StepResult::Done) => Ok(STEP_DONE),
+        Ok(turso_core::StepResult::Interrupt) => {
+            Err(create_generic_error("statement was interrupted"))
+        }
+        Ok(turso_core::StepResult::Busy) => Err(create_generic_error("database is busy")),
+        Err(e) => Err(to_generic_error("step failed", e)),
+    }
+}
+
+fn to_generic_error<E: std::error::Error>(message: &str, e: E) -> napi::Error {
+    Error::new(Status::GenericFailure, format!("{message}: {e}"))
+}
+
+fn to_error<E: std::error::Error>(status: napi::Status, message: &str, e: E) -> napi::Error {
+    Error::new(status, format!("{message}: {e}"))
+}
+
+fn create_generic_error(message: &str) -> napi::Error {
+    Error::new(Status::GenericFailure, message)
+}
+
+fn create_error(status: napi::Status, message: &str) -> napi::Error {
+    Error::new(status, message)
+}
+
+fn connect_sync(db: &DatabaseInner) -> napi::Result<()> {
+    if db.is_connected.get() == Some(&true) {
+        return Ok(());
+    }
+
+    let mut flags = turso_core::OpenFlags::Create;
+    let mut busy_timeout = None;
+    if let Some(opts) = &db.opts {
+        if opts.readonly == Some(true) {
+            flags.set(turso_core::OpenFlags::ReadOnly, true);
+            flags.set(turso_core::OpenFlags::Create, false);
+        }
+        if opts.file_must_exist == Some(true) {
+            flags.set(turso_core::OpenFlags::Create, false);
+        }
+        if let Some(timeout) = opts.timeout {
+            busy_timeout = Some(std::time::Duration::from_millis(timeout as u64));
+        }
+    }
+    tracing::info!("flags: {:?}", flags);
+    let io = &db.io;
+    let file = io
+        .open_file(&db.path, flags, false)
+        .map_err(|e| to_generic_error("failed to open file", e))?;
+
+    let db_file = Arc::new(DatabaseFile::new(file));
+    let db_core = turso_core::Database::open_with_flags(
+        io.clone(),
+        &db.path,
+        db_file,
+        flags,
+        turso_core::DatabaseOpts::new()
+            .with_mvcc(false)
+            .with_indexes(true),
+        None,
+    )
+    .map_err(|e| to_generic_error("failed to open database", e))?;
+
+    let conn = db_core
+        .connect()
+        .map_err(|e| to_generic_error("failed to connect", e))?;
+
+    if let Some(busy_timeout) = busy_timeout {
+        conn.set_busy_timeout(busy_timeout);
+    }
+
+    db.is_connected
+        .set(true)
+        .map_err(|_| create_generic_error("db already connected, API misuse"))?;
+    db.db
+        .set(Some(db_core))
+        .map_err(|_| create_generic_error("db already connected, API misuse"))?;
+    db.conn
+        .set(Some(conn))
+        .map_err(|_| create_generic_error("db already connected, API misuse"))?;
+    Ok(())
 }
 
 #[napi]
 impl Database {
+    /// Creates a new database instance.
+    ///
+    /// # Arguments
+    /// * `path` - The path to the database file.
     #[napi(constructor)]
-    pub fn new(path: String, options: Option<OpenDatabaseOptions>) -> napi::Result<Self, String> {
-        let memory = path == ":memory:";
-        let io: Arc<dyn turso_core::IO> = if memory {
+    pub fn new(path: String, opts: Option<DatabaseOpts>) -> napi::Result<Self> {
+        let io: Arc<dyn turso_core::IO> = if is_memory(&path) {
             Arc::new(turso_core::MemoryIO::new())
         } else {
-            Arc::new(turso_core::PlatformIO::new().map_err(into_napi_sqlite_error)?)
+            #[cfg(not(feature = "browser"))]
+            {
+                Arc::new(
+                    turso_core::PlatformIO::new()
+                        .map_err(|e| to_generic_error("failed to create IO", e))?,
+                )
+            }
+            #[cfg(feature = "browser")]
+            {
+                browser::opfs()
+            }
         };
-        let opts = options.unwrap_or_default();
-        let flag = if opts.readonly() {
-            turso_core::OpenFlags::ReadOnly
-        } else {
-            turso_core::OpenFlags::Create
-        };
-        let file = io
-            .open_file(&path, flag, false)
-            .map_err(|err| into_napi_error_with_message("SQLITE_CANTOPEN".to_owned(), err))?;
+        Self::new_with_io(path, io, opts)
+    }
 
-        let db_file = Arc::new(DatabaseFile::new(file));
-        let db = turso_core::Database::open(io.clone(), &path, db_file, false, false)
-            .map_err(into_napi_sqlite_error)?;
-        let conn = db.connect().map_err(into_napi_sqlite_error)?;
-
+    pub fn new_with_io(
+        path: String,
+        io: Arc<dyn turso_core::IO>,
+        opts: Option<DatabaseOpts>,
+    ) -> napi::Result<Self> {
+        if let Some(opts) = &opts {
+            init_tracing(&opts.tracing);
+        }
         Ok(Self {
-            readonly: opts.readonly(),
-            memory,
-            _db: db,
-            conn,
-            open: true,
-            name: path,
-            _io: io,
+            #[allow(clippy::arc_with_non_send_sync)]
+            inner: Some(Arc::new(DatabaseInner {
+                path,
+                opts,
+                io,
+                db: OnceLock::new(),
+                conn: OnceLock::new(),
+                is_connected: OnceLock::new(),
+                default_safe_integers: Mutex::new(false),
+            })),
+        })
+    }
+
+    pub fn set_connected(&self, conn: Arc<turso_core::Connection>) -> napi::Result<()> {
+        let inner = self.inner()?;
+        inner
+            .db
+            .set(None)
+            .map_err(|_| create_generic_error("database was already connected"))?;
+
+        inner
+            .conn
+            .set(Some(conn))
+            .map_err(|_| create_generic_error("database was already connected"))?;
+
+        inner
+            .is_connected
+            .set(true)
+            .map_err(|_| create_generic_error("database was already connected"))?;
+
+        Ok(())
+    }
+
+    fn inner(&self) -> napi::Result<&Arc<DatabaseInner>> {
+        let Some(inner) = &self.inner else {
+            return Err(create_generic_error("database must be connected"));
+        };
+        Ok(inner)
+    }
+
+    /// Connect the database synchronously
+    /// This method is idempotent and can be called multiple times safely until the database will be closed
+    #[napi]
+    pub fn connect_sync(&self) -> napi::Result<()> {
+        connect_sync(self.inner()?)
+    }
+
+    /// Connect the database asynchronously
+    /// This method is idempotent and can be called multiple times safely until the database will be closed
+    #[napi(ts_return_type = "Promise<void>")]
+    pub fn connect_async(&self) -> napi::Result<AsyncTask<DbTask>> {
+        Ok(AsyncTask::new(DbTask::Connect {
+            db: self.inner()?.clone(),
+        }))
+    }
+
+    fn conn(&self) -> Result<Arc<turso_core::Connection>> {
+        let Some(Some(conn)) = self.inner()?.conn.get() else {
+            return Err(create_generic_error("database must be connected"));
+        };
+        Ok(conn.clone())
+    }
+
+    /// Returns whether the database is in readonly-only mode.
+    #[napi(getter)]
+    pub fn readonly(&self) -> napi::Result<bool> {
+        Ok(self.conn()?.is_readonly(0))
+    }
+
+    /// Returns whether the database is in memory-only mode.
+    #[napi(getter)]
+    pub fn memory(&self) -> napi::Result<bool> {
+        Ok(is_memory(&self.inner()?.path))
+    }
+
+    /// Returns whether the database is in memory-only mode.
+    #[napi(getter)]
+    pub fn path(&self) -> napi::Result<String> {
+        Ok(self.inner()?.path.clone())
+    }
+
+    /// Returns whether the database connection is open.
+    #[napi(getter)]
+    pub fn open(&self) -> napi::Result<bool> {
+        if self.inner.is_none() {
+            return Ok(false);
+        }
+        Ok(self.inner()?.is_connected.get() == Some(&true))
+    }
+
+    /// Prepares a statement for execution.
+    ///
+    /// # Arguments
+    ///
+    /// * `sql` - The SQL statement to prepare.
+    ///
+    /// # Returns
+    ///
+    /// A `Statement` instance.
+    #[napi]
+    pub fn prepare(&self, sql: String) -> napi::Result<Statement> {
+        let stmt = self
+            .conn()?
+            .prepare(&sql)
+            .map_err(|e| to_generic_error("prepare failed", e))?;
+        let column_names: Vec<std::ffi::CString> = (0..stmt.num_columns())
+            .map(|i| std::ffi::CString::new(stmt.get_column_name(i).to_string()).unwrap())
+            .collect();
+        Ok(Statement {
+            #[allow(clippy::arc_with_non_send_sync)]
+            stmt: Some(Arc::new(RefCell::new(stmt))),
+            column_names,
+            mode: RefCell::new(PresentationMode::Expanded),
+            safe_integers: Cell::new(*self.inner()?.default_safe_integers.lock().unwrap()),
         })
     }
 
     #[napi]
-    pub fn prepare(&self, sql: String) -> napi::Result<Statement> {
-        let stmt = self.conn.prepare(&sql).map_err(into_napi_error)?;
-        Ok(Statement::new(RefCell::new(stmt), self.clone(), sql))
+    pub fn executor(&self, sql: String) -> napi::Result<BatchExecutor> {
+        Ok(BatchExecutor {
+            conn: Some(self.conn()?.clone()),
+            sql,
+            position: 0,
+            stmt: None,
+        })
     }
 
+    /// Returns the rowid of the last row inserted.
+    ///
+    /// # Returns
+    ///
+    /// The rowid of the last row inserted.
     #[napi]
-    pub fn pragma(
-        &self,
-        env: Env,
-        pragma_name: String,
-        options: Option<PragmaOptions>,
-    ) -> napi::Result<JsUnknown> {
-        let sql = format!("PRAGMA {pragma_name}");
-        let stmt = self.prepare(sql)?;
-        match options {
-            Some(PragmaOptions { simple: true, .. }) => {
-                let mut stmt = stmt.inner.borrow_mut();
-                loop {
-                    match stmt.step().map_err(into_napi_error)? {
-                        turso_core::StepResult::Row => {
-                            let row: Vec<_> = stmt.row().unwrap().get_values().cloned().collect();
-                            return to_js_value(&env, &row[0]);
-                        }
-                        turso_core::StepResult::Done => {
-                            return Ok(env.get_undefined()?.into_unknown())
-                        }
-                        turso_core::StepResult::IO => {
-                            stmt.run_once().map_err(into_napi_error)?;
-                            continue;
-                        }
-                        step @ turso_core::StepResult::Interrupt
-                        | step @ turso_core::StepResult::Busy => {
-                            return Err(napi::Error::new(
-                                napi::Status::GenericFailure,
-                                format!("{step:?}"),
-                            ))
-                        }
-                    }
-                }
-            }
-            _ => stmt.run_internal(env, None),
-        }
+    pub fn last_insert_rowid(&self) -> napi::Result<i64> {
+        Ok(self.conn()?.last_insert_rowid())
     }
 
+    /// Returns the number of changes made by the last statement.
+    ///
+    /// # Returns
+    ///
+    /// The number of changes made by the last statement.
     #[napi]
-    pub fn backup(&self) {
-        todo!()
+    pub fn changes(&self) -> napi::Result<i64> {
+        Ok(self.conn()?.changes())
     }
 
+    /// Returns the total number of changes made by all statements.
+    ///
+    /// # Returns
+    ///
+    /// The total number of changes made by all statements.
     #[napi]
-    pub fn serialize(&self) {
-        todo!()
+    pub fn total_changes(&self) -> napi::Result<i64> {
+        Ok(self.conn()?.total_changes())
     }
 
-    #[napi]
-    pub fn function(&self) {
-        todo!()
-    }
-
-    #[napi]
-    pub fn aggregate(&self) {
-        todo!()
-    }
-
-    #[napi]
-    pub fn table(&self) {
-        todo!()
-    }
-
-    #[napi]
-    pub fn load_extension(&self, path: String) -> napi::Result<()> {
-        let ext_path = turso_core::resolve_ext_path(path.as_str()).map_err(into_napi_error)?;
-        self.conn
-            .load_extension(ext_path)
-            .map_err(into_napi_error)?;
-        Ok(())
-    }
-
-    #[napi]
-    pub fn exec(&self, sql: String) -> napi::Result<(), String> {
-        let query_runner = self.conn.query_runner(sql.as_bytes());
-
-        // Since exec doesn't return any values, we can just iterate over the results
-        for output in query_runner {
-            match output {
-                Ok(Some(mut stmt)) => loop {
-                    match stmt.step() {
-                        Ok(StepResult::Row) => continue,
-                        Ok(StepResult::IO) => stmt.run_once().map_err(into_napi_sqlite_error)?,
-                        Ok(StepResult::Done) => break,
-                        Ok(StepResult::Interrupt | StepResult::Busy) => {
-                            return Err(napi::Error::new(
-                                "SQLITE_ERROR".to_owned(),
-                                "Statement execution interrupted or busy".to_string(),
-                            ));
-                        }
-                        Err(err) => {
-                            return Err(napi::Error::new(
-                                "SQLITE_ERROR".to_owned(),
-                                format!("Error executing SQL: {err}"),
-                            ));
-                        }
-                    }
-                },
-                Ok(None) => continue,
-                Err(err) => {
-                    return Err(napi::Error::new(
-                        "SQLITE_ERROR".to_owned(),
-                        format!("Error executing SQL: {err}"),
-                    ));
-                }
-            }
-        }
-        Ok(())
-    }
-
+    /// Closes the database connection.
+    ///
+    /// # Returns
+    ///
+    /// `Ok(())` if the database is closed successfully.
     #[napi]
     pub fn close(&mut self) -> napi::Result<()> {
-        if self.open {
-            self.conn.close().map_err(into_napi_error)?;
-            self.open = false;
-        }
+        let _ = self.inner.take();
         Ok(())
     }
-}
 
-#[derive(Debug, Clone)]
-enum PresentationMode {
-    Raw,
-    Pluck,
-    None,
+    /// Sets the default safe integers mode for all statements from this database.
+    ///
+    /// # Arguments
+    ///
+    /// * `toggle` - Whether to use safe integers by default.
+    #[napi(js_name = "defaultSafeIntegers")]
+    pub fn default_safe_integers(&self, toggle: Option<bool>) -> napi::Result<()> {
+        *self.inner()?.default_safe_integers.lock().unwrap() = toggle.unwrap_or(true);
+        Ok(())
+    }
+
+    /// Runs the I/O loop synchronously.
+    #[napi]
+    pub fn io_loop_sync(&self) -> napi::Result<()> {
+        let io = &self.inner()?.io;
+        io.step().map_err(|e| to_generic_error("IO error", e))?;
+        Ok(())
+    }
+
+    /// Runs the I/O loop asynchronously, returning a Promise.
+    #[napi(ts_return_type = "Promise<void>")]
+    pub fn io_loop_async(&self) -> napi::Result<AsyncTask<IoLoopTask>> {
+        let io = self.inner()?.io.clone();
+        Ok(AsyncTask::new(IoLoopTask { io }))
+    }
 }
 
 #[napi]
-#[derive(Clone)]
-pub struct Statement {
-    // TODO: implement each property when core supports it
-    // #[napi(able = false)]
-    // pub reader: bool,
-    // #[napi(writable = false)]
-    // pub readonly: bool,
-    // #[napi(writable = false)]
-    // pub busy: bool,
-    #[napi(writable = false)]
-    pub source: String,
+pub struct BatchExecutor {
+    conn: Option<Arc<turso_core::Connection>>,
+    sql: String,
+    position: usize,
+    stmt: Option<Arc<RefCell<turso_core::Statement>>>,
+}
 
-    database: Database,
-    presentation_mode: PresentationMode,
-    binded: bool,
-    inner: Rc<RefCell<turso_core::Statement>>,
+#[napi]
+impl BatchExecutor {
+    #[napi]
+    pub fn step_sync(&mut self) -> Result<u32> {
+        loop {
+            if self.stmt.is_none() && self.position >= self.sql.len() {
+                return Ok(STEP_DONE);
+            }
+            if self.stmt.is_none() {
+                let conn = self.conn.as_ref().unwrap();
+                match conn.consume_stmt(&self.sql[self.position..]) {
+                    #[allow(clippy::arc_with_non_send_sync)]
+                    Ok(Some((stmt, offset))) => {
+                        self.position += offset;
+                        self.stmt = Some(Arc::new(RefCell::new(stmt)));
+                    }
+                    Ok(None) => return Ok(STEP_DONE),
+                    Err(err) => return Err(to_generic_error("failed to consume stmt", err)),
+                }
+            }
+            let stmt = self.stmt.as_ref().unwrap();
+            match step_sync(stmt) {
+                Ok(STEP_DONE) => {
+                    let _ = self.stmt.take();
+                    continue;
+                }
+                result => return result,
+            }
+        }
+    }
+
+    #[napi]
+    pub fn reset(&mut self) {
+        let _ = self.conn.take();
+        let _ = self.stmt.take();
+    }
+}
+
+/// A prepared statement.
+#[napi]
+pub struct Statement {
+    stmt: Option<Arc<RefCell<turso_core::Statement>>>,
+    column_names: Vec<std::ffi::CString>,
+    mode: RefCell<PresentationMode>,
+    safe_integers: Cell<bool>,
 }
 
 #[napi]
 impl Statement {
-    pub fn new(inner: RefCell<turso_core::Statement>, database: Database, source: String) -> Self {
-        Self {
-            inner: Rc::new(inner),
-            database,
-            source,
-            presentation_mode: PresentationMode::None,
-            binded: false,
-        }
+    pub fn stmt(&self) -> napi::Result<&Arc<RefCell<turso_core::Statement>>> {
+        self.stmt
+            .as_ref()
+            .ok_or_else(|| create_generic_error("statement has been finalized"))
+    }
+    #[napi]
+    pub fn reset(&self) -> Result<()> {
+        self.stmt()?.borrow_mut().reset();
+        Ok(())
     }
 
+    /// Returns the number of parameters in the statement.
     #[napi]
-    pub fn get(&self, env: Env, args: Option<Vec<JsUnknown>>) -> napi::Result<JsUnknown> {
-        let mut stmt = self.check_and_bind(env, args)?;
+    pub fn parameter_count(&self) -> Result<u32> {
+        Ok(self.stmt()?.borrow().parameters_count() as u32)
+    }
 
-        loop {
-            let step = stmt.step().map_err(into_napi_error)?;
-            match step {
-                turso_core::StepResult::Row => {
-                    let row = stmt.row().unwrap();
+    /// Returns the name of a parameter at a specific 1-based index.
+    ///
+    /// # Arguments
+    ///
+    /// * `index` - The 1-based parameter index.
+    #[napi]
+    pub fn parameter_name(&self, index: u32) -> Result<Option<String>> {
+        let non_zero_idx = NonZeroUsize::new(index as usize).ok_or_else(|| {
+            create_error(Status::InvalidArg, "parameter index must be greater than 0")
+        })?;
 
-                    match self.presentation_mode {
-                        PresentationMode::Raw => {
-                            let mut raw_obj = env.create_array(row.len() as u32)?;
-                            for (idx, value) in row.get_values().enumerate() {
-                                let js_value = to_js_value(&env, value);
+        let stmt = self.stmt()?.borrow();
+        Ok(stmt.parameters().name(non_zero_idx).map(|s| s.to_string()))
+    }
 
-                                raw_obj.set(idx as u32, js_value)?;
-                            }
-
-                            return Ok(raw_obj.coerce_to_object()?.into_unknown());
-                        }
-                        PresentationMode::Pluck => {
-                            let (_, value) =
-                                row.get_values().enumerate().next().ok_or(napi::Error::new(
-                                    napi::Status::GenericFailure,
-                                    "Pluck mode requires at least one column in the result",
-                                ))?;
-                            let js_value = to_js_value(&env, value)?;
-
-                            return Ok(js_value);
-                        }
-                        PresentationMode::None => {
-                            let mut obj = env.create_object()?;
-
-                            for (idx, value) in row.get_values().enumerate() {
-                                let key = stmt.get_column_name(idx);
-                                let js_value = to_js_value(&env, value);
-
-                                obj.set_named_property(&key, js_value)?;
-                            }
-
-                            return Ok(obj.into_unknown());
-                        }
-                    }
-                }
-                turso_core::StepResult::Done => return Ok(env.get_undefined()?.into_unknown()),
-                turso_core::StepResult::IO => {
-                    stmt.run_once().map_err(into_napi_error)?;
-                    continue;
-                }
-                turso_core::StepResult::Interrupt | turso_core::StepResult::Busy => {
-                    return Err(napi::Error::new(
-                        napi::Status::GenericFailure,
-                        format!("{step:?}"),
-                    ))
+    /// Binds a parameter at a specific 1-based index with explicit type.
+    ///
+    /// # Arguments
+    ///
+    /// * `index` - The 1-based parameter index.
+    /// * `value_type` - The type constant (0=null, 1=int, 2=float, 3=text, 4=blob).
+    /// * `value` - The value to bind.
+    #[napi]
+    pub fn bind_at(&self, index: u32, value: Unknown) -> Result<()> {
+        let non_zero_idx = NonZeroUsize::new(index as usize).ok_or_else(|| {
+            create_error(Status::InvalidArg, "parameter index must be greater than 0")
+        })?;
+        let value_type = value.get_type()?;
+        let turso_value = match value_type {
+            ValueType::Null => turso_core::Value::Null,
+            ValueType::Number => {
+                let n: f64 = unsafe { value.cast()? };
+                if n.fract() == 0.0 && n >= i64::MIN as f64 && n <= i64::MAX as f64 {
+                    turso_core::Value::Integer(n as i64)
+                } else {
+                    turso_core::Value::Float(n)
                 }
             }
-        }
-    }
+            ValueType::BigInt => {
+                let bigint_str = value.coerce_to_string()?.into_utf8()?.as_str()?.to_owned();
+                let bigint_value = bigint_str
+                    .parse::<i64>()
+                    .map_err(|e| to_error(Status::NumberExpected, "failed to parse BigInt", e))?;
+                turso_core::Value::Integer(bigint_value)
+            }
+            ValueType::String => {
+                let s = value.coerce_to_string()?.into_utf8()?;
+                turso_core::Value::Text(s.as_str()?.to_owned().into())
+            }
+            ValueType::Boolean => {
+                let b: bool = unsafe { value.cast()? };
+                turso_core::Value::Integer(if b { 1 } else { 0 })
+            }
+            ValueType::Object => {
+                let obj = value.coerce_to_object()?;
 
-    #[napi]
-    pub fn run(&self, env: Env, args: Option<Vec<JsUnknown>>) -> napi::Result<RunResult> {
-        self.run_and_build_info_object(|| self.run_internal(env, args))
-    }
-
-    fn run_internal(&self, env: Env, args: Option<Vec<JsUnknown>>) -> napi::Result<JsUnknown> {
-        let stmt = self.check_and_bind(env, args)?;
-
-        self.internal_all(env, stmt)
-    }
-
-    fn run_and_build_info_object<T, E>(
-        &self,
-        query_fn: impl FnOnce() -> Result<T, E>,
-    ) -> Result<RunResult, E> {
-        let total_changes_before = self.database.conn.total_changes();
-
-        query_fn()?;
-
-        let last_insert_rowid = self.database.conn.last_insert_rowid();
-        let changes = if self.database.conn.total_changes() == total_changes_before {
-            0
-        } else {
-            self.database.conn.changes()
+                if obj.is_buffer()? || obj.is_typedarray()? {
+                    let length = obj.get_named_property::<u32>("length")?;
+                    let mut bytes = Vec::with_capacity(length as usize);
+                    for i in 0..length {
+                        let byte = obj.get_element::<u32>(i)?;
+                        bytes.push(byte as u8);
+                    }
+                    turso_core::Value::Blob(bytes)
+                } else {
+                    let s = value.coerce_to_string()?.into_utf8()?;
+                    turso_core::Value::Text(s.as_str()?.to_owned().into())
+                }
+            }
+            _ => {
+                let s = value.coerce_to_string()?.into_utf8()?;
+                turso_core::Value::Text(s.as_str()?.to_owned().into())
+            }
         };
 
-        Ok(RunResult {
-            changes,
-            last_insert_rowid,
-        })
+        self.stmt()?.borrow_mut().bind_at(non_zero_idx, turso_value);
+        Ok(())
     }
 
+    /// Step the statement and return result code (executed on the main thread):
+    /// 1 = Row available, 2 = Done, 3 = I/O needed
     #[napi]
-    pub fn iterate(
-        &self,
-        env: Env,
-        args: Option<Vec<JsUnknown>>,
-    ) -> napi::Result<IteratorStatement> {
-        if let Some(some_args) = args.as_ref() {
-            if some_args.iter().len() != 0 {
-                self.check_and_bind(env, args)?;
+    pub fn step_sync(&self) -> Result<u32> {
+        step_sync(self.stmt()?)
+    }
+
+    /// Get the current row data according to the presentation mode
+    #[napi]
+    pub fn row<'env>(&self, env: &'env Env) -> Result<Unknown<'env>> {
+        let stmt = self.stmt()?.borrow();
+        let row_data = stmt
+            .row()
+            .ok_or_else(|| create_generic_error("no row data available"))?;
+
+        let mode = self.mode.borrow();
+        let safe_integers = self.safe_integers.get();
+        let row_value = match *mode {
+            PresentationMode::Raw => {
+                let mut raw_array = env.create_array(row_data.len() as u32)?;
+                for (idx, value) in row_data.get_values().enumerate() {
+                    let js_value = to_js_value(env, value, safe_integers)?;
+                    raw_array.set(idx as u32, js_value)?;
+                }
+                raw_array.coerce_to_object()?.to_unknown()
             }
-        }
-
-        Ok(IteratorStatement {
-            stmt: Rc::clone(&self.inner),
-            _database: self.database.clone(),
-            env,
-            presentation_mode: self.presentation_mode.clone(),
-        })
-    }
-
-    #[napi]
-    pub fn all(&self, env: Env, args: Option<Vec<JsUnknown>>) -> napi::Result<JsUnknown> {
-        let stmt = self.check_and_bind(env, args)?;
-
-        self.internal_all(env, stmt)
-    }
-
-    fn internal_all(
-        &self,
-        env: Env,
-        mut stmt: RefMut<'_, turso_core::Statement>,
-    ) -> napi::Result<JsUnknown> {
-        let mut results = env.create_empty_array()?;
-        let mut index = 0;
-        loop {
-            match stmt.step().map_err(into_napi_error)? {
-                turso_core::StepResult::Row => {
-                    let row = stmt.row().unwrap();
-
-                    match self.presentation_mode {
-                        PresentationMode::Raw => {
-                            let mut raw_array = env.create_array(row.len() as u32)?;
-                            for (idx, value) in row.get_values().enumerate() {
-                                let js_value = to_js_value(&env, value)?;
-                                raw_array.set(idx as u32, js_value)?;
-                            }
-                            results.set_element(index, raw_array.coerce_to_object()?)?;
-                            index += 1;
-                            continue;
-                        }
-                        PresentationMode::Pluck => {
-                            let (_, value) =
-                                row.get_values().enumerate().next().ok_or(napi::Error::new(
-                                    napi::Status::GenericFailure,
-                                    "Pluck mode requires at least one column in the result",
-                                ))?;
-                            let js_value = to_js_value(&env, value)?;
-                            results.set_element(index, js_value)?;
-                            index += 1;
-                            continue;
-                        }
-                        PresentationMode::None => {
-                            let mut obj = env.create_object()?;
-                            for (idx, value) in row.get_values().enumerate() {
-                                let key = stmt.get_column_name(idx);
-                                let js_value = to_js_value(&env, value);
-                                obj.set_named_property(&key, js_value)?;
-                            }
-                            results.set_element(index, obj)?;
-                            index += 1;
-                        }
+            PresentationMode::Pluck => {
+                let (_, value) =
+                    row_data
+                        .get_values()
+                        .enumerate()
+                        .next()
+                        .ok_or(create_generic_error(
+                            "pluck mode requires at least one column in the result",
+                        ))?;
+                to_js_value(env, value, safe_integers)?
+            }
+            PresentationMode::Expanded => {
+                let row = Object::new(env)?;
+                let raw_row = row.raw();
+                let raw_env = env.raw();
+                for idx in 0..row_data.len() {
+                    let value = row_data.get_value(idx);
+                    let column_name = &self.column_names[idx];
+                    let js_value = to_js_value(env, value, safe_integers)?;
+                    unsafe {
+                        napi::sys::napi_set_named_property(
+                            raw_env,
+                            raw_row,
+                            column_name.as_ptr(),
+                            js_value.raw(),
+                        );
                     }
                 }
-                turso_core::StepResult::Done => {
-                    break;
-                }
-                turso_core::StepResult::IO => {
-                    stmt.run_once().map_err(into_napi_error)?;
-                }
-                turso_core::StepResult::Interrupt | turso_core::StepResult::Busy => {
-                    return Err(napi::Error::new(
-                        napi::Status::GenericFailure,
-                        format!("{:?}", stmt.step()),
-                    ));
-                }
+                row.to_unknown()
             }
-        }
-
-        Ok(results.into_unknown())
-    }
-
-    #[napi]
-    pub fn pluck(&mut self, pluck: Option<bool>) {
-        self.presentation_mode = match pluck {
-            Some(false) => PresentationMode::None,
-            _ => PresentationMode::Pluck,
         };
+
+        Ok(row_value)
     }
 
-    #[napi]
-    pub fn expand() {
-        todo!()
-    }
-
+    /// Sets the presentation mode to raw.
     #[napi]
     pub fn raw(&mut self, raw: Option<bool>) {
-        self.presentation_mode = match raw {
-            Some(false) => PresentationMode::None,
+        self.mode = RefCell::new(match raw {
+            Some(false) => PresentationMode::Expanded,
             _ => PresentationMode::Raw,
-        };
+        });
     }
 
+    /// Sets the presentation mode to pluck.
     #[napi]
-    pub fn columns() {
-        todo!()
+    pub fn pluck(&mut self, pluck: Option<bool>) {
+        self.mode = RefCell::new(match pluck {
+            Some(false) => PresentationMode::Expanded,
+            _ => PresentationMode::Pluck,
+        });
     }
 
-    #[napi]
-    pub fn bind(&mut self, env: Env, args: Option<Vec<JsUnknown>>) -> napi::Result<Self, String> {
-        self.check_and_bind(env, args)
-            .map_err(with_sqlite_error_message)?;
-        self.binded = true;
-
-        Ok(self.clone())
+    /// Sets safe integers mode for this statement.
+    ///
+    /// # Arguments
+    ///
+    /// * `toggle` - Whether to use safe integers.
+    #[napi(js_name = "safeIntegers")]
+    pub fn safe_integers(&self, toggle: Option<bool>) {
+        self.safe_integers.set(toggle.unwrap_or(true));
     }
 
-    /// Check if the Statement is already binded by the `bind()` method
-    /// and bind values to variables.
-    fn check_and_bind(
-        &self,
-        env: Env,
-        args: Option<Vec<JsUnknown>>,
-    ) -> napi::Result<RefMut<'_, turso_core::Statement>> {
-        let mut stmt = self.inner.borrow_mut();
-        stmt.reset();
-        if let Some(args) = args {
-            if self.binded {
-                let err = napi::Error::new(
-                    into_convertible_type_error_message("TypeError"),
-                    "The bind() method can only be invoked once per statement object",
-                );
-                unsafe {
-                    napi::JsTypeError::from(err).throw_into(env.raw());
-                }
+    /// Get column information for the statement
+    #[napi(ts_return_type = "Promise<any>")]
+    pub fn columns<'env>(&self, env: &'env Env) -> Result<Array<'env>> {
+        let stmt = self.stmt()?.borrow();
 
-                return Err(napi::Error::from_status(napi::Status::PendingException));
+        let column_count = stmt.num_columns();
+        let mut js_array = env.create_array(column_count as u32)?;
+
+        for i in 0..column_count {
+            let mut js_obj = Object::new(env)?;
+            let column_name = stmt.get_column_name(i);
+            let column_type = stmt.get_column_type(i);
+
+            // Set the name property
+            js_obj.set("name", column_name.as_ref())?;
+
+            // Set type property if available
+            match column_type {
+                Some(type_str) => js_obj.set("type", type_str.as_str())?,
+                None => js_obj.set("type", ToNapiValue::into_unknown(Null, env)?)?,
             }
 
-            if args.len() == 1 && matches!(args[0].get_type()?, napi::ValueType::Object) {
-                bind_named_parameters(&mut stmt, args)?;
-            } else {
-                bind_parameters(&mut stmt, args)?;
-            }
+            // For now, set other properties to null since turso_core doesn't provide this metadata
+            js_obj.set("column", ToNapiValue::into_unknown(Null, env)?)?;
+            js_obj.set("table", ToNapiValue::into_unknown(Null, env)?)?;
+            js_obj.set("database", ToNapiValue::into_unknown(Null, env)?)?;
+
+            js_array.set(i as u32, js_obj)?;
         }
 
-        Ok(stmt)
+        Ok(js_array)
+    }
+
+    /// Finalizes the statement.
+    #[napi]
+    pub fn finalize(&mut self) -> Result<()> {
+        let _ = self.stmt.take();
+        Ok(())
     }
 }
 
-fn bind_parameters(
-    stmt: &mut RefMut<'_, turso_core::Statement>,
-    args: Vec<JsUnknown>,
-) -> Result<(), napi::Error> {
-    for (i, elem) in args.into_iter().enumerate() {
-        let value = from_js_value(elem)?;
-        stmt.bind_at(NonZeroUsize::new(i + 1).unwrap(), value);
+/// Async task for running the I/O loop.
+pub struct IoLoopTask {
+    // this field is public because it is also set in the sync package
+    pub io: Arc<dyn turso_core::IO>,
+}
+
+impl Task for IoLoopTask {
+    type Output = ();
+    type JsValue = ();
+
+    fn compute(&mut self) -> napi::Result<Self::Output> {
+        self.io
+            .step()
+            .map_err(|e| to_generic_error("IO error", e))?;
+        Ok(())
     }
-    Ok(())
-}
 
-fn bind_named_parameters(
-    stmt: &mut RefMut<'_, turso_core::Statement>,
-    args: Vec<JsUnknown>,
-) -> Result<(), napi::Error> {
-    let obj: napi::JsObject = args.into_iter().next().unwrap().coerce_to_object()?;
-    for idx in 1..stmt.parameters_count() {
-        let non_zero_idx = NonZero::new(idx).unwrap();
-
-        let param = stmt.parameters().name(non_zero_idx);
-        let Some(name) = param else {
-            return Err(napi::Error::from_status(napi::Status::GenericFailure));
-        };
-
-        let value = obj.get_named_property::<napi::JsUnknown>(&name)?;
-        stmt.bind_at(non_zero_idx, from_js_value(value)?);
-    }
-    Ok(())
-}
-
-#[napi(iterator)]
-pub struct IteratorStatement {
-    stmt: Rc<RefCell<turso_core::Statement>>,
-    _database: Database,
-    env: Env,
-    presentation_mode: PresentationMode,
-}
-
-impl Generator for IteratorStatement {
-    type Yield = JsUnknown;
-
-    type Next = ();
-
-    type Return = ();
-
-    fn next(&mut self, _: Option<Self::Next>) -> Option<Self::Yield> {
-        let mut stmt = self.stmt.borrow_mut();
-
-        loop {
-            match stmt.step().ok()? {
-                turso_core::StepResult::Row => {
-                    let row = stmt.row().unwrap();
-
-                    match self.presentation_mode {
-                        PresentationMode::Raw => {
-                            let mut raw_array = self.env.create_array(row.len() as u32).ok()?;
-                            for (idx, value) in row.get_values().enumerate() {
-                                let js_value = to_js_value(&self.env, value);
-                                raw_array.set(idx as u32, js_value).ok()?;
-                            }
-
-                            return Some(raw_array.coerce_to_object().ok()?.into_unknown());
-                        }
-                        PresentationMode::Pluck => {
-                            let (_, value) = row.get_values().enumerate().next()?;
-                            return to_js_value(&self.env, value).ok();
-                        }
-                        PresentationMode::None => {
-                            let mut js_row = self.env.create_object().ok()?;
-                            for (idx, value) in row.get_values().enumerate() {
-                                let key = stmt.get_column_name(idx);
-                                let js_value = to_js_value(&self.env, value);
-                                js_row.set_named_property(&key, js_value).ok()?;
-                            }
-
-                            return Some(js_row.into_unknown());
-                        }
-                    }
-                }
-                turso_core::StepResult::Done => return None,
-                turso_core::StepResult::IO => {
-                    stmt.run_once().ok()?;
-                    continue;
-                }
-                turso_core::StepResult::Interrupt | turso_core::StepResult::Busy => return None,
-            }
-        }
+    fn resolve(&mut self, _env: Env, _output: Self::Output) -> napi::Result<Self::JsValue> {
+        Ok(())
     }
 }
 
-fn to_js_value(env: &napi::Env, value: &turso_core::Value) -> napi::Result<JsUnknown> {
+/// Convert a Turso value to a JavaScript value.
+fn to_js_value<'a>(
+    env: &'a napi::Env,
+    value: &turso_core::Value,
+    safe_integers: bool,
+) -> napi::Result<Unknown<'a>> {
     match value {
-        turso_core::Value::Null => Ok(env.get_null()?.into_unknown()),
-        turso_core::Value::Integer(i) => Ok(env.create_int64(*i)?.into_unknown()),
-        turso_core::Value::Float(f) => Ok(env.create_double(*f)?.into_unknown()),
-        turso_core::Value::Text(s) => Ok(env.create_string(s.as_str())?.into_unknown()),
-        turso_core::Value::Blob(b) => Ok(env.create_buffer_copy(b.as_slice())?.into_unknown()),
-    }
-}
-
-fn from_js_value(value: JsUnknown) -> napi::Result<turso_core::Value> {
-    match value.get_type()? {
-        napi::ValueType::Undefined | napi::ValueType::Null | napi::ValueType::Unknown => {
-            Ok(turso_core::Value::Null)
-        }
-        napi::ValueType::Boolean => {
-            let b = value.coerce_to_bool()?.get_value()?;
-            Ok(turso_core::Value::Integer(b as i64))
-        }
-        napi::ValueType::Number => {
-            let num = value.coerce_to_number()?.get_double()?;
-            if num.fract() == 0.0 {
-                Ok(turso_core::Value::Integer(num as i64))
+        turso_core::Value::Null => ToNapiValue::into_unknown(Null, env),
+        turso_core::Value::Integer(i) => {
+            if safe_integers {
+                let bigint = BigInt::from(*i);
+                ToNapiValue::into_unknown(bigint, env)
             } else {
-                Ok(turso_core::Value::Float(num))
+                ToNapiValue::into_unknown(*i as f64, env)
             }
         }
-        napi::ValueType::String => {
-            let s = value.coerce_to_string()?;
-            Ok(turso_core::Value::Text(s.into_utf8()?.as_str()?.into()))
+        turso_core::Value::Float(f) => ToNapiValue::into_unknown(*f, env),
+        turso_core::Value::Text(s) => ToNapiValue::into_unknown(s.as_str(), env),
+        turso_core::Value::Blob(b) => {
+            #[cfg(not(feature = "browser"))]
+            {
+                let buffer = Buffer::from(b.as_slice());
+                ToNapiValue::into_unknown(buffer, env)
+            }
+            // emnapi do not support Buffer
+            #[cfg(feature = "browser")]
+            {
+                let buffer = Uint8Array::from(b.as_slice());
+                ToNapiValue::into_unknown(buffer, env)
+            }
         }
-        napi::ValueType::Symbol
-        | napi::ValueType::Object
-        | napi::ValueType::Function
-        | napi::ValueType::External => Err(napi::Error::new(
-            napi::Status::GenericFailure,
-            "Unsupported type",
-        )),
     }
-}
-
-struct DatabaseFile {
-    file: Arc<dyn turso_core::File>,
-}
-
-unsafe impl Send for DatabaseFile {}
-unsafe impl Sync for DatabaseFile {}
-
-impl DatabaseFile {
-    pub fn new(file: Arc<dyn turso_core::File>) -> Self {
-        Self { file }
-    }
-}
-
-impl turso_core::DatabaseStorage for DatabaseFile {
-    fn read_page(&self, page_idx: usize, c: turso_core::Completion) -> turso_core::Result<()> {
-        let r = match c.completion_type {
-            turso_core::CompletionType::Read(ref r) => r,
-            _ => unreachable!(),
-        };
-        let size = r.buf().len();
-        assert!(page_idx > 0);
-        if !(512..=65536).contains(&size) || size & (size - 1) != 0 {
-            return Err(turso_core::LimboError::NotADB);
-        }
-        let pos = (page_idx - 1) * size;
-        self.file.pread(pos, c.into())?;
-        Ok(())
-    }
-
-    fn write_page(
-        &self,
-        page_idx: usize,
-        buffer: Arc<std::cell::RefCell<turso_core::Buffer>>,
-        c: turso_core::Completion,
-    ) -> turso_core::Result<()> {
-        let size = buffer.borrow().len();
-        let pos = (page_idx - 1) * size;
-        self.file.pwrite(pos, buffer, c.into())?;
-        Ok(())
-    }
-
-    fn sync(&self, c: turso_core::Completion) -> turso_core::Result<()> {
-        let _ = self.file.sync(c.into())?;
-        Ok(())
-    }
-
-    fn size(&self) -> turso_core::Result<u64> {
-        self.file.size()
-    }
-}
-
-#[inline]
-fn into_napi_error(limbo_error: LimboError) -> napi::Error {
-    napi::Error::new(napi::Status::GenericFailure, format!("{limbo_error}"))
-}
-
-#[inline]
-fn into_napi_sqlite_error(limbo_error: LimboError) -> napi::Error<String> {
-    napi::Error::new(String::from("SQLITE_ERROR"), format!("{limbo_error}"))
-}
-
-#[inline]
-fn into_napi_error_with_message(
-    error_code: String,
-    limbo_error: LimboError,
-) -> napi::Error<String> {
-    napi::Error::new(error_code, format!("{limbo_error}"))
-}
-
-#[inline]
-fn with_sqlite_error_message(err: napi::Error) -> napi::Error<String> {
-    napi::Error::new("SQLITE_ERROR".to_owned(), err.reason)
-}
-
-#[inline]
-fn into_convertible_type_error_message(error_type: &str) -> String {
-    "[TURSO_CONVERT_TYPE]".to_owned() + error_type
 }

@@ -1,24 +1,10 @@
-use turso_sqlite3_parser::ast::{self, SortOrder};
+use turso_parser::ast::{fmt::ToTokens, SortOrder};
 
 use std::sync::Arc;
 
-use crate::{
-    schema::{Affinity, Index, IndexColumn, Table},
-    translate::{
-        plan::{DistinctCtx, Distinctness},
-        result_row::emit_select_result,
-    },
-    types::SeekOp,
-    vdbe::{
-        builder::{CursorKey, CursorType, ProgramBuilder},
-        insn::{CmpInsFlags, IdxInsertFlags, Insn},
-        BranchOffset, CursorID,
-    },
-    Result,
-};
-
 use super::{
-    aggregation::translate_aggregation_step,
+    aggregation::{translate_aggregation_step, AggArgumentSource},
+    display::PlanContext,
     emitter::{OperationMode, TranslateCtx},
     expr::{
         translate_condition_expr, translate_expr, translate_expr_no_constant_opt,
@@ -28,9 +14,25 @@ use super::{
     optimizer::Optimizable,
     order_by::{order_by_sorter_insert, sorter_insert},
     plan::{
-        convert_where_to_vtab_constraint, Aggregate, GroupBy, IterationDirection, JoinOrderMember,
-        Operation, QueryDestination, Search, SeekDef, SelectPlan, TableReferences, WhereTerm,
+        Aggregate, GroupBy, IterationDirection, JoinOrderMember, Operation, QueryDestination,
+        Search, SeekDef, SelectPlan, TableReferences, WhereTerm,
     },
+};
+use crate::translate::window::emit_window_loop_source;
+use crate::{
+    schema::{Affinity, Index, IndexColumn, Table},
+    translate::{
+        emitter::prepare_cdc_if_necessary,
+        plan::{DistinctCtx, Distinctness, Scan},
+        result_row::emit_select_result,
+    },
+    types::SeekOp,
+    vdbe::{
+        builder::{CursorKey, CursorType, ProgramBuilder},
+        insn::{CmpInsFlags, IdxInsertFlags, Insn},
+        BranchOffset, CursorID,
+    },
+    Result,
 };
 
 // Metadata for handling LEFT JOIN operations
@@ -76,16 +78,22 @@ pub fn init_distinct(program: &mut ProgramBuilder, plan: &SelectPlan) -> Distinc
             .result_columns
             .iter()
             .enumerate()
-            .map(|(i, col)| IndexColumn {
-                name: col.expr.to_string(),
-                order: SortOrder::Asc,
-                pos_in_table: i,
-                collation: None, // FIXME: this should be determined based on the result column expression!
-                default: None, // FIXME: this should be determined based on the result column expression!
+            .map(|(i, col)| {
+                IndexColumn {
+                    name: col
+                        .expr
+                        .displayer(&PlanContext(&[&plan.table_references]))
+                        .to_string(),
+                    order: SortOrder::Asc,
+                    pos_in_table: i,
+                    collation: None, // FIXME: this should be determined based on the result column expression!
+                    default: None, // FIXME: this should be determined based on the result column expression!
+                }
             })
             .collect(),
         unique: false,
         has_rowid: false,
+        where_clause: None,
     });
     let cursor_id = program.alloc_cursor_id(CursorType::BTreeIndex(index.clone()));
     let ctx = DistinctCtx {
@@ -117,28 +125,15 @@ pub fn init_loop(
         "meta_left_joins length does not match tables length"
     );
 
-    let cdc_table = program.capture_data_changes_mode().table();
-    if cdc_table.is_some()
-        && matches!(
-            mode,
-            OperationMode::INSERT | OperationMode::UPDATE | OperationMode::DELETE
-        )
-    {
+    if matches!(
+        mode,
+        OperationMode::INSERT | OperationMode::UPDATE | OperationMode::DELETE
+    ) {
         assert!(tables.joined_tables().len() == 1);
-        let cdc_table_name = cdc_table.unwrap();
-        if tables.joined_tables()[0].table.get_name() != cdc_table_name {
-            let Some(cdc_table) = t_ctx.resolver.schema.get_table(cdc_table_name) else {
-                crate::bail_parse_error!("no such table: {}", cdc_table_name);
-            };
-            let Some(cdc_btree) = cdc_table.btree().clone() else {
-                crate::bail_parse_error!("no such table: {}", cdc_table_name);
-            };
-            let cdc_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(cdc_btree.clone()));
-            program.emit_insn(Insn::OpenWrite {
-                cursor_id: cdc_cursor_id,
-                root_page: cdc_btree.root_page.into(),
-                name: cdc_btree.name.clone(),
-            });
+        let changed_table = &tables.joined_tables()[0].table;
+        let prepared =
+            prepare_cdc_if_necessary(program, t_ctx.resolver.schema, changed_table.get_name())?;
+        if let Some((cdc_cursor_id, _)) = prepared {
             t_ctx.cdc_cursor_id = Some(cdc_cursor_id);
         }
     }
@@ -153,14 +148,18 @@ pub fn init_loop(
             agg.args.len() == 1,
             "DISTINCT aggregate functions must have exactly one argument"
         );
-        let index_name = format!("distinct_agg_{}_{}", i, agg.args[0]);
+        let index_name = format!(
+            "distinct_agg_{}_{}",
+            i,
+            agg.args[0].displayer(&PlanContext(&[tables]))
+        );
         let index = Arc::new(Index {
             name: index_name.clone(),
             table_name: String::new(),
             ephemeral: true,
             root_page: 0,
             columns: vec![IndexColumn {
-                name: agg.args[0].to_string(),
+                name: agg.args[0].displayer(&PlanContext(&[tables])).to_string(),
                 order: SortOrder::Asc,
                 pos_in_table: 0,
                 collation: None, // FIXME: this should be inferred from the expression
@@ -168,6 +167,7 @@ pub fn init_loop(
             }],
             has_rowid: false,
             unique: false,
+            where_clause: None,
         });
         let cursor_id = program.alloc_cursor_id(CursorType::BTreeIndex(index.clone()));
         if group_by.is_none() {
@@ -198,21 +198,24 @@ pub fn init_loop(
                 t_ctx.meta_left_joins[table_index] = Some(lj_metadata);
             }
         }
-        let (table_cursor_id, index_cursor_id) = table.open_cursors(program, mode)?;
+        let (table_cursor_id, index_cursor_id) =
+            table.open_cursors(program, mode, t_ctx.resolver.schema)?;
         match &table.op {
-            Operation::Scan { index, .. } => match (mode, &table.table) {
+            Operation::Scan(Scan::BTreeTable { index, .. }) => match (mode, &table.table) {
                 (OperationMode::SELECT, Table::BTree(btree)) => {
                     let root_page = btree.root_page;
                     if let Some(cursor_id) = table_cursor_id {
                         program.emit_insn(Insn::OpenRead {
                             cursor_id,
                             root_page,
+                            db: table.database_id,
                         });
                     }
                     if let Some(index_cursor_id) = index_cursor_id {
                         program.emit_insn(Insn::OpenRead {
                             cursor_id: index_cursor_id,
                             root_page: index.as_ref().unwrap().root_page,
+                            db: table.database_id,
                         });
                     }
                 }
@@ -222,13 +225,13 @@ pub fn init_loop(
                         cursor_id: table_cursor_id
                             .expect("table cursor is always opened in OperationMode::DELETE"),
                         root_page: root_page.into(),
-                        name: btree.name.clone(),
+                        db: table.database_id,
                     });
                     if let Some(index_cursor_id) = index_cursor_id {
                         program.emit_insn(Insn::OpenWrite {
                             cursor_id: index_cursor_id,
                             root_page: index.as_ref().unwrap().root_page.into(),
-                            name: index.as_ref().unwrap().name.clone(),
+                            db: table.database_id,
                         });
                     }
                     // For delete, we need to open all the other indexes too for writing
@@ -248,7 +251,7 @@ pub fn init_loop(
                             program.emit_insn(Insn::OpenWrite {
                                 cursor_id,
                                 root_page: index.root_page.into(),
-                                name: index.name.clone(),
+                                db: table.database_id,
                             });
                         }
                     }
@@ -259,23 +262,33 @@ pub fn init_loop(
                         cursor_id: table_cursor_id
                             .expect("table cursor is always opened in OperationMode::UPDATE"),
                         root_page: root_page.into(),
-                        name: btree.name.clone(),
+                        db: table.database_id,
                     });
                     if let Some(index_cursor_id) = index_cursor_id {
                         program.emit_insn(Insn::OpenWrite {
                             cursor_id: index_cursor_id,
                             root_page: index.as_ref().unwrap().root_page.into(),
-                            name: index.as_ref().unwrap().name.clone(),
+                            db: table.database_id,
                         });
-                    }
-                }
-                (_, Table::Virtual(_)) => {
-                    if let Some(cursor_id) = table_cursor_id {
-                        program.emit_insn(Insn::VOpen { cursor_id });
                     }
                 }
                 _ => {}
             },
+            Operation::Scan(Scan::VirtualTable { .. }) => {
+                if let Table::Virtual(tbl) = &table.table {
+                    let is_write = matches!(
+                        mode,
+                        OperationMode::INSERT | OperationMode::UPDATE | OperationMode::DELETE
+                    );
+                    if is_write && tbl.readonly() {
+                        return Err(crate::LimboError::ReadOnly);
+                    }
+                    if let Some(cursor_id) = table_cursor_id {
+                        program.emit_insn(Insn::VOpen { cursor_id });
+                    }
+                }
+            }
+            Operation::Scan(_) => {}
             Operation::Search(search) => {
                 match mode {
                     OperationMode::SELECT => {
@@ -283,6 +296,7 @@ pub fn init_loop(
                             program.emit_insn(Insn::OpenRead {
                                 cursor_id: table_cursor_id,
                                 root_page: table.table.get_root_page(),
+                                db: table.database_id,
                             });
                         }
                     }
@@ -294,7 +308,7 @@ pub fn init_loop(
                         program.emit_insn(Insn::OpenWrite {
                             cursor_id: table_cursor_id,
                             root_page: table.table.get_root_page().into(),
-                            name: table.table.get_name().to_string(),
+                            db: table.database_id,
                         });
 
                         // For DELETE, we need to open all the indexes for writing
@@ -318,7 +332,7 @@ pub fn init_loop(
                                     program.emit_insn(Insn::OpenWrite {
                                         cursor_id,
                                         root_page: index.root_page.into(),
-                                        name: index.name.clone(),
+                                        db: table.database_id,
                                     });
                                 }
                             }
@@ -341,6 +355,7 @@ pub fn init_loop(
                                     cursor_id: index_cursor_id
                                         .expect("index cursor is always opened in Seek with index"),
                                     root_page: index.root_page,
+                                    db: table.database_id,
                                 });
                             }
                             OperationMode::UPDATE | OperationMode::DELETE => {
@@ -348,7 +363,7 @@ pub fn init_loop(
                                     cursor_id: index_cursor_id
                                         .expect("index cursor is always opened in Seek with index"),
                                     root_page: index.root_page.into(),
-                                    name: index.name.clone(),
+                                    db: table.database_id,
                                 });
                             }
                             _ => {
@@ -417,9 +432,9 @@ pub fn open_loop(
         let (table_cursor_id, index_cursor_id) = table.resolve_cursors(program)?;
 
         match &table.op {
-            Operation::Scan { iter_dir, .. } => {
-                match &table.table {
-                    Table::BTree(_) => {
+            Operation::Scan(scan) => {
+                match (scan, &table.table) {
+                    (Scan::BTreeTable { iter_dir, .. }, Table::BTree(_)) => {
                         let iteration_cursor_id = temp_cursor_id.unwrap_or_else(|| {
                             index_cursor_id.unwrap_or_else(|| {
                                 table_cursor_id.expect(
@@ -440,94 +455,41 @@ pub fn open_loop(
                         }
                         program.preassign_label_to_next_insn(loop_start);
                     }
-                    Table::Virtual(vtab) => {
+                    (
+                        Scan::VirtualTable {
+                            idx_num,
+                            idx_str,
+                            constraints,
+                        },
+                        Table::Virtual(_),
+                    ) => {
                         let (start_reg, count, maybe_idx_str, maybe_idx_int) = {
-                            // Virtual‑table modules can receive constraints via xBestIndex.
-                            // They return information with which to pass to VFilter operation.
-                            // We forward every predicate that touches vtab columns.
-                            //
-                            // vtab.col = literal             (always usable)
-                            // vtab.col = outer_table.col     (usable, because outer_table is already positioned)
-                            // vtab.col = later_table.col     (forwarded with usable = false)
-                            //
-                            // xBestIndex decides which ones it wants by setting argvIndex and whether the
-                            // core layer may omit them (omit = true).
-                            // We then materialise the RHS/LHS into registers before issuing VFilter.
-                            let converted_constraints = predicates
-                                .iter()
-                                .enumerate()
-                                .filter(|(_, p)| p.should_eval_at_loop(join_index, join_order))
-                                .filter_map(|(i, p)| {
-                                    // Build ConstraintInfo from the predicates
-                                    convert_where_to_vtab_constraint(
-                                        p,
-                                        joined_table_index,
-                                        i,
-                                        join_order,
-                                    )
-                                    .unwrap_or(None)
-                                })
-                                .collect::<Vec<_>>();
-                            // TODO: get proper order_by information to pass to the vtab.
-                            // maybe encode more info on t_ctx? we need: [col_idx, is_descending]
-                            let index_info = vtab.best_index(&converted_constraints, &[]);
-
-                            // Determine the number of VFilter arguments (constraints with an argv_index).
-                            let args_needed = index_info
-                                .constraint_usages
-                                .iter()
-                                .filter(|u| u.argv_index.is_some())
-                                .count();
+                            let args_needed = constraints.len();
                             let start_reg = program.alloc_registers(args_needed);
 
-                            // For each constraint used by best_index, translate the opposite side.
-                            for (i, usage) in index_info.constraint_usages.iter().enumerate() {
-                                if let Some(argv_index) = usage.argv_index {
-                                    if let Some(cinfo) = converted_constraints.get(i) {
-                                        let (pred_idx, is_rhs) = cinfo.unpack_plan_info();
-                                        if let ast::Expr::Binary(lhs, _, rhs) =
-                                            &predicates[pred_idx].expr
-                                        {
-                                            // translate the opposite side of the referenced vtab column
-                                            let expr = if is_rhs { lhs } else { rhs };
-                                            // argv_index is 1-based; adjust to get the proper register offset.
-                                            if argv_index == 0 {
-                                                // invalid since argv_index is 1-based
-                                                continue;
-                                            }
-                                            let target_reg = start_reg + (argv_index - 1) as usize;
-                                            translate_expr(
-                                                program,
-                                                Some(table_references),
-                                                expr,
-                                                target_reg,
-                                                &t_ctx.resolver,
-                                            )?;
-                                            if cinfo.usable && usage.omit {
-                                                predicates[pred_idx].consumed.set(true);
-                                            }
-                                        }
-                                    }
-                                }
+                            for (argv_index, expr) in constraints.iter().enumerate() {
+                                let target_reg = start_reg + argv_index;
+                                translate_expr(
+                                    program,
+                                    Some(table_references),
+                                    expr,
+                                    target_reg,
+                                    &t_ctx.resolver,
+                                )?;
                             }
 
                             // If best_index provided an idx_str, translate it.
-                            let maybe_idx_str = if let Some(idx_str) = index_info.idx_str {
+                            let maybe_idx_str = if let Some(idx_str) = idx_str {
                                 let reg = program.alloc_register();
                                 program.emit_insn(Insn::String8 {
                                     dest: reg,
-                                    value: idx_str,
+                                    value: idx_str.to_owned(),
                                 });
                                 Some(reg)
                             } else {
                                 None
                             };
-                            (
-                                start_reg,
-                                args_needed,
-                                maybe_idx_str,
-                                Some(index_info.idx_num),
-                            )
+                            (start_reg, args_needed, maybe_idx_str, Some(*idx_num))
                         };
 
                         // Emit VFilter with the computed arguments.
@@ -542,7 +504,7 @@ pub fn open_loop(
                         });
                         program.preassign_label_to_next_insn(loop_start);
                     }
-                    Table::FromClauseSubquery(from_clause_subquery) => {
+                    (Scan::Subquery, Table::FromClauseSubquery(from_clause_subquery)) => {
                         let (yield_reg, coroutine_implementation_start) =
                             match &from_clause_subquery.plan.query_destination {
                                 QueryDestination::CoroutineYield {
@@ -567,6 +529,10 @@ pub fn open_loop(
                             end_offset: loop_end,
                         });
                     }
+                    _ => unreachable!(
+                        "{:?} scan cannot be used with {:?} table",
+                        scan, table.table
+                    ),
                 }
 
                 if let Some(table_cursor_id) = table_cursor_id {
@@ -576,26 +542,6 @@ pub fn open_loop(
                             table_cursor_id,
                         });
                     }
-                }
-
-                for cond in predicates
-                    .iter()
-                    .filter(|cond| cond.should_eval_at_loop(join_index, join_order))
-                {
-                    let jump_target_when_true = program.allocate_label();
-                    let condition_metadata = ConditionMetadata {
-                        jump_if_condition_is_true: false,
-                        jump_target_when_true,
-                        jump_target_when_false: next,
-                    };
-                    translate_condition_expr(
-                        program,
-                        table_references,
-                        &cond.expr,
-                        condition_metadata,
-                        &t_ctx.resolver,
-                    )?;
-                    program.preassign_label_to_next_insn(jump_target_when_true);
                 }
             }
             Operation::Search(search) => {
@@ -692,28 +638,20 @@ pub fn open_loop(
                         }
                     }
                 }
-
-                for cond in predicates
-                    .iter()
-                    .filter(|cond| cond.should_eval_at_loop(join_index, join_order))
-                {
-                    let jump_target_when_true = program.allocate_label();
-                    let condition_metadata = ConditionMetadata {
-                        jump_if_condition_is_true: false,
-                        jump_target_when_true,
-                        jump_target_when_false: next,
-                    };
-                    translate_condition_expr(
-                        program,
-                        table_references,
-                        &cond.expr,
-                        condition_metadata,
-                        &t_ctx.resolver,
-                    )?;
-                    program.preassign_label_to_next_insn(jump_target_when_true);
-                }
             }
         }
+
+        // First emit outer join conditions, if any.
+        emit_conditions(
+            program,
+            &t_ctx,
+            table_references,
+            join_order,
+            predicates,
+            join_index,
+            next,
+            true,
+        )?;
 
         // Set the match flag to true if this is a LEFT JOIN.
         // At this point of execution we are going to emit columns for the left table,
@@ -729,6 +667,56 @@ pub fn open_loop(
                 });
             }
         }
+
+        // Now we can emit conditions from the WHERE clause.
+        // If the right table produces a NULL row, control jumps to the point where the match flag is set.
+        // The WHERE clause conditions may reference columns from that row, so they cannot be emitted
+        // before the flag is set — the row may be filtered out by the WHERE clause.
+        emit_conditions(
+            program,
+            &t_ctx,
+            table_references,
+            join_order,
+            predicates,
+            join_index,
+            next,
+            false,
+        )?;
+    }
+
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_conditions(
+    program: &mut ProgramBuilder,
+    t_ctx: &&mut TranslateCtx,
+    table_references: &TableReferences,
+    join_order: &[JoinOrderMember],
+    predicates: &[WhereTerm],
+    join_index: usize,
+    next: BranchOffset,
+    from_outer_join: bool,
+) -> Result<()> {
+    for cond in predicates
+        .iter()
+        .filter(|cond| cond.from_outer_join.is_some() == from_outer_join)
+        .filter(|cond| cond.should_eval_at_loop(join_index, join_order))
+    {
+        let jump_target_when_true = program.allocate_label();
+        let condition_metadata = ConditionMetadata {
+            jump_if_condition_is_true: false,
+            jump_target_when_true,
+            jump_target_when_false: next,
+        };
+        translate_condition_expr(
+            program,
+            table_references,
+            &cond.expr,
+            condition_metadata,
+            &t_ctx.resolver,
+        )?;
+        program.preassign_label_to_next_insn(jump_target_when_true);
     }
 
     Ok(())
@@ -738,13 +726,15 @@ pub fn open_loop(
 /// The loop may emit rows to various destinations depending on the query:
 /// - a GROUP BY sorter (grouping is done by sorting based on the GROUP BY keys and aggregating while the GROUP BY keys match)
 /// - a GROUP BY phase with no sorting (when the rows are already in the order required by the GROUP BY keys)
-/// - an ORDER BY sorter (when there is no GROUP BY, but there is an ORDER BY)
 /// - an AggStep (the columns are collected for aggregation, which is finished later)
+/// - a Window (rows are buffered and returned according to the rules of the window definition)
+/// - an ORDER BY sorter (when there is none of the above, but there is an ORDER BY)
 /// - a QueryResult (there is none of the above, so the loop either emits a ResultRow, or if it's a subquery, yields to the parent query)
 enum LoopEmitTarget {
     GroupBy,
     OrderBySorter,
     AggStep,
+    Window,
     QueryResult,
 }
 
@@ -765,8 +755,16 @@ pub fn emit_loop(
     if !plan.aggregates.is_empty() {
         return emit_loop_source(program, t_ctx, plan, LoopEmitTarget::AggStep);
     }
-    // if we DONT have a group by, but we have an order by, we emit a record into the order by sorter.
-    if plan.order_by.is_some() {
+
+    // Window processing is planned so that the query plan has neither GROUP BY nor aggregates.
+    // If the original query contained them, they are pushed down into a subquery.
+    // Rows are buffered and returned according to the rules of the window definition.
+    if plan.window.is_some() {
+        return emit_loop_source(program, t_ctx, plan, LoopEmitTarget::Window);
+    }
+
+    // if NONE of the above applies, but we have an order by, we emit a record into the order by sorter.
+    if !plan.order_by.is_empty() {
         return emit_loop_source(program, t_ctx, plan, LoopEmitTarget::OrderBySorter);
     }
     // if we have neither, we emit a ResultRow. In that case, if we have a Limit, we handle that with DecrJumpZero.
@@ -862,16 +860,7 @@ fn emit_loop_source(
             Ok(())
         }
         LoopEmitTarget::OrderBySorter => {
-            order_by_sorter_insert(
-                program,
-                &t_ctx.resolver,
-                t_ctx
-                    .meta_sort
-                    .as_ref()
-                    .expect("sort metadata must exist for ORDER BY"),
-                &mut t_ctx.result_column_indexes_in_orderby_sorter,
-                plan,
-            )?;
+            order_by_sorter_insert(program, t_ctx, plan)?;
 
             if let Distinctness::Distinct { ctx } = &plan.distinctness {
                 let distinct_ctx = ctx.as_ref().expect("distinct context must exist");
@@ -894,7 +883,7 @@ fn emit_loop_source(
                 translate_aggregation_step(
                     program,
                     &plan.table_references,
-                    agg,
+                    AggArgumentSource::new_from_expression(&agg.func, &agg.args, &agg.distinctness),
                     reg,
                     &t_ctx.resolver,
                 )?;
@@ -975,6 +964,11 @@ fn emit_loop_source(
 
             Ok(())
         }
+        LoopEmitTarget::Window => {
+            emit_window_loop_source(program, t_ctx, plan)?;
+
+            Ok(())
+        }
     }
 }
 
@@ -1007,10 +1001,10 @@ pub fn close_loop(
         let (table_cursor_id, index_cursor_id) = table.resolve_cursors(program)?;
 
         match &table.op {
-            Operation::Scan { iter_dir, .. } => {
+            Operation::Scan(scan) => {
                 program.resolve_label(loop_labels.next, program.offset());
-                match &table.table {
-                    Table::BTree(_) => {
+                match scan {
+                    Scan::BTreeTable { iter_dir, .. } => {
                         let iteration_cursor_id = temp_cursor_id.unwrap_or_else(|| {
                             index_cursor_id.unwrap_or_else(|| {
                                 table_cursor_id.expect(
@@ -1030,14 +1024,14 @@ pub fn close_loop(
                             });
                         }
                     }
-                    Table::Virtual(_) => {
+                    Scan::VirtualTable { .. } => {
                         program.emit_insn(Insn::VNext {
                             cursor_id: table_cursor_id
                                 .expect("Virtual tables do not support covering indexes"),
                             pc_if_next: loop_labels.loop_start,
                         });
                     }
-                    Table::FromClauseSubquery(_) => {
+                    Scan::Subquery => {
                         // A subquery has no cursor to call Next on, so it just emits a Goto
                         // to the Yield instruction, which in turn jumps back to the main loop of the subquery,
                         // so that the next row from the subquery can be read.
@@ -1430,7 +1424,7 @@ fn emit_autoindex(
     let ephemeral_cols_start_reg = program.alloc_registers(num_regs_to_reserve);
     for (i, col) in index.columns.iter().enumerate() {
         let reg = ephemeral_cols_start_reg + i;
-        program.emit_column(table_cursor_id, col.pos_in_table, reg);
+        program.emit_column_or_rowid(table_cursor_id, col.pos_in_table, reg);
     }
     if table_has_rowid {
         program.emit_insn(Insn::RowId {
@@ -1444,6 +1438,7 @@ fn emit_autoindex(
         count: num_regs_to_reserve,
         dest_reg: record_reg,
         index_name: Some(index.name.clone()),
+        affinity_str: None,
     });
     program.emit_insn(Insn::IdxInsert {
         cursor_id: index_cursor_id,

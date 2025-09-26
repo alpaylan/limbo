@@ -16,6 +16,7 @@ pub type RegisterModuleFn = unsafe extern "C" fn(
 #[derive(Clone, Debug)]
 pub struct VTabModuleImpl {
     pub name: *const c_char,
+    pub readonly: bool,
     pub create: VtabFnCreate,
     pub open: VtabFnOpen,
     pub close: VtabFnClose,
@@ -28,6 +29,11 @@ pub struct VTabModuleImpl {
     pub destroy: VtabFnDestroy,
     pub best_idx: BestIdxFn,
 }
+
+// SAFETY: VTabModuleImpl contains function pointers and a name pointer that are
+// immutable after creation and, therefore, safe to share between threads.
+unsafe impl Send for VTabModuleImpl {}
+unsafe impl Sync for VTabModuleImpl {}
 
 #[repr(C)]
 pub struct VTabCreateResult {
@@ -72,7 +78,8 @@ impl VTabModuleImpl {
 
 pub type VtabFnCreate = unsafe extern "C" fn(args: *const Value, argc: i32) -> VTabCreateResult;
 
-pub type VtabFnOpen = unsafe extern "C" fn(table: *const c_void, conn: *mut Conn) -> *const c_void;
+pub type VtabFnOpen =
+    unsafe extern "C" fn(table: *const c_void, conn: *const Conn) -> *const c_void;
 
 pub type VtabFnClose = unsafe extern "C" fn(cursor: *const c_void) -> ResultCode;
 
@@ -119,6 +126,7 @@ pub trait VTabModule: 'static {
     type Table: VTable;
     const VTAB_KIND: VTabKind;
     const NAME: &'static str;
+    const READONLY: bool = true;
 
     /// Creates a new instance of a virtual table.
     /// Returns a tuple where the first element is the table's schema.
@@ -144,9 +152,30 @@ pub trait VTable {
     fn destroy(&mut self) -> Result<(), Self::Error> {
         Ok(())
     }
-    fn best_index(_constraints: &[ConstraintInfo], _order_by: &[OrderByInfo]) -> IndexInfo {
-        IndexInfo {
-            idx_num: 0,
+
+    /// The query planner may call this method multiple times during optimization, exploring
+    /// different join orders. Each call asks the virtual table which constraints (WHERE clause
+    /// terms) it can efficiently handle. Based on the incoming `ConstraintInfo`s, the virtual table
+    /// should decide:
+    /// - which constraints it can consume (`ConstraintUsage`),
+    /// - how they map to arguments passed into `filter`,
+    /// - and return an `IndexInfo` describing the resulting plan.
+    ///
+    /// The return value’s `idx_num`, `idx_str`, and `constraint_usages` are later passed back to
+    /// the virtual table’s `filter` method if the chosen plan is selected for execution. There is
+    /// no guarantee that `filter` will ever be called — many `best_index` candidates are discarded
+    /// during planning.
+    ///
+    /// If an error occurs, an appropriate error code is returned. A return value of
+    /// `ResultCode::ConstraintViolation` from `best_index` is not considered an error. Instead, it
+    /// indicates that the current configuration of `usable` flags in `ConstraintInfo` cannot
+    /// produce a valid plan.
+    fn best_index(
+        _constraints: &[ConstraintInfo],
+        _order_by: &[OrderByInfo],
+    ) -> Result<IndexInfo, ResultCode> {
+        Ok(IndexInfo {
+            idx_num: -1,
             idx_str: None,
             order_by_consumed: false,
             estimated_cost: 1_000_000.0,
@@ -154,11 +183,11 @@ pub trait VTable {
             constraint_usages: _constraints
                 .iter()
                 .map(|_| ConstraintUsage {
-                    argv_index: Some(0),
+                    argv_index: None,
                     omit: false,
                 })
                 .collect(),
-        }
+        })
     }
 }
 
@@ -220,6 +249,8 @@ pub struct IndexInfo {
     /// Estimated number of rows that the query will return
     pub estimated_rows: u32,
     /// List of constraints that can be used to optimize the query.
+    /// Each `ConstraintInfo` passed to `best_index` must have a corresponding entry in `constraint_usages`.
+    /// The length and order are important—they must exactly match the input `ConstraintInfo` array.
     pub constraint_usages: Vec<ConstraintUsage>,
 }
 impl Default for IndexInfo {
@@ -249,6 +280,7 @@ impl IndexInfo {
             .map(|s| std::ffi::CString::new(s).unwrap().into_raw())
             .unwrap_or(std::ptr::null_mut());
         ExtIndexInfo {
+            code: ResultCode::OK,
             idx_num: self.idx_num,
             estimated_cost: self.estimated_cost,
             estimated_rows: self.estimated_rows,
@@ -264,7 +296,10 @@ impl IndexInfo {
     /// # Safety
     /// This method is unsafe because it can cause memory leaks if not used correctly.
     /// to_ffi and from_ffi are meant to send index info across ffi bounds then immediately reclaim it.
-    pub unsafe fn from_ffi(ffi: ExtIndexInfo) -> Self {
+    pub unsafe fn from_ffi(ffi: ExtIndexInfo) -> Result<Self, ResultCode> {
+        if ffi.code != ResultCode::OK {
+            return Err(ffi.code);
+        }
         let constraint_usages = unsafe {
             Box::from_raw(std::slice::from_raw_parts_mut(
                 ffi.constraint_usages_ptr,
@@ -281,14 +316,14 @@ impl IndexInfo {
                     .into_owned()
             })
         };
-        Self {
+        Ok(Self {
             idx_num: ffi.idx_num,
             idx_str,
             order_by_consumed: ffi.order_by_consumed,
             estimated_cost: ffi.estimated_cost,
             estimated_rows: ffi.estimated_rows,
             constraint_usages,
-        }
+        })
     }
 }
 
@@ -296,6 +331,7 @@ impl IndexInfo {
 #[derive(Clone, Debug)]
 /// FFI representation of IndexInfo.
 pub struct ExtIndexInfo {
+    pub code: ResultCode,
     pub idx_num: i32,
     pub idx_str: *const u8,
     pub idx_str_len: usize,
@@ -306,11 +342,39 @@ pub struct ExtIndexInfo {
     pub constraint_usage_len: usize,
 }
 
+impl ExtIndexInfo {
+    pub fn error(code: ResultCode) -> ExtIndexInfo {
+        ExtIndexInfo {
+            code,
+            idx_num: -1,
+            estimated_cost: 0.0,
+            estimated_rows: 0,
+            order_by_consumed: false,
+            constraint_usages_ptr: std::ptr::null_mut(),
+            constraint_usage_len: 0,
+            idx_str: std::ptr::null_mut(),
+            idx_str_len: 0,
+        }
+    }
+}
+
 /// Returned from xBestIndex to describe how the virtual table
 /// can use the constraints in the WHERE clause of a query.
 #[derive(Debug, Clone, Copy)]
 pub struct ConstraintUsage {
-    /// 1 based index of the argument passed
+    /// 1-based index indicating which argument from the `filter` `args` array
+    /// corresponds to this constraint. The VDBE passes constraint values
+    /// in the order defined by these indices when invoking `filter`.
+    ///
+    /// Rules:
+    /// - All assigned `argv_index` values must form a contiguous sequence of indices
+    ///   (e.g., 1, 2, 3, …, N). The values may be returned in any order, but no
+    ///   gaps are allowed.
+    /// - Each `argv_index` value must be unique.
+    /// - `argv_index` must not exceed the total number of constraints.
+    /// - An `argv_index` value less than 1 is invalid and will result in an error.
+    ///
+    /// If `None`, this constraint will not be passed as an argument.
     pub argv_index: Option<u32>,
     /// If true, core can omit this constraint in the vdbe layer.
     pub omit: bool,
@@ -327,20 +391,13 @@ pub struct ConstraintInfo {
     pub op: ConstraintOp,
     /// Whether or not constraint is garaunteed to be enforced.
     pub usable: bool,
-    /// packed integer with the index of the constraint in the planner,
-    /// and the side of the binary expr that the relevant column is on.
-    pub plan_info: u32,
-}
-
-impl ConstraintInfo {
-    #[inline(always)]
-    pub fn pack_plan_info(pred_idx: u32, is_right_side: bool) -> u32 {
-        ((pred_idx) << 1) | (is_right_side as u32)
-    }
-    #[inline(always)]
-    pub fn unpack_plan_info(&self) -> (usize, bool) {
-        ((self.plan_info >> 1) as usize, (self.plan_info & 1) != 0)
-    }
+    /// Index of the `Constraint` in the array precomputed by the optimizer
+    /// from the WHERE clause. Used internally to match this constraint with
+    /// the corresponding entry in `TableConstraints`.
+    ///
+    /// This field is for optimizer use only and should not be accessed
+    /// by extensions.
+    pub index: usize,
 }
 
 pub type PrepareStmtFn = unsafe extern "C" fn(api: *mut Conn, sql: *const c_char) -> *mut Stmt;
@@ -357,7 +414,6 @@ pub type BindArgsFn = unsafe extern "C" fn(ctx: *mut Stmt, idx: i32, arg: Value)
 pub type StmtStepFn = unsafe extern "C" fn(ctx: *mut Stmt) -> ResultCode;
 pub type StmtGetRowValuesFn = unsafe extern "C" fn(ctx: *mut Stmt);
 pub type FreeCurrentRowFn = unsafe extern "C" fn(ctx: *mut Stmt);
-pub type CloseConnectionFn = unsafe extern "C" fn(ctx: *mut c_void);
 pub type CloseStmtFn = unsafe extern "C" fn(ctx: *mut Stmt);
 
 /// core database connection
@@ -365,25 +421,18 @@ pub type CloseStmtFn = unsafe extern "C" fn(ctx: *mut Stmt);
 #[repr(C)]
 #[derive(Debug, Clone)]
 pub struct Conn {
-    // boxed Rc::Weak from core::Connection
+    // std::sync::Weak from core::Connection
     pub _ctx: *mut c_void,
     pub _prepare_stmt: PrepareStmtFn,
     pub _execute: ExecuteFn,
-    pub _close: CloseConnectionFn,
 }
 
 impl Conn {
-    pub fn new(
-        ctx: *mut c_void,
-        prepare_stmt: PrepareStmtFn,
-        exec_fn: ExecuteFn,
-        close: CloseConnectionFn,
-    ) -> Self {
+    pub fn new(ctx: *mut c_void, prepare_stmt: PrepareStmtFn, exec_fn: ExecuteFn) -> Self {
         Conn {
             _ctx: ctx,
             _prepare_stmt: prepare_stmt,
             _execute: exec_fn,
-            _close: close,
         }
     }
 
@@ -394,14 +443,6 @@ impl Conn {
             return Err(ResultCode::Error);
         }
         Ok(unsafe { &mut *(ptr) })
-    }
-
-    pub fn close(&mut self) {
-        if self._ctx.is_null() {
-            return;
-        }
-        unsafe { (self._close)(self._ctx) };
-        self._ctx = std::ptr::null_mut();
     }
 
     /// execute a SQL statement with the given arguments.
@@ -431,7 +472,7 @@ impl Conn {
         let Ok(sql) = CString::new(sql) else {
             return std::ptr::null_mut();
         };
-        unsafe { (self._prepare_stmt)(self as *const _ as *mut Conn, sql.as_ptr()) }
+        unsafe { (self._prepare_stmt)(self as *const Conn as *mut Conn, sql.as_ptr()) }
     }
 }
 
@@ -455,10 +496,10 @@ impl Drop for Statement {
 /// the VTable is dropped, so there is no need to manually close the connection.
 #[derive(Debug)]
 #[repr(transparent)]
-pub struct Connection(*mut Conn);
+pub struct Connection(*const Conn);
 
 impl Connection {
-    pub fn new(ctx: *mut Conn) -> Self {
+    pub fn new(ctx: *const Conn) -> Self {
         Connection(ctx)
     }
 

@@ -1,4 +1,4 @@
-name: JavaScript
+name: Build & publish @tursodatabase/database
 
 on:
   push:
@@ -13,11 +13,15 @@ on:
 env:
   DEBUG: napi:*
   APP_NAME: turso
-  MACOSX_DEPLOYMENT_TARGET: '10.13'
+  MACOSX_DEPLOYMENT_TARGET: "10.13"
 
 defaults:
   run:
     working-directory: bindings/javascript
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
 
 jobs:
   build:
@@ -26,22 +30,72 @@ jobs:
       fail-fast: false
       matrix:
         settings:
-          - host: macos-13
-            target: x86_64-apple-darwin
-            build: yarn build --target x86_64-apple-darwin
           - host: windows-latest
-            build: |
-              yarn build --target x86_64-pc-windows-msvc
-              yarn test
             target: x86_64-pc-windows-msvc
+            artifact: db-bindings-x86_64-pc-windows-msvc
+            build: yarn workspace @tursodatabase/database napi-build --target x86_64-pc-windows-msvc
+          - host: windows-latest
+            target: x86_64-pc-windows-msvc
+            artifact: sync-bindings-x86_64-pc-windows-msvc
+            build: yarn workspace @tursodatabase/sync napi-build --target x86_64-pc-windows-msvc
           - host: ubuntu-latest
             target: x86_64-unknown-linux-gnu
+            artifact: db-bindings-x86_64-unknown-linux-gnu
             docker: ghcr.io/napi-rs/napi-rs/nodejs-rust:lts-debian
-            build: yarn build --target x86_64-unknown-linux-gnu
+            build: yarn workspace @tursodatabase/database napi-build --target x86_64-unknown-linux-gnu
+          - host: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            artifact: sync-bindings-x86_64-unknown-linux-gnu
+            docker: ghcr.io/napi-rs/napi-rs/nodejs-rust:lts-debian
+            build: yarn workspace @tursodatabase/sync napi-build --target x86_64-unknown-linux-gnu
           - host: macos-latest
             target: aarch64-apple-darwin
-            build: yarn build --target aarch64-apple-darwin
-    name: stable - ${{ matrix.settings.target }} - node@20
+            artifact: db-bindings-aarch64-apple-darwin
+            build: yarn workspace @tursodatabase/database napi-build --target aarch64-apple-darwin
+          - host: macos-latest
+            target: aarch64-apple-darwin
+            artifact: sync-bindings-aarch64-apple-darwin
+            build: yarn workspace @tursodatabase/sync napi-build --target aarch64-apple-darwin
+          - host: blacksmith-2vcpu-ubuntu-2404-arm
+            target: aarch64-unknown-linux-gnu
+            artifact: db-bindings-aarch64-unknown-linux-gnu
+            build: yarn workspace @tursodatabase/database napi-build --target aarch64-unknown-linux-gnu
+          - host: blacksmith-2vcpu-ubuntu-2404-arm
+            target: aarch64-unknown-linux-gnu
+            artifact: sync-bindings-aarch64-unknown-linux-gnu
+            build: yarn workspace @tursodatabase/sync napi-build --target aarch64-unknown-linux-gnu
+          - host: ubuntu-latest
+            target: wasm32-wasip1-threads
+            artifact: db-bindings-wasm32-wasip1-threads
+            setup: |
+              rustup target add wasm32-wasip1-threads
+              wget https://github.com/WebAssembly/wasi-sdk/releases/download/wasi-sdk-25/wasi-sdk-25.0-x86_64-linux.tar.gz
+              tar -xvf wasi-sdk-25.0-x86_64-linux.tar.gz
+            build: |
+              export WASI_SDK_PATH="$(pwd)/wasi-sdk-25.0-x86_64-linux"
+              export CMAKE_BUILD_PARALLEL_LEVEL=$(nproc)
+              export TARGET_CXXFLAGS="--target=wasm32-wasi-threads --sysroot=$(pwd)/wasi-sdk-25.0-x86_64-linux/share/wasi-sysroot -pthread -mllvm -wasm-enable-sjlj -lsetjmp"
+              export TARGET_CFLAGS="$TARGET_CXXFLAGS"
+              yarn workspace @tursodatabase/database-common build
+              yarn workspace @tursodatabase/database-browser-common build
+              yarn workspace @tursodatabase/database-browser build
+          - host: ubuntu-latest
+            target: wasm32-wasip1-threads
+            artifact: sync-bindings-wasm32-wasip1-threads
+            setup: |
+              rustup target add wasm32-wasip1-threads
+              wget https://github.com/WebAssembly/wasi-sdk/releases/download/wasi-sdk-25/wasi-sdk-25.0-x86_64-linux.tar.gz
+              tar -xvf wasi-sdk-25.0-x86_64-linux.tar.gz
+            build: |
+              export WASI_SDK_PATH="$(pwd)/wasi-sdk-25.0-x86_64-linux"
+              export CMAKE_BUILD_PARALLEL_LEVEL=$(nproc)
+              export TARGET_CXXFLAGS="--target=wasm32-wasi-threads --sysroot=$(pwd)/wasi-sdk-25.0-x86_64-linux/share/wasi-sysroot -pthread -mllvm -wasm-enable-sjlj -lsetjmp"
+              export TARGET_CFLAGS="$TARGET_CXXFLAGS"
+              yarn workspace @tursodatabase/database-common build
+              yarn workspace @tursodatabase/database-browser-common build
+              yarn workspace @tursodatabase/sync-common build
+              yarn workspace @tursodatabase/sync-browser build
+    name: ${{ matrix.settings.artifact }} - node@20
     runs-on: ${{ matrix.settings.host }}
     steps:
       - uses: actions/checkout@v4
@@ -66,7 +120,7 @@ jobs:
             .cargo-cache
             target/
           key: ${{ matrix.settings.target }}-cargo-${{ matrix.settings.host }}
-      - uses: goto-bus-stop/setup-zig@v2
+      - uses: mlugg/setup-zig@v2
         if: ${{ matrix.settings.target == 'armv7-unknown-linux-gnueabihf' || matrix.settings.target == 'armv7-unknown-linux-musleabihf' }}
         with:
           version: 0.13.0
@@ -76,6 +130,8 @@ jobs:
         shell: bash
       - name: Install dependencies
         run: yarn install
+      - name: Build common
+        run: yarn workspace @tursodatabase/database-common build
       - name: Setup node x86
         uses: actions/setup-node@v4
         if: matrix.settings.target == 'x86_64-pc-windows-msvc'
@@ -87,7 +143,7 @@ jobs:
         if: ${{ matrix.settings.docker }}
         with:
           image: ${{ matrix.settings.docker }}
-          options: '--user 0:0 -v ${{ github.workspace }}/.cargo-cache/git/db:/usr/local/cargo/git/db -v ${{ github.workspace }}/.cargo/registry/cache:/usr/local/cargo/registry/cache -v ${{ github.workspace }}/.cargo/registry/index:/usr/local/cargo/registry/index -v ${{ github.workspace }}:/build -w /build/bindings/javascript'
+          options: "--user 0:0 -v ${{ github.workspace }}/.cargo-cache/git/db:/usr/local/cargo/git/db -v ${{ github.workspace }}/.cargo/registry/cache:/usr/local/cargo/registry/cache -v ${{ github.workspace }}/.cargo/registry/index:/usr/local/cargo/registry/index -v ${{ github.workspace }}:/build -w /build/bindings/javascript"
           run: ${{ matrix.settings.build }}
       - name: Build
         run: ${{ matrix.settings.build }}
@@ -96,50 +152,22 @@ jobs:
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: bindings-${{ matrix.settings.target }}
-          path: bindings/javascript/${{ env.APP_NAME }}.*.node
+          name: ${{ matrix.settings.artifact }}
+          path: |
+            bindings/javascript/packages/native/turso.*.node
+            bindings/javascript/packages/browser/turso.*.wasm
+            bindings/javascript/sync/packages/native/sync.*.node
+            bindings/javascript/sync/packages/browser/sync.*.wasm
           if-no-files-found: error
-  test-macOS-windows-binding:
-    name: Test bindings on ${{ matrix.settings.target }} - node@${{ matrix.node }}
-    needs:
-      - build
-    strategy:
-      fail-fast: false
-      matrix:
-        settings:
-          - host: macos-13
-            target: x86_64-apple-darwin
-        node:
-          - '20'
-    runs-on: ${{ matrix.settings.host }}
-    steps:
-      - uses: actions/checkout@v4
-      - name: Setup node
-        uses: actions/setup-node@v4
-        with:
-          node-version: ${{ matrix.node }}
-          architecture: x64
-      - name: Install dependencies
-        run: yarn install
-      - name: Download artifacts
-        uses: actions/download-artifact@v4
-        with:
-          name: bindings-${{ matrix.settings.target }}
-          path: bindings/javascript
-      - name: List packages
-        run: ls -R .
-        shell: bash
-      - name: Test bindings
-        run: yarn test
-  test-linux-x64-gnu-binding:
-    name: Test bindings on Linux-x64-gnu - node@${{ matrix.node }}
+  test-db-linux-x64-gnu-binding:
+    name: Test DB bindings on Linux-x64-gnu - node@${{ matrix.node }}
     needs:
       - build
     strategy:
       fail-fast: false
       matrix:
         node:
-          - '20'
+          - "20"
     runs-on: blacksmith-4vcpu-ubuntu-2404
     steps:
       - uses: actions/checkout@v4
@@ -149,89 +177,108 @@ jobs:
           node-version: ${{ matrix.node }}
       - name: Install dependencies
         run: yarn install
-      - name: Download artifacts
+      - name: Build common
+        run: yarn workspace @tursodatabase/database-common build
+      - name: Download all DB artifacts
         uses: actions/download-artifact@v4
         with:
-          name: bindings-x86_64-unknown-linux-gnu
           path: bindings/javascript
+          merge-multiple: true
+          pattern: 'db*'
       - name: List packages
         run: ls -R .
         shell: bash
       - name: Test bindings
-        run: docker run --rm -v $(pwd):/build -w /build node:${{ matrix.node }}-slim yarn test
-  universal-macOS:
-    name: Build universal macOS binary
+        run: docker run --rm -v $(pwd):/build -w /build node:${{ matrix.node }}-slim yarn workspace @tursodatabase/database test
+  test-db-browser-binding:
+    name: Test DB bindings on browser@${{ matrix.node }}
     needs:
       - build
-    runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node:
+          - "20"
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     steps:
       - uses: actions/checkout@v4
       - name: Setup node
-        uses: actions/setup-node@v4
+        uses: useblacksmith/setup-node@v5
         with:
-          node-version: 20
+          node-version: ${{ matrix.node }}
       - name: Install dependencies
         run: yarn install
-      - name: Download macOS x64 artifact
+      - name: Build common
+        run: yarn workspace @tursodatabase/database-common build
+      - name: Build browser-common
+        run: yarn workspace @tursodatabase/database-browser-common build
+      - name: Install playwright with deps
+        run: yarn workspace @tursodatabase/database-browser playwright install --with-deps
+      - name: Download all DB artifacts
         uses: actions/download-artifact@v4
         with:
-          name: bindings-x86_64-apple-darwin
-          path: bindings/javascript/artifacts
-      - name: Download macOS arm64 artifact
-        uses: actions/download-artifact@v4
-        with:
-          name: bindings-aarch64-apple-darwin
-          path: bindings/javascript/artifacts
-      - name: Combine binaries
-        run: yarn universal
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: bindings-universal-apple-darwin
-          path: bindings/javascript/${{ env.APP_NAME }}.*.node
-          if-no-files-found: error
+          path: bindings/javascript
+          merge-multiple: true
+          pattern: 'db*'
+      - name: List packages
+        run: ls -R .
+        shell: bash
+      - name: Test bindings
+        run: yarn workspace @tursodatabase/database-browser test
   publish:
     name: Publish
     runs-on: ubuntu-latest
-    if: startsWith(github.ref, 'refs/tags/v')
     permissions:
       contents: read
       id-token: write
     needs:
-      - test-macOS-windows-binding
-      - test-linux-x64-gnu-binding
-      - universal-macOS
+      - test-db-linux-x64-gnu-binding
+      - test-db-browser-binding
     steps:
       - uses: actions/checkout@v4
       - name: Setup node
         uses: useblacksmith/setup-node@v5
         with:
           node-version: 20
-      - name: Install dependencies
-        run: yarn install
-      - name: Download all artifacts
+      - name: Download all DB artifacts
         uses: actions/download-artifact@v4
         with:
-          path: bindings/javascript/artifacts
-      - name: Move artifacts
-        run: yarn artifacts
+          path: bindings/javascript
+          merge-multiple: true
+          pattern: 'db*'
+      - name: Download all sync artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: bindings/javascript
+          merge-multiple: true
+          pattern: 'sync*'
       - name: List packages
-        run: ls -R ./npm
+        run: ls -R .
         shell: bash
+      - name: Install dependencies
+        run: yarn install
+      - name: Install dependencies
+        run: yarn tsc-build
       - name: Publish
+        if: "startsWith(github.ref, 'refs/tags/v')"
         run: |
           npm config set provenance true
           if git log -1 --pretty=%B | grep "^Turso [0-9]\+\.[0-9]\+\.[0-9]\+$";
           then
             echo "//registry.npmjs.org/:_authToken=$NPM_TOKEN" >> ~/.npmrc
-            npm publish --access public
+            npm publish --workspaces --access public
           elif git log -1 --pretty=%B | grep "^Turso [0-9]\+\.[0-9]\+\.[0-9]\+";
           then
             echo "//registry.npmjs.org/:_authToken=$NPM_TOKEN" >> ~/.npmrc
-            npm publish --tag next --access public
+            npm publish --workspaces --access public --tag next
           else
-            echo "Not a release, skipping publish"
+            echo "git log structure is unexpected, skip publishing"
+            npm publish --workspaces --dry-run
           fi
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+      - name: Publish (dry-run)
+        if: "!startsWith(github.ref, 'refs/tags/v')"
+        run: |
+          npm publish --workspaces --dry-run

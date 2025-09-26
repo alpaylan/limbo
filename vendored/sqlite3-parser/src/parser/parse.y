@@ -376,7 +376,7 @@ generated(X) ::= LP expr(E) RP. {
   X = ColumnConstraint::Generated{ expr: E, typ: None };
 }
 generated(X) ::= LP expr(E) RP ID(TYPE). {
-  X = ColumnConstraint::Generated{ expr: E, typ: Some(Id::from_token(@TYPE, TYPE)) };
+  X = ColumnConstraint::Generated{ expr: E, typ: Some(Name::from_token(@TYPE, TYPE)) };
 }
 
 // The optional AUTOINCREMENT keyword
@@ -476,6 +476,11 @@ ifexists(A) ::= .            {A = false;}
 cmd ::= createkw temp(T) VIEW ifnotexists(E) fullname(Y) eidlist_opt(C)
           AS select(S). {
   self.ctx.stmt = Some(Stmt::CreateView{ temporary: T, if_not_exists: E, view_name: Y, columns: C,
+                                         select: Box::new(S) });
+}
+cmd ::= createkw MATERIALIZED VIEW ifnotexists(E) fullname(Y) eidlist_opt(C)
+          AS select(S). {
+  self.ctx.stmt = Some(Stmt::CreateMaterializedView{ if_not_exists: E, view_name: Y, columns: C,
                                          select: Box::new(S) });
 }
 cmd ::= DROP VIEW ifexists(E) fullname(X). {
@@ -802,22 +807,28 @@ cmd ::= with(C) UPDATE orconf(R) xfullname(X) indexed_opt(I) SET setlist(Y) from
 }
 %endif
 
+%type reidlist {Names}
 
+reidlist(A) ::= reidlist(A) COMMA nm(Y).
+    {let id = Y; A.insert(id)?;}
+reidlist(A) ::= nm(Y).
+    { A = Names::new(Y); /*A-overwrites-Y*/}
 
 %type setlist {Vec<Set>}
 
 setlist(A) ::= setlist(A) COMMA nm(X) EQ expr(Y). {
-  let s = Set{ col_names: DistinctNames::single(X), expr: Y };
+  let s = Set{ col_names: Names::single(X), expr: Y };
   A.push(s);
 }
-setlist(A) ::= setlist(A) COMMA LP idlist(X) RP EQ expr(Y). {
+setlist(A) ::= setlist(A) COMMA LP reidlist(X) RP EQ expr(Y). {
   let s = Set{ col_names: X, expr: Y };
   A.push(s);
 }
 setlist(A) ::= nm(X) EQ expr(Y). {
-  A = vec![Set{ col_names: DistinctNames::single(X), expr: Y }];
+  A = vec![Set{ col_names: Names::single(X), expr: Y }];
+
 }
-setlist(A) ::= LP idlist(X) RP EQ expr(Y). {
+setlist(A) ::= LP reidlist(X) RP EQ expr(Y). {
   A = vec![Set{ col_names: X, expr: Y }];
 }
 
@@ -916,24 +927,24 @@ expr(A) ::= CAST LP expr(E) AS typetoken(T) RP. {
 %endif  SQLITE_OMIT_CAST
 
 expr(A) ::= idj(X) LP distinct(D) exprlist(Y) RP. {
-  A = Expr::FunctionCall{ name: Id::from_token(@X, X), distinctness: D, args: Y, order_by: None, filter_over: None }; /*A-overwrites-X*/
+  A = Expr::FunctionCall{ name: Name::from_token(@X, X), distinctness: D, args: Y, order_by: None, filter_over: None }; /*A-overwrites-X*/
 }
 expr(A) ::= idj(X) LP distinct(D) exprlist(Y) ORDER BY sortlist(O) RP. {
-  A = Expr::FunctionCall{ name: Id::from_token(@X, X), distinctness: D, args: Y, order_by: Some(O), filter_over: None }; /*A-overwrites-X*/
+  A = Expr::FunctionCall{ name: Name::from_token(@X, X), distinctness: D, args: Y, order_by: Some(O), filter_over: None }; /*A-overwrites-X*/
 }
 expr(A) ::= idj(X) LP STAR RP. {
-  A = Expr::FunctionCallStar{ name: Id::from_token(@X, X), filter_over: None }; /*A-overwrites-X*/
+  A = Expr::FunctionCallStar{ name: Name::from_token(@X, X), filter_over: None }; /*A-overwrites-X*/
 }
 
 %ifndef SQLITE_OMIT_WINDOWFUNC
 expr(A) ::= idj(X) LP distinct(D) exprlist(Y) RP filter_over(Z). {
-  A = Expr::FunctionCall{ name: Id::from_token(@X, X), distinctness: D, args: Y, order_by: None, filter_over: Some(Z) }; /*A-overwrites-X*/
+  A = Expr::FunctionCall{ name: Name::from_token(@X, X), distinctness: D, args: Y, order_by: None, filter_over: Some(Z) }; /*A-overwrites-X*/
 }
 expr(A) ::= idj(X) LP distinct(D) exprlist(Y) ORDER BY sortlist(O) RP filter_over(Z). {
-  A = Expr::FunctionCall{ name: Id::from_token(@X, X), distinctness: D, args: Y, order_by: Some(O), filter_over: Some(Z) }; /*A-overwrites-X*/
+  A = Expr::FunctionCall{ name: Name::from_token(@X, X), distinctness: D, args: Y, order_by: Some(O), filter_over: Some(Z) }; /*A-overwrites-X*/
 }
 expr(A) ::= idj(X) LP STAR RP filter_over(Z). {
-  A = Expr::FunctionCallStar{ name: Id::from_token(@X, X), filter_over: Some(Z) }; /*A-overwrites-X*/
+  A = Expr::FunctionCallStar{ name: Name::from_token(@X, X), filter_over: Some(Z) }; /*A-overwrites-X*/
 }
 %endif
 

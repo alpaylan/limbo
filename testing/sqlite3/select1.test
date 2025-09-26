@@ -24,7 +24,7 @@ do_test select1-1.1 {
 } {1 {no such table: test1}}
 
 
-execsql {CREATE TABLE test1(f1 int, f2 int)}
+execsql {CREATE TABLE test1 (f1 int, f2 int)}
 
 do_test select1-1.2 {
   set v [catch {execsql {SELECT * FROM test1, test2}} msg]
@@ -65,7 +65,7 @@ do_test select1-1.8.3 {
   execsql {SELECT 'one', *, 'two', * FROM test1}
 } {one 11 22 two 11 22}
 
-execsql {CREATE TABLE test2(r1 real, r2 real)}
+execsql {CREATE TABLE test2 (r1 real, r2 real)}
 execsql {INSERT INTO test2(r1,r2) VALUES(1.1,2.2)}
 
 do_test select1-1.9 {
@@ -105,11 +105,11 @@ do_test select1-2.0 {
     DELETE FROM test1;
     INSERT INTO test1 VALUES(11,22);
     INSERT INTO test1 VALUES(33,44);
-    CREATE TABLE t3(a,b);
+    CREATE TABLE t3 (a,b);
     INSERT INTO t3 VALUES('abc',NULL);
     INSERT INTO t3 VALUES(NULL,'xyz');
     INSERT INTO t3 SELECT * FROM test1;
-    CREATE TABLE t4(a,b);
+    CREATE TABLE t4 (a,b);
     INSERT INTO t4 VALUES(NULL,'$long');
     SELECT * FROM t3;
   "
@@ -241,7 +241,7 @@ do_test select1-2.22 {
 } {1 {misuse of aliased aggregate m}}
 do_test select1-2.23 {
   execsql {
-    CREATE TABLE tkt2526(a,b,c PRIMARY KEY);
+    CREATE TABLE tkt2526 (a,b,c PRIMARY KEY);
     INSERT INTO tkt2526 VALUES('x','y',NULL);
     INSERT INTO tkt2526 VALUES('x','z',NULL);
   }
@@ -357,7 +357,7 @@ do_test select1-4.6 {
 
 do_test select1-4.8 {
   execsql {
-    CREATE TABLE t5(a,b);
+    CREATE TABLE t5 (a,b);
     INSERT INTO t5 VALUES(1,10);
     INSERT INTO t5 VALUES(2,9);
     SELECT * FROM t5 ORDER BY 1;
@@ -408,7 +408,7 @@ do_test select1-5.1 {
   lappend v $msg
 } {0 33}
 
-execsql {CREATE TABLE test2(t1 text, t2 text)}
+execsql {CREATE TABLE test2 (t1 text, t2 text)}
 execsql {INSERT INTO test2 VALUES('abc','xyz')}
 
 # Check for column naming
@@ -634,7 +634,7 @@ do_test select1-6.11 {
 ifcapable subquery&&compound {
 do_test select1-6.20 {
    execsql {
-     CREATE TABLE t6(a TEXT, b TEXT);
+     CREATE TABLE t6 (a TEXT, b TEXT);
      INSERT INTO t6 VALUES('a','0');
      INSERT INTO t6 VALUES('b','1');
      INSERT INTO t6 VALUES('c','2');
@@ -1005,7 +1005,7 @@ ifcapable subquery {
   do_test select1-13.1 {
     execsql {
       BEGIN;
-      create TABLE abc(a, b, c, PRIMARY KEY(a, b));
+      create TABLE abc (a, b, c, PRIMARY KEY(a, b));
       INSERT INTO abc VALUES(1, 1, 1);
     }
     for {set i 0} {$i<10} {incr i} {
@@ -1053,7 +1053,7 @@ if {[db one {PRAGMA locking_mode}]=="normal"} {
   #
   do_test select1-15.1 {
     execsql {
-      CREATE TABLE t1(a);
+      CREATE TABLE t1 (a);
       CREATE INDEX i1 ON t1(a);
       INSERT INTO t1 VALUES(1);
       INSERT INTO t1 VALUES(2);
@@ -1087,8 +1087,8 @@ do_catchsql_test select1-16.2 {
 do_execsql_test select1-17.1 {
   DROP TABLE IF EXISTS t1;
   DROP TABLE IF EXISTS t2;
-  CREATE TABLE t1(x);   INSERT INTO t1 VALUES(1);
-  CREATE TABLE t2(y,z); INSERT INTO t2 VALUES(2,3);
+  CREATE TABLE t1 (x);   INSERT INTO t1 VALUES(1);
+  CREATE TABLE t2 (y,z); INSERT INTO t2 VALUES(2,3);
   CREATE INDEX t2y ON t2(y);
   SELECT * FROM t1,(SELECT * FROM t2 WHERE y=2 ORDER BY y,z);
 } {1 2 3}
@@ -1105,8 +1105,8 @@ do_execsql_test select1-17.3 {
 do_execsql_test select1-18.1 {
   DROP TABLE IF EXISTS t1;
   DROP TABLE IF EXISTS t2;
-  CREATE TABLE t1(c);
-  CREATE TABLE t2(x PRIMARY KEY, y);
+  CREATE TABLE t1 (c);
+  CREATE TABLE t2 (x PRIMARY KEY, y);
   INSERT INTO t1(c) VALUES(123);
   INSERT INTO t2(x) VALUES(123);
   SELECT x FROM t2, t1 WHERE x BETWEEN c AND null OR x AND
@@ -1128,8 +1128,8 @@ do_execsql_test select1-18.1 {
 do_execsql_test select1-18.2 {
   DROP TABLE IF EXISTS t1;
   DROP TABLE IF EXISTS t2;
-  CREATE TABLE t1(c);
-  CREATE TABLE t2(x PRIMARY KEY, y);
+  CREATE TABLE t1 (c);
+  CREATE TABLE t2 (x PRIMARY KEY, y);
   INSERT INTO t1(c) VALUES(123);
   INSERT INTO t2(x) VALUES(123);
   SELECT x FROM t2, t1 WHERE x BETWEEN c AND (c+1) OR x AND
@@ -1169,7 +1169,7 @@ do_execsql_test select1-18.4 {
 #
 do_execsql_test select1-19.10 {
   DROP TABLE IF EXISTS t1;
-  CREATE TABLE t1(x);
+  CREATE TABLE t1 (x);
 } {}
 do_catchsql_test select1-19.20 {
   INSERT INTO t1
@@ -1205,8 +1205,8 @@ do_execsql_test select1-20.20 {
 reset_db
 # TODO: Views are not supported.
 #do_execsql_test select1-21.1 {
-#  CREATE TABLE t1(a IMTEGES PRIMARY KEY,R);
-#  CREATE TABLE t2(x UNIQUE);
+#  CREATE TABLE t1 (a IMTEGES PRIMARY KEY,R);
+#  CREATE TABLE t2 (x UNIQUE);
 #  CREATE VIEW v1a(z,y) AS SELECT x IS NULL, x FROM t2;
 #  SELECT a,(+a)b,(+a)b,(+a)b,NOT EXISTS(SELECT null FROM t2),CASE z WHEN 487 THEN 992 WHEN 391 THEN 203 WHEN 10 THEN '?k<D Q' END,'' FROM t1 LEFT JOIN v1a ON z=b;
 #} {}

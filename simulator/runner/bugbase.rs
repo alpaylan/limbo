@@ -6,7 +6,7 @@ use std::{
     time::SystemTime,
 };
 
-use anyhow::{anyhow, Context};
+use anyhow::{Context, anyhow};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
@@ -439,11 +439,6 @@ impl BugBase {
         &self.path
     }
 
-    /// Get the path to the database file for a given seed.
-    pub(crate) fn db_path(&self, seed: u64) -> PathBuf {
-        self.path.join(format!("{seed}/test.db"))
-    }
-
     /// Get paths to all the files for a given seed.
     pub(crate) fn paths(&self, seed: u64) -> Paths {
         let base = self.path.join(format!("{seed}/"));
@@ -468,15 +463,13 @@ impl BugBase {
         Ok(PathBuf::from(
             String::from_utf8(
                 Command::new("git")
-                    .args(["rev-parse", "--git-dir"])
+                    .args(["rev-parse", "--show-toplevel"])
                     .output()
                     .with_context(|| "should be able to get the git path")?
                     .stdout,
             )
             .with_context(|| "commit hash should be valid utf8")?
-            .trim()
-            .strip_suffix(".git")
-            .with_context(|| "should be able to strip .git suffix")?,
+            .trim(),
         ))
     }
 }

@@ -43,8 +43,8 @@ proc test_transform {testname sql1 sql2 results} {
 
 do_test selectB-1.1 {
   execsql {
-    CREATE TABLE t1(a, b, c);
-    CREATE TABLE t2(d, e, f);
+    CREATE TABLE t1 (a, b, c);
+    CREATE TABLE t2 (d, e, f);
 
     INSERT INTO t1 VALUES( 2,  4,  6);
     INSERT INTO t1 VALUES( 8, 10, 12);

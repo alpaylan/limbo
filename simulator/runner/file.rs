@@ -6,11 +6,12 @@ use std::{
 
 use rand::Rng as _;
 use rand_chacha::ChaCha8Rng;
-use tracing::{instrument, Level};
+use tracing::{Level, instrument};
 use turso_core::{File, Result};
 
-use crate::{model::FAULT_ERROR_MSG, runner::clock::SimulatorClock};
+use crate::runner::{FAULT_ERROR_MSG, clock::SimulatorClock};
 pub(crate) struct SimulatorFile {
+    pub path: String,
     pub(crate) inner: Arc<dyn File>,
     pub(crate) fault: Cell<bool>,
 
@@ -38,12 +39,12 @@ pub(crate) struct SimulatorFile {
 
     pub latency_probability: usize,
 
-    pub sync_completion: RefCell<Option<Arc<turso_core::Completion>>>,
+    pub sync_completion: RefCell<Option<turso_core::Completion>>,
     pub queued_io: RefCell<Vec<DelayedIo>>,
     pub clock: Arc<SimulatorClock>,
 }
 
-type IoOperation = Box<dyn FnOnce(&SimulatorFile) -> Result<Arc<turso_core::Completion>>>;
+type IoOperation = Box<dyn FnOnce(&SimulatorFile) -> Result<turso_core::Completion>>;
 
 pub struct DelayedIo {
     pub time: turso_core::Instant,
@@ -99,10 +100,10 @@ impl SimulatorFile {
     fn generate_latency_duration(&self) -> Option<turso_core::Instant> {
         let mut rng = self.rng.borrow_mut();
         // Chance to introduce some latency
-        rng.gen_bool(self.latency_probability as f64 / 100.0)
+        rng.random_bool(self.latency_probability as f64 / 100.0)
             .then(|| {
                 let now = self.clock.now();
-                let sum = now + std::time::Duration::from_millis(rng.gen_range(5..20));
+                let sum = now + std::time::Duration::from_millis(rng.random_range(5..20));
                 sum.into()
             })
     }
@@ -110,21 +111,8 @@ impl SimulatorFile {
     #[instrument(skip_all, level = Level::DEBUG)]
     pub fn run_queued_io(&self, now: turso_core::Instant) -> Result<()> {
         let mut queued_io = self.queued_io.borrow_mut();
-        // TODO: as we are not in version 1.87 we cannot use `extract_if`
-        // so we have to do something different to achieve the same thing
-        // This code was acquired from: https://doc.rust-lang.org/beta/std/vec/struct.Vec.html#method.extract_if
-        let range = 0..queued_io.len();
-        let mut i = range.start;
-        let end_items = queued_io.len() - range.end;
-
-        while i < queued_io.len() - end_items {
-            if queued_io[i].time <= now {
-                let io = queued_io.remove(i);
-                // your code here
-                (io.op)(self)?;
-            } else {
-                i += 1;
-            }
+        for io in queued_io.extract_if(.., |item| item.time <= now) {
+            let _c = (io.op)(self)?;
         }
         Ok(())
     }
@@ -149,11 +137,7 @@ impl File for SimulatorFile {
         self.inner.unlock_file()
     }
 
-    fn pread(
-        &self,
-        pos: usize,
-        c: Arc<turso_core::Completion>,
-    ) -> Result<Arc<turso_core::Completion>> {
+    fn pread(&self, pos: u64, c: turso_core::Completion) -> Result<turso_core::Completion> {
         self.nr_pread_calls.set(self.nr_pread_calls.get() + 1);
         if self.fault.get() {
             tracing::debug!("pread fault");
@@ -176,10 +160,10 @@ impl File for SimulatorFile {
 
     fn pwrite(
         &self,
-        pos: usize,
-        buffer: Arc<RefCell<turso_core::Buffer>>,
-        c: Arc<turso_core::Completion>,
-    ) -> Result<Arc<turso_core::Completion>> {
+        pos: u64,
+        buffer: Arc<turso_core::Buffer>,
+        c: turso_core::Completion,
+    ) -> Result<turso_core::Completion> {
         self.nr_pwrite_calls.set(self.nr_pwrite_calls.get() + 1);
         if self.fault.get() {
             tracing::debug!("pwrite fault");
@@ -200,11 +184,13 @@ impl File for SimulatorFile {
         }
     }
 
-    fn sync(&self, c: Arc<turso_core::Completion>) -> Result<Arc<turso_core::Completion>> {
+    fn sync(&self, c: turso_core::Completion) -> Result<turso_core::Completion> {
         self.nr_sync_calls.set(self.nr_sync_calls.get() + 1);
         if self.fault.get() {
             // TODO: Enable this when https://github.com/tursodatabase/turso/issues/2091 is fixed.
-            tracing::debug!("ignoring sync fault because it causes false positives with current simulator design");
+            tracing::debug!(
+                "ignoring sync fault because it causes false positives with current simulator design"
+            );
             self.fault.set(false);
         }
         let c = if let Some(latency) = self.generate_latency_duration() {
@@ -226,8 +212,55 @@ impl File for SimulatorFile {
         Ok(c)
     }
 
+    fn pwritev(
+        &self,
+        pos: u64,
+        buffers: Vec<Arc<turso_core::Buffer>>,
+        c: turso_core::Completion,
+    ) -> Result<turso_core::Completion> {
+        self.nr_pwrite_calls.set(self.nr_pwrite_calls.get() + 1);
+        if self.fault.get() {
+            tracing::debug!("pwritev fault");
+            self.nr_pwrite_faults.set(self.nr_pwrite_faults.get() + 1);
+            return Err(turso_core::LimboError::InternalError(
+                FAULT_ERROR_MSG.into(),
+            ));
+        }
+        if let Some(latency) = self.generate_latency_duration() {
+            let cloned_c = c.clone();
+            let op =
+                Box::new(move |file: &SimulatorFile| file.inner.pwritev(pos, buffers, cloned_c));
+            self.queued_io
+                .borrow_mut()
+                .push(DelayedIo { time: latency, op });
+            Ok(c)
+        } else {
+            let c = self.inner.pwritev(pos, buffers, c)?;
+            Ok(c)
+        }
+    }
+
     fn size(&self) -> Result<u64> {
         self.inner.size()
+    }
+
+    fn truncate(&self, len: u64, c: turso_core::Completion) -> Result<turso_core::Completion> {
+        if self.fault.get() {
+            return Err(turso_core::LimboError::InternalError(
+                FAULT_ERROR_MSG.into(),
+            ));
+        }
+        let c = if let Some(latency) = self.generate_latency_duration() {
+            let cloned_c = c.clone();
+            let op = Box::new(move |file: &SimulatorFile| file.inner.truncate(len, cloned_c));
+            self.queued_io
+                .borrow_mut()
+                .push(DelayedIo { time: latency, op });
+            c
+        } else {
+            self.inner.truncate(len, c)?
+        };
+        Ok(c)
     }
 }
 

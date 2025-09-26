@@ -2,9 +2,9 @@ name: Rust
 
 on:
   push:
-    branches: [ "main" ]
+    branches: ["main"]
   pull_request:
-    branches: [ "main" ]
+    branches: ["main"]
 
 env:
   CARGO_TERM_COLOR: always
@@ -13,12 +13,12 @@ jobs:
   cargo-fmt-check:
     runs-on: blacksmith-4vcpu-ubuntu-2404
     steps:
-    - uses: actions/checkout@v3
-    - uses: dtolnay/rust-toolchain@stable
-    - name: Check formatting
-      run: cargo fmt --check
-    - name: Check formatting (fuzz)
-      run: cd fuzz && cargo fmt --check
+      - uses: actions/checkout@v3
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Check formatting
+        run: cargo fmt --check
+      - name: Check formatting (fuzz)
+        run: cd fuzz && cargo fmt --check
 
   build-native:
     strategy:
@@ -28,21 +28,29 @@ jobs:
     runs-on: ${{ matrix.os }}
 
     steps:
-    - uses: actions/checkout@v3
-    - uses: useblacksmith/rust-cache@v3
-      with:
-        prefix-key: "v1-rust" # can be updated if we need to reset caches due to non-trivial change in the dependencies (for example, custom env var were set for single workspace project)
-    - name: Set up Python 3.10
-      uses: useblacksmith/setup-python@v6
-      with:
-        python-version: "3.10"
-    - name: Build
-      run: cargo build --verbose
-    - name: Test
-      env:
-        RUST_LOG: ${{ runner.debug && 'turso_core::storage=trace' || '' }}
-      run: cargo test --verbose
-      timeout-minutes: 20
+      - uses: actions/checkout@v3
+      - uses: useblacksmith/rust-cache@v3
+        with:
+          prefix-key: "v1-rust" # can be updated if we need to reset caches due to non-trivial change in the dependencies (for example, custom env var were set for single workspace project)
+      - name: Set up Python 3.10
+        uses: useblacksmith/setup-python@v6
+        with:
+          python-version: "3.10"
+      - name: Build
+        run: cargo build --verbose
+      - name: Test Encryption
+        run: |
+          cargo test --features encryption --color=always --test integration_tests query_processing::encryption
+          cargo test --features encryption --color=always --lib storage::encryption
+      - name: Test Checksums
+        run: |
+          cargo test --features checksum --color=always --lib storage::checksum
+          cargo test --features checksum --color=always --test integration_tests storage::checksum
+      - name: Test
+        env:
+          RUST_LOG: ${{ runner.debug && 'turso_core::storage=trace' || '' }}
+        run: cargo test --verbose --features checksum
+        timeout-minutes: 20
 
   clippy:
     runs-on: blacksmith-4vcpu-ubuntu-2404
@@ -50,21 +58,7 @@ jobs:
       - uses: actions/checkout@v3
       - name: Clippy
         run: |
-          cargo clippy --workspace --all-features --all-targets --exclude limbo-wasm -- --deny=warnings
-      - name: Clippy `limbo-wasm` crate `nodejs` feature
-        run: |
-          cargo clippy --package limbo-wasm --features nodejs --all-targets --no-deps -- -A clippy::all -W clippy::correctness -W clippy::perf -W clippy::suspicious --deny=warnings
-      - name: Clippy `limbo-wasm` crate `web` feature
-        run: |
-          cargo clippy --package limbo-wasm --no-default-features --features web --all-targets --no-deps -- -A clippy::all -W clippy::correctness -W clippy::perf -W clippy::suspicious --deny=warnings
-
-  build-wasm:
-    runs-on: blacksmith-4vcpu-ubuntu-2404
-    steps:
-      - uses: actions/checkout@v3
-      - name: Install
-        run: curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
-      - run: wasm-pack build --target nodejs bindings/wasm
+          cargo clippy --workspace --all-features --all-targets -- --deny=warnings
 
   simulator:
     runs-on: blacksmith-4vcpu-ubuntu-2404
@@ -74,8 +68,14 @@ jobs:
       - uses: useblacksmith/rust-cache@v3
         with:
           prefix-key: "v1-rust" # can be updated if we need to reset caches due to non-trivial change in the dependencies (for example, custom env var were set for single workspace project)
-      - name: Install the project
+      - name: Simulator default
         run: ./scripts/run-sim --maximum-tests 1000 --min-tick 10 --max-tick 50 loop -n 10 -s
+      - name: Simulator InsertHeavy
+        run: ./scripts/run-sim --maximum-tests 1000 --min-tick 10 --max-tick 50 --profile write_heavy loop -n 10 -s
+      - name: Simulator Faultless
+        run: ./scripts/run-sim --maximum-tests 1000 --min-tick 10 --max-tick 50 --profile faultless loop -n 10 -s
+      - name: Simulator Differential
+        run: ./scripts/run-sim --maximum-tests 1000 --differential loop -n 10 -s
 
   test-limbo:
     runs-on: blacksmith-4vcpu-ubuntu-2404
@@ -95,15 +95,12 @@ jobs:
       - name: Test
         run: make test
         timeout-minutes: 20
-#      - uses: "./.github/shared/install_sqlite"
-#      - name: Test with index enabled
-#        run: SQLITE_EXEC="scripts/limbo-sqlite3-index-experimental" make test
-#        timeout-minutes: 20
   test-sqlite:
     runs-on: blacksmith-4vcpu-ubuntu-2404
     steps:
       - uses: actions/checkout@v3
       - uses: "./.github/shared/install_sqlite"
+      - name: build SQLite test extensions
+        run: cargo build --package limbo_sqlite_test_ext
       - name: Test
         run: SQLITE_EXEC="sqlite3" make test-compat
-

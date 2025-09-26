@@ -33,16 +33,24 @@
 //! ```
 
 pub mod params;
+mod rows;
+pub mod transaction;
 pub mod value;
 
+use transaction::TransactionBehavior;
+#[cfg(feature = "conn_raw_api")]
+use turso_core::types::WalFrameInfo;
 pub use value::Value;
 
 pub use params::params_from_iter;
+pub use params::IntoParams;
 
-use crate::params::*;
 use std::fmt::Debug;
 use std::num::NonZero;
 use std::sync::{Arc, Mutex};
+
+// Re-exports rows
+pub use crate::rows::{Row, Rows};
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -52,6 +60,12 @@ pub enum Error {
     MutexError(String),
     #[error("SQL execution failure: `{0}`")]
     SqlExecutionFailure(String),
+    #[error("WAL operation error: `{0}`")]
+    WalOperationError(String),
+    #[error("Query returned no rows")]
+    QueryReturnedNoRows,
+    #[error("Conversion failure: `{0}`")]
+    ConversionFailure(String),
 }
 
 impl From<turso_core::LimboError> for Error {
@@ -67,6 +81,8 @@ pub type Result<T> = std::result::Result<T, Error>;
 /// A builder for `Database`.
 pub struct Builder {
     path: String,
+    enable_mvcc: bool,
+    vfs: Option<String>,
 }
 
 impl Builder {
@@ -74,37 +90,80 @@ impl Builder {
     pub fn new_local(path: &str) -> Self {
         Self {
             path: path.to_string(),
+            enable_mvcc: false,
+            vfs: None,
         }
+    }
+
+    pub fn with_mvcc(mut self, mvcc_enabled: bool) -> Self {
+        self.enable_mvcc = mvcc_enabled;
+        self
+    }
+
+    pub fn with_io(mut self, vfs: String) -> Self {
+        self.vfs = Some(vfs);
+        self
     }
 
     /// Build the database.
     #[allow(unused_variables, clippy::arc_with_non_send_sync)]
     pub async fn build(self) -> Result<Database> {
-        match self.path.as_str() {
-            ":memory:" => {
-                let io: Arc<dyn turso_core::IO> = Arc::new(turso_core::MemoryIO::new());
-                let db = turso_core::Database::open_file(
-                    io,
-                    self.path.as_str(),
-                    false,
-                    indexes_enabled(),
-                )?;
-                Ok(Database { inner: db })
+        let io = self.get_io()?;
+        let db = turso_core::Database::open_file(io, self.path.as_str(), self.enable_mvcc, true)?;
+        Ok(Database { inner: db })
+    }
+
+    fn get_io(&self) -> Result<Arc<dyn turso_core::IO>> {
+        let vfs_choice = self.vfs.as_deref().unwrap_or("");
+
+        if self.path == ":memory:" && vfs_choice.is_empty() {
+            return Ok(Arc::new(turso_core::MemoryIO::new()));
+        }
+
+        match vfs_choice {
+            "memory" => Ok(Arc::new(turso_core::MemoryIO::new())),
+            "syscall" => {
+                #[cfg(target_family = "unix")]
+                {
+                    Ok(Arc::new(
+                        turso_core::UnixIO::new()
+                            .map_err(|e| Error::SqlExecutionFailure(e.to_string()))?,
+                    ))
+                }
+                #[cfg(not(target_family = "unix"))]
+                {
+                    Ok(Arc::new(
+                        turso_core::PlatformIO::new()
+                            .map_err(|e| Error::SqlExecutionFailure(e.to_string()))?,
+                    ))
+                }
             }
-            path => {
-                let io: Arc<dyn turso_core::IO> = Arc::new(turso_core::PlatformIO::new()?);
-                let db = turso_core::Database::open_file(io, path, false, indexes_enabled())?;
-                Ok(Database { inner: db })
+            #[cfg(target_os = "linux")]
+            "io_uring" => Ok(Arc::new(
+                turso_core::UringIO::new()
+                    .map_err(|e| Error::SqlExecutionFailure(e.to_string()))?,
+            )),
+            #[cfg(not(target_os = "linux"))]
+            "io_uring" => Err(Error::SqlExecutionFailure(
+                "io_uring is only available on Linux targets".to_string(),
+            )),
+            "" => {
+                // Default behavior: memory for ":memory:", platform IO for files
+                if self.path == ":memory:" {
+                    Ok(Arc::new(turso_core::MemoryIO::new()))
+                } else {
+                    Ok(Arc::new(
+                        turso_core::PlatformIO::new()
+                            .map_err(|e| Error::SqlExecutionFailure(e.to_string()))?,
+                    ))
+                }
             }
+            _ => Ok(Arc::new(
+                turso_core::PlatformIO::new()
+                    .map_err(|e| Error::SqlExecutionFailure(e.to_string()))?,
+            )),
         }
     }
-}
-
-fn indexes_enabled() -> bool {
-    #[cfg(feature = "experimental_indexes")]
-    return true;
-    #[cfg(not(feature = "experimental_indexes"))]
-    return false;
 }
 
 /// A database.
@@ -128,23 +187,21 @@ impl Database {
     /// Connect to the database.
     pub fn connect(&self) -> Result<Connection> {
         let conn = self.inner.connect()?;
-        #[allow(clippy::arc_with_non_send_sync)]
-        let connection = Connection {
-            inner: Arc::new(Mutex::new(conn)),
-        };
-        Ok(connection)
+        Ok(Connection::create(conn))
     }
 }
 
 /// A database connection.
 pub struct Connection {
     inner: Arc<Mutex<Arc<turso_core::Connection>>>,
+    transaction_behavior: TransactionBehavior,
 }
 
 impl Clone for Connection {
     fn clone(&self) -> Self {
         Self {
             inner: Arc::clone(&self.inner),
+            transaction_behavior: self.transaction_behavior,
         }
     }
 }
@@ -153,6 +210,14 @@ unsafe impl Send for Connection {}
 unsafe impl Sync for Connection {}
 
 impl Connection {
+    pub fn create(conn: Arc<turso_core::Connection>) -> Self {
+        #[allow(clippy::arc_with_non_send_sync)]
+        let connection = Connection {
+            inner: Arc::new(Mutex::new(conn)),
+            transaction_behavior: TransactionBehavior::Deferred,
+        };
+        connection
+    }
     /// Query the database with SQL.
     pub async fn query(&self, sql: &str, params: impl IntoParams) -> Result<Rows> {
         let mut stmt = self.prepare(sql).await?;
@@ -163,6 +228,90 @@ impl Connection {
     pub async fn execute(&self, sql: &str, params: impl IntoParams) -> Result<u64> {
         let mut stmt = self.prepare(sql).await?;
         stmt.execute(params).await
+    }
+
+    #[cfg(feature = "conn_raw_api")]
+    pub fn wal_frame_count(&self) -> Result<u64> {
+        let conn = self
+            .inner
+            .lock()
+            .map_err(|e| Error::MutexError(e.to_string()))?;
+        conn.wal_state()
+            .map_err(|e| Error::WalOperationError(format!("wal_insert_begin failed: {e}")))
+            .map(|state| state.max_frame)
+    }
+
+    #[cfg(feature = "conn_raw_api")]
+    pub fn try_wal_watermark_read_page(
+        &self,
+        page_idx: u32,
+        page: &mut [u8],
+        frame_watermark: Option<u64>,
+    ) -> Result<bool> {
+        let conn = self
+            .inner
+            .lock()
+            .map_err(|e| Error::MutexError(e.to_string()))?;
+        conn.try_wal_watermark_read_page(page_idx, page, frame_watermark)
+            .map_err(|e| {
+                Error::WalOperationError(format!("try_wal_watermark_read_page failed: {e}"))
+            })
+    }
+
+    #[cfg(feature = "conn_raw_api")]
+    pub fn wal_changed_pages_after(&self, frame_watermark: u64) -> Result<Vec<u32>> {
+        let conn = self
+            .inner
+            .lock()
+            .map_err(|e| Error::MutexError(e.to_string()))?;
+        conn.wal_changed_pages_after(frame_watermark)
+            .map_err(|e| Error::WalOperationError(format!("wal_changed_pages_after failed: {e}")))
+    }
+
+    #[cfg(feature = "conn_raw_api")]
+    pub fn wal_insert_begin(&self) -> Result<()> {
+        let conn = self
+            .inner
+            .lock()
+            .map_err(|e| Error::MutexError(e.to_string()))?;
+        conn.wal_insert_begin()
+            .map_err(|e| Error::WalOperationError(format!("wal_insert_begin failed: {e}")))
+    }
+
+    #[cfg(feature = "conn_raw_api")]
+    pub fn wal_insert_end(&self, force_commit: bool) -> Result<()> {
+        let conn = self
+            .inner
+            .lock()
+            .map_err(|e| Error::MutexError(e.to_string()))?;
+        conn.wal_insert_end(force_commit)
+            .map_err(|e| Error::WalOperationError(format!("wal_insert_end failed: {e}")))
+    }
+
+    #[cfg(feature = "conn_raw_api")]
+    pub fn wal_insert_frame(&self, frame_no: u64, frame: &[u8]) -> Result<WalFrameInfo> {
+        let conn = self
+            .inner
+            .lock()
+            .map_err(|e| Error::MutexError(e.to_string()))?;
+        conn.wal_insert_frame(frame_no, frame)
+            .map_err(|e| Error::WalOperationError(format!("wal_insert_frame failed: {e}")))
+    }
+
+    #[cfg(feature = "conn_raw_api")]
+    pub fn wal_get_frame(&self, frame_no: u64, frame: &mut [u8]) -> Result<WalFrameInfo> {
+        let conn = self
+            .inner
+            .lock()
+            .map_err(|e| Error::MutexError(e.to_string()))?;
+        conn.wal_get_frame(frame_no, frame)
+            .map_err(|e| Error::WalOperationError(format!("wal_insert_frame failed: {e}")))
+    }
+
+    /// Execute a batch of SQL statements on the database.
+    pub async fn execute_batch(&self, sql: &str) -> Result<()> {
+        self.prepare_execute_batch(sql).await?;
+        Ok(())
     }
 
     /// Prepare a SQL statement for later execution.
@@ -179,6 +328,15 @@ impl Connection {
             inner: Arc::new(Mutex::new(stmt)),
         };
         Ok(statement)
+    }
+
+    async fn prepare_execute_batch(&self, sql: impl AsRef<str>) -> Result<()> {
+        let conn = self
+            .inner
+            .lock()
+            .map_err(|e| Error::MutexError(e.to_string()))?;
+        conn.prepare_execute_batch(sql)?;
+        Ok(())
     }
 
     /// Query a pragma.
@@ -206,6 +364,12 @@ impl Connection {
         Ok(())
     }
 
+    /// Returns the rowid of the last row inserted.
+    pub fn last_insert_rowid(&self) -> i64 {
+        let conn = self.inner.lock().unwrap();
+        conn.last_insert_rowid()
+    }
+
     /// Flush dirty pages to disk.
     /// This will write the dirty pages to the WAL.
     pub fn cacheflush(&self) -> Result<()> {
@@ -213,7 +377,43 @@ impl Connection {
             .inner
             .lock()
             .map_err(|e| Error::MutexError(e.to_string()))?;
-        conn.cacheflush()?;
+        let completions = conn.cacheflush()?;
+        let pager = conn.get_pager();
+        for c in completions {
+            pager.io.wait_for_completion(c)?;
+        }
+        Ok(())
+    }
+
+    pub fn is_autocommit(&self) -> Result<bool> {
+        let conn = self
+            .inner
+            .lock()
+            .map_err(|e| Error::MutexError(e.to_string()))?;
+
+        Ok(conn.get_auto_commit())
+    }
+
+    /// Sets maximum total accumuated timeout. If the duration is None or Zero, we unset the busy handler for this Connection
+    ///
+    /// This api defers slighty from: https://www.sqlite.org/c3ref/busy_timeout.html
+    ///
+    /// Instead of sleeping for linear amount of time specified by the user,
+    /// we will sleep in phases, until the the total amount of time is reached.
+    /// This means we first sleep of 1ms, then if we still return busy, we sleep for 2 ms, and repeat until a maximum of 100 ms per phase.
+    ///
+    /// Example:
+    /// 1. Set duration to 5ms
+    /// 2. Step through query -> returns Busy -> sleep/yield for 1 ms
+    /// 3. Step through query -> returns Busy -> sleep/yield for 2 ms
+    /// 4. Step through query -> returns Busy -> sleep/yield for 2 ms (totaling 5 ms of sleep)
+    /// 5. Step through query -> returns Busy -> return Busy to user
+    pub fn busy_timeout(&self, duration: std::time::Duration) -> Result<()> {
+        let conn = self
+            .inner
+            .lock()
+            .map_err(|e| Error::MutexError(e.to_string()))?;
+        conn.set_busy_timeout(duration);
         Ok(())
     }
 }
@@ -260,10 +460,7 @@ impl Statement {
                 }
             }
         }
-        #[allow(clippy::arc_with_non_send_sync)]
-        let rows = Rows {
-            inner: Arc::clone(&self.inner),
-        };
+        let rows = Rows::new(&self.inner);
         Ok(rows)
     }
 
@@ -294,21 +491,23 @@ impl Statement {
             let mut stmt = self.inner.lock().unwrap();
             match stmt.step() {
                 Ok(turso_core::StepResult::Row) => {
-                    // unexpected row during execution, error out.
-                    return Ok(2);
+                    return Err(Error::SqlExecutionFailure(
+                        "unexpected row during execution".to_string(),
+                    ));
                 }
                 Ok(turso_core::StepResult::Done) => {
-                    return Ok(0);
+                    let changes = stmt.n_change();
+                    assert!(changes >= 0);
+                    return Ok(changes as u64);
                 }
                 Ok(turso_core::StepResult::IO) => {
-                    let _ = stmt.run_once();
-                    //return Ok(1);
+                    stmt.run_once()?;
                 }
                 Ok(turso_core::StepResult::Busy) => {
-                    return Ok(4);
+                    return Err(Error::SqlExecutionFailure("database is locked".to_string()));
                 }
                 Ok(turso_core::StepResult::Interrupt) => {
-                    return Ok(3);
+                    return Err(Error::SqlExecutionFailure("interrupted".to_string()));
                 }
                 Err(err) => {
                     return Err(err.into());
@@ -334,6 +533,23 @@ impl Statement {
         }
 
         cols
+    }
+
+    /// Reset internal statement state after previous execution so it can be reused again
+    pub fn reset(&self) {
+        let mut stmt = self.inner.lock().unwrap();
+        stmt.reset();
+    }
+
+    /// Execute a query that returns the first [`Row`].
+    ///
+    /// # Errors
+    ///
+    /// - Returns `QueryReturnedNoRows` if no rows were returned.
+    pub async fn query_row(&mut self, params: impl IntoParams) -> Result<Row> {
+        let mut rows = self.query(params).await?;
+
+        rows.next().await?.ok_or(Error::QueryReturnedNoRows)
     }
 }
 
@@ -367,95 +583,6 @@ pub enum Params {
 }
 
 pub struct Transaction {}
-
-/// Results of a prepared statement query.
-pub struct Rows {
-    inner: Arc<Mutex<turso_core::Statement>>,
-}
-
-impl Clone for Rows {
-    fn clone(&self) -> Self {
-        Self {
-            inner: Arc::clone(&self.inner),
-        }
-    }
-}
-
-unsafe impl Send for Rows {}
-unsafe impl Sync for Rows {}
-
-impl Rows {
-    /// Fetch the next row of this result set.
-    pub async fn next(&mut self) -> Result<Option<Row>> {
-        loop {
-            let mut stmt = self
-                .inner
-                .lock()
-                .map_err(|e| Error::MutexError(e.to_string()))?;
-            match stmt.step() {
-                Ok(turso_core::StepResult::Row) => {
-                    let row = stmt.row().unwrap();
-                    return Ok(Some(Row {
-                        values: row.get_values().map(|v| v.to_owned()).collect(),
-                    }));
-                }
-                Ok(turso_core::StepResult::Done) => return Ok(None),
-                Ok(turso_core::StepResult::IO) => {
-                    if let Err(e) = stmt.run_once() {
-                        return Err(e.into());
-                    }
-                    continue;
-                }
-                Ok(turso_core::StepResult::Busy) => return Ok(None),
-                Ok(turso_core::StepResult::Interrupt) => return Ok(None),
-                _ => return Ok(None),
-            }
-        }
-    }
-}
-
-/// Query result row.
-#[derive(Debug)]
-pub struct Row {
-    values: Vec<turso_core::Value>,
-}
-
-unsafe impl Send for Row {}
-unsafe impl Sync for Row {}
-
-impl Row {
-    pub fn get_value(&self, index: usize) -> Result<Value> {
-        let value = &self.values[index];
-        match value {
-            turso_core::Value::Integer(i) => Ok(Value::Integer(*i)),
-            turso_core::Value::Null => Ok(Value::Null),
-            turso_core::Value::Float(f) => Ok(Value::Real(*f)),
-            turso_core::Value::Text(text) => Ok(Value::Text(text.to_string())),
-            turso_core::Value::Blob(items) => Ok(Value::Blob(items.to_vec())),
-        }
-    }
-
-    pub fn column_count(&self) -> usize {
-        self.values.len()
-    }
-}
-
-impl<'a> FromIterator<&'a turso_core::Value> for Row {
-    fn from_iter<T: IntoIterator<Item = &'a turso_core::Value>>(iter: T) -> Self {
-        let values = iter
-            .into_iter()
-            .map(|v| match v {
-                turso_core::Value::Integer(i) => turso_core::Value::Integer(*i),
-                turso_core::Value::Null => turso_core::Value::Null,
-                turso_core::Value::Float(f) => turso_core::Value::Float(*f),
-                turso_core::Value::Text(s) => turso_core::Value::Text(s.clone()),
-                turso_core::Value::Blob(b) => turso_core::Value::Blob(b.clone()),
-            })
-            .collect();
-
-        Row { values }
-    }
-}
 
 #[cfg(test)]
 mod tests {
@@ -536,36 +663,38 @@ mod tests {
             }
         } // db and conn are dropped here, simulating closing
 
-        // Now, re-open the database and check if the data is still there
-        let db = Builder::new_local(db_path).build().await?;
-        let conn = db.connect()?;
+        {
+            // Now, re-open the database and check if the data is still there
+            let db = Builder::new_local(db_path).build().await?;
+            let conn = db.connect()?;
 
-        let mut rows = conn
-            .query("SELECT data FROM test_large_persistence ORDER BY id;", ())
-            .await?;
+            let mut rows = conn
+                .query("SELECT data FROM test_large_persistence ORDER BY id;", ())
+                .await?;
 
-        for (i, value) in original_data.iter().enumerate().take(NUM_INSERTS) {
-            let row = rows
-                .next()
-                .await?
-                .unwrap_or_else(|| panic!("Expected row {i} but found None"));
-            assert_eq!(
-                row.get_value(0)?,
-                Value::Text(value.clone()),
-                "Mismatch in retrieved data for row {i}"
+            for (i, value) in original_data.iter().enumerate().take(NUM_INSERTS) {
+                let row = rows
+                    .next()
+                    .await?
+                    .unwrap_or_else(|| panic!("Expected row {i} but found None"));
+                assert_eq!(
+                    row.get_value(0)?,
+                    Value::Text(value.clone()),
+                    "Mismatch in retrieved data for row {i}"
+                );
+            }
+
+            assert!(
+                rows.next().await?.is_none(),
+                "Expected no more rows after retrieving all inserted data"
             );
+
+            // Delete the WAL file only and try to re-open and query
+            let wal_path = format!("{db_path}-wal");
+            std::fs::remove_file(&wal_path)
+                .map_err(|e| eprintln!("Warning: Failed to delete WAL file for test: {e}"))
+                .unwrap();
         }
-
-        assert!(
-            rows.next().await?.is_none(),
-            "Expected no more rows after retrieving all inserted data"
-        );
-
-        // Delete the WAL file only and try to re-open and query
-        let wal_path = format!("{db_path}-wal");
-        std::fs::remove_file(&wal_path)
-            .map_err(|e| eprintln!("Warning: Failed to delete WAL file for test: {e}"))
-            .unwrap();
 
         // Attempt to re-open the database after deleting WAL and assert that table is missing.
         let db_after_wal_delete = Builder::new_local(db_path).build().await?;

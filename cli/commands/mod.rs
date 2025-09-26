@@ -2,13 +2,17 @@ pub mod args;
 pub mod import;
 
 use args::{
-    CwdArgs, EchoArgs, ExitArgs, HeadersArgs, IndexesArgs, LoadExtensionArgs, NullValueArgs,
-    OpcodesArgs, OpenArgs, OutputModeArgs, SchemaArgs, SetOutputArgs, TablesArgs, TimerArgs,
+    CwdArgs, DbConfigArgs, EchoArgs, ExitArgs, HeadersArgs, IndexesArgs, LoadExtensionArgs,
+    ManualArgs, NullValueArgs, OpcodesArgs, OpenArgs, OutputModeArgs, SchemaArgs, SetOutputArgs,
+    StatsArgs, TablesArgs, TimerArgs,
 };
 use clap::Parser;
 use import::ImportArgs;
 
-use crate::input::{AFTER_HELP_MSG, BEFORE_HELP_MSG};
+use crate::{
+    commands::args::CloneArgs,
+    input::{AFTER_HELP_MSG, BEFORE_HELP_MSG},
+};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -61,6 +65,8 @@ pub enum Command {
     Echo(EchoArgs),
     /// Display tables
     Tables(TablesArgs),
+    /// Display attached databases
+    Databases,
     /// Import data from FILE into TABLE
     #[command(name = "import", display_name = ".import")]
     Import(ImportArgs),
@@ -69,6 +75,12 @@ pub enum Command {
     LoadExtension(LoadExtensionArgs),
     /// Dump the current database as a list of SQL statements
     Dump,
+    /// Print or set the current configuration for the database. Currently ignored.
+    #[command(name = "dbconfig", display_name = ".dbconfig")]
+    DbConfig(DbConfigArgs),
+    /// Display database statistics
+    #[command(name = "stats", display_name = ".stats")]
+    Stats(StatsArgs),
     /// List vfs modules available
     #[command(name = "vfslist", display_name = ".vfslist")]
     ListVfs,
@@ -80,6 +92,11 @@ pub enum Command {
     /// Toggle column headers on/off in list mode
     #[command(name = "headers", display_name = ".headers")]
     Headers(HeadersArgs),
+    #[command(name = "clone", display_name = ".clone")]
+    Clone(CloneArgs),
+    /// Display manual pages for features
+    #[command(name = "manual", display_name = ".manual", alias = "man")]
+    Manual(ManualArgs),
 }
 
 const _HELP_TEMPLATE: &str = "{before-help}{name}

@@ -4,23 +4,31 @@ set testdir [file dirname $argv0]
 source $testdir/tester.tcl
 
 do_execsql_test_on_specific_db {:memory:} alter-table-rename-table {
-    CREATE TABLE t1(x INTEGER PRIMARY KEY, u UNIQUE);
+    CREATE TABLE t1 (x INTEGER PRIMARY KEY, u);
     ALTER TABLE t1 RENAME TO t2;
     SELECT name FROM sqlite_schema WHERE type = 'table';
 } { "t2" }
 
 do_execsql_test_on_specific_db {:memory:} alter-table-rename-column {
-    CREATE TABLE t(a);
-    CREATE INDEX i ON t(a);
+    CREATE TABLE t (a INTEGER);
+    CREATE INDEX i ON t (a);
     ALTER TABLE t RENAME a TO b;
     SELECT sql FROM sqlite_schema;
 } {
-    "CREATE TABLE t(b)"
-    "CREATE INDEX i ON t(b)"
+    "CREATE TABLE t (b INTEGER)"
+    "CREATE INDEX i ON t (b)"
+}
+
+do_execsql_test_on_specific_db {:memory:} alter-table-rename-quoted-column {
+    CREATE TABLE t (a INTEGER);
+    ALTER TABLE t RENAME a TO "ab cd";
+    SELECT sql FROM sqlite_schema;
+} {
+    "CREATE TABLE t (\"ab cd\" INTEGER)"
 }
 
 do_execsql_test_on_specific_db {:memory:} alter-table-add-column {
-    CREATE TABLE t(a);
+    CREATE TABLE t (a);
     INSERT INTO t VALUES (1);
     SELECT * FROM t;
 
@@ -29,12 +37,12 @@ do_execsql_test_on_specific_db {:memory:} alter-table-add-column {
     SELECT * FROM t;
 } {
   "1"
-  "CREATE TABLE t(a, b)"
+  "CREATE TABLE t (a, b)"
   "1|"
 }
 
 do_execsql_test_on_specific_db {:memory:} alter-table-add-column-typed {
-    CREATE TABLE t(a);
+    CREATE TABLE t (a);
     ALTER TABLE t ADD b DEFAULT 0;
 
     SELECT sql FROM sqlite_schema;
@@ -42,12 +50,12 @@ do_execsql_test_on_specific_db {:memory:} alter-table-add-column-typed {
     INSERT INTO t (a) VALUES (1);
     SELECT * FROM t;
 } {
-  "CREATE TABLE t(a, b DEFAULT 0)"
+  "CREATE TABLE t (a, b DEFAULT 0)"
   "1|0"
 }
 
 do_execsql_test_on_specific_db {:memory:} alter-table-add-column-default {
-    CREATE TABLE test(a);
+    CREATE TABLE test (a);
     INSERT INTO test VALUES (1), (2), (3);
 
     ALTER TABLE test ADD b DEFAULT 0.1;
@@ -61,21 +69,29 @@ do_execsql_test_on_specific_db {:memory:} alter-table-add-column-default {
     SELECT * FROM test;
 
 } {
-  "1|0.1|hello"
-  "2|0.1|hello"
-  "3|0.1|hello"
+"1|0.1|hello"
+"2|0.1|hello"
+"3|0.1|hello"
 
-  "0.1|hello"
-  "0.1|hello"
-  "0.1|hello"
+"0.1|hello"
+"0.1|hello"
+"0.1|hello"
 
-  "0.1|hello"
-  "0.1|hello"
-  "0.1|hello"
+"0.1|hello"
+"0.1|hello"
+"0.1|hello"
+}
+
+do_execsql_test_on_specific_db {:memory:} alter-table-add-quoted-column {
+    CREATE TABLE test (a);
+    ALTER TABLE test ADD COLUMN [b c];
+    SELECT sql FROM sqlite_schema;
+} {
+    "CREATE TABLE test (a, [b c])"
 }
 
 do_execsql_test_on_specific_db {:memory:} alter-table-drop-column {
-    CREATE TABLE t(a, b);
+    CREATE TABLE t (a, b);
     INSERT INTO t VALUES (1, 1), (2, 2), (3, 3);
     SELECT * FROM t;
 
@@ -88,29 +104,103 @@ do_execsql_test_on_specific_db {:memory:} alter-table-drop-column {
   "2|2"
   "3|3"
 
-  "CREATE TABLE t(a)"
+  "CREATE TABLE t (a)"
 
   "1"
   "2"
   "3"
 }
 
+do_execsql_test_on_specific_db {:memory:} alter-table-drop-column-special-name {
+    CREATE TABLE t (a, b, [c c]);
+    INSERT INTO t VALUES (1, 2, 3);
+    ALTER TABLE t DROP COLUMN b;
+
+    SELECT "c c" FROM t;
+    SELECT sql FROM sqlite_schema;
+} {
+    3
+    "CREATE TABLE t (a, [c c])"
+}
+
 do_execsql_test_in_memory_any_error fail-alter-table-drop-unique-column {
-    CREATE TABLE t(a, b UNIQUE);
+    CREATE TABLE t (a, b UNIQUE);
     ALTER TABLE t DROP b;
 }
 
 do_execsql_test_in_memory_any_error fail-alter-table-drop-unique-column-constraint {
-    CREATE TABLE t(a, b, UNIQUE (b));
+    CREATE TABLE t (a, b, UNIQUE (b));
     ALTER TABLE t DROP b;
 }
 
+
+# refer https://github.com/tursodatabase/turso/issues/3231
+do_execsql_test_in_memory_any_error fail-alter-table-add-duplicate-column {
+    CREATE TABLE t1 (a);
+    ALTER TABLE t1 ADD COLUMN a;
+}
+do_execsql_test_in_memory_any_error fail-alter-table-add-duplicate-column-case-insensitive {
+    CREATE TABLE t1 (a);
+    ALTER TABLE t1 ADD COLUMN A;
+}
+
 do_execsql_test_in_memory_any_error fail-alter-table-drop-primary-key-column {
-    CREATE TABLE t(a PRIMARY KEY, b);
+    CREATE TABLE t (a PRIMARY KEY, b);
     ALTER TABLE t DROP a;
 }
 
 do_execsql_test_in_memory_any_error fail-alter-table-drop-primary-key-column-constrait {
-    CREATE TABLE t(a, b, PRIMARY KEY (a));
+    CREATE TABLE t (a, b, PRIMARY KEY (a));
     ALTER TABLE t DROP a;
+}
+
+do_execsql_test_in_memory_any_error fail-alter-table-rename-to-existing-index {
+    CREATE TABLE x (a);
+    CREATE INDEX y ON x (a);
+    ALTER TABLE x RENAME TO y;
+}
+
+do_execsql_test_in_memory_any_error fail-alter-table-rename-to-existing-table {
+    CREATE TABLE x (a);
+    CREATE TABLE y (a);
+    ALTER TABLE x RENAME TO y;
+}
+
+do_execsql_test_on_specific_db {:memory:} alter-table-rename-to-quoted-identifier {
+    CREATE TABLE t (a);
+    CREATE INDEX idx ON t (a);
+    INSERT INTO t VALUES (1);
+
+    ALTER TABLE t RENAME TO "t t";
+    SELECT sql FROM sqlite_schema;
+
+    INSERT INTO "t t" VALUES (2);
+    SELECT a FROM "t t";
+
+    DELETE FROM "t t" WHERE a = 1;
+    SELECT a FROM "t t";
+
+    ALTER TABLE "t t" RENAME COLUMN a TO "a a";
+    SELECT sql FROM sqlite_schema;
+    SELECT "a a" FROM "t t";
+
+    ALTER TABLE "t t" RENAME COLUMN "a a" TO "b b";
+    SELECT sql FROM sqlite_schema;
+    SELECT "b b" FROM "t t";
+} {
+    "CREATE TABLE \"t t\" (a)"
+    "CREATE INDEX idx ON \"t t\" (a)"
+
+    "1"
+    "2"
+
+    "2"
+
+    "CREATE TABLE \"t t\" (\"a a\")"
+    "CREATE INDEX idx ON \"t t\" (\"a a\")"
+    "2"
+
+    "CREATE TABLE \"t t\" (\"b b\")"
+    "CREATE INDEX idx ON \"t t\" (\"b b\")"
+    "2"
 }

@@ -1,57 +1,124 @@
-use crate::result::LimboResult;
+use crate::function::Func;
+use crate::incremental::view::IncrementalView;
+use crate::translate::expr::{
+    bind_and_rewrite_expr, walk_expr, BindingBehavior, ParamState, WalkControl,
+};
+use crate::translate::planner::ROWID_STRS;
+use parking_lot::RwLock;
+
+/// Simple view structure for non-materialized views
+#[derive(Debug, Clone)]
+pub struct View {
+    pub name: String,
+    pub sql: String,
+    pub select_stmt: ast::Select,
+    pub columns: Vec<Column>,
+}
+
+/// Type alias for regular views collection
+pub type ViewsMap = HashMap<String, View>;
+
 use crate::storage::btree::BTreeCursor;
 use crate::translate::collate::CollationSeq;
-use crate::translate::plan::SelectPlan;
-use crate::types::IOResult;
-use crate::util::{module_args_from_sql, module_name_from_sql, UnparsedFromSqlIndex};
+use crate::translate::plan::{SelectPlan, TableReferences};
+use crate::util::{
+    module_args_from_sql, module_name_from_sql, type_from_name, IOExt, UnparsedFromSqlIndex,
+};
+use crate::{
+    contains_ignore_ascii_case, eq_ignore_ascii_case, match_ignore_ascii_case, Connection,
+    LimboError, MvCursor, MvStore, Pager, RefValue, SymbolTable, VirtualTable,
+};
 use crate::{util::normalize_ident, Result};
-use crate::{LimboError, MvCursor, Pager, RefValue, SymbolTable, VirtualTable};
 use core::fmt;
-use fallible_iterator::FallibleIterator;
-use std::cell::RefCell;
-use std::collections::hash_map::Entry;
-use std::collections::{BTreeSet, HashMap};
-use std::rc::Rc;
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::ops::Deref;
 use std::sync::Arc;
+use std::sync::Mutex;
 use tracing::trace;
-use turso_sqlite3_parser::ast::{self, ColumnDefinition, Expr, Literal, SortOrder, TableOptions};
-use turso_sqlite3_parser::{
-    ast::{Cmd, CreateTableBody, QualifiedName, ResultColumn, Stmt},
-    lexer::sql::Parser,
+use turso_parser::ast::{self, ColumnDefinition, Expr, Literal, SortOrder, TableOptions};
+use turso_parser::{
+    ast::{Cmd, CreateTableBody, Name, ResultColumn, Stmt},
+    parser::Parser,
 };
 
 const SCHEMA_TABLE_NAME: &str = "sqlite_schema";
 const SCHEMA_TABLE_NAME_ALT: &str = "sqlite_master";
+pub const DBSP_TABLE_PREFIX: &str = "__turso_internal_dbsp_state_v";
 
-#[derive(Debug, Clone)]
+/// Used to refer to the implicit rowid column in tables without an alias during UPDATE
+pub const ROWID_SENTINEL: usize = usize::MAX;
+
+/// Internal table prefixes that should be protected from CREATE/DROP
+pub const RESERVED_TABLE_PREFIXES: [&str; 2] = ["sqlite_", "__turso_internal_"];
+
+/// Check if a table name refers to a system table that should be protected from direct writes
+pub fn is_system_table(table_name: &str) -> bool {
+    let normalized = table_name.to_lowercase();
+    normalized == SCHEMA_TABLE_NAME
+        || normalized == SCHEMA_TABLE_NAME_ALT
+        || table_name.starts_with(DBSP_TABLE_PREFIX)
+}
+
+#[derive(Debug)]
 pub struct Schema {
     pub tables: HashMap<String, Arc<Table>>,
+
+    /// Track which tables are actually materialized views
+    pub materialized_view_names: HashSet<String>,
+    /// Store original SQL for materialized views (for .schema command)
+    pub materialized_view_sql: HashMap<String, String>,
+    /// The incremental view objects (DBSP circuits)
+    pub incremental_views: HashMap<String, Arc<Mutex<IncrementalView>>>,
+
+    pub views: ViewsMap,
+
     /// table_name to list of indexes for the table
-    pub indexes: HashMap<String, Vec<Arc<Index>>>,
+    pub indexes: HashMap<String, VecDeque<Arc<Index>>>,
     pub has_indexes: std::collections::HashSet<String>,
     pub indexes_enabled: bool,
     pub schema_version: u32,
+
+    /// Mapping from table names to the materialized views that depend on them
+    pub table_to_materialized_views: HashMap<String, Vec<String>>,
+
+    /// Track views that exist but have incompatible versions
+    pub incompatible_views: HashSet<String>,
 }
 
 impl Schema {
     pub fn new(indexes_enabled: bool) -> Self {
         let mut tables: HashMap<String, Arc<Table>> = HashMap::new();
         let has_indexes = std::collections::HashSet::new();
-        let indexes: HashMap<String, Vec<Arc<Index>>> = HashMap::new();
+        let indexes: HashMap<String, VecDeque<Arc<Index>>> = HashMap::new();
         #[allow(clippy::arc_with_non_send_sync)]
         tables.insert(
             SCHEMA_TABLE_NAME.to_string(),
             Arc::new(Table::BTree(sqlite_schema_table().into())),
         );
         for function in VirtualTable::builtin_functions() {
-            tables.insert(function.name.to_owned(), Arc::new(Table::Virtual(function)));
+            tables.insert(
+                function.name.to_owned(),
+                Arc::new(Table::Virtual(Arc::new((*function).clone()))),
+            );
         }
+        let materialized_view_names = HashSet::new();
+        let materialized_view_sql = HashMap::new();
+        let incremental_views = HashMap::new();
+        let views: ViewsMap = HashMap::new();
+        let table_to_materialized_views: HashMap<String, Vec<String>> = HashMap::new();
+        let incompatible_views = HashSet::new();
         Self {
             tables,
+            materialized_view_names,
+            materialized_view_sql,
+            incremental_views,
+            views,
             indexes,
             has_indexes,
             indexes_enabled,
             schema_version: 0,
+            table_to_materialized_views,
+            incompatible_views,
         }
     }
 
@@ -61,13 +128,128 @@ impl Schema {
             .iter()
             .any(|idx| idx.1.iter().any(|i| i.name == name))
     }
+    pub fn add_materialized_view(&mut self, view: IncrementalView, table: Arc<Table>, sql: String) {
+        let name = normalize_ident(view.name());
 
-    pub fn add_btree_table(&mut self, table: Rc<BTreeTable>) {
+        // Add to tables (so it appears as a regular table)
+        self.tables.insert(name.clone(), table);
+
+        // Track that this is a materialized view
+        self.materialized_view_names.insert(name.clone());
+        self.materialized_view_sql.insert(name.clone(), sql);
+
+        // Store the incremental view (DBSP circuit)
+        self.incremental_views
+            .insert(name, Arc::new(Mutex::new(view)));
+    }
+
+    pub fn get_materialized_view(&self, name: &str) -> Option<Arc<Mutex<IncrementalView>>> {
+        let name = normalize_ident(name);
+        self.incremental_views.get(&name).cloned()
+    }
+
+    /// Check if DBSP state table exists with the current version
+    pub fn has_compatible_dbsp_state_table(&self, view_name: &str) -> bool {
+        use crate::incremental::compiler::DBSP_CIRCUIT_VERSION;
+        let view_name = normalize_ident(view_name);
+        let expected_table_name = format!("{DBSP_TABLE_PREFIX}{DBSP_CIRCUIT_VERSION}_{view_name}");
+
+        // Check if a table with the expected versioned name exists
+        self.tables.contains_key(&expected_table_name)
+    }
+
+    pub fn is_materialized_view(&self, name: &str) -> bool {
+        let name = normalize_ident(name);
+        self.materialized_view_names.contains(&name)
+    }
+
+    /// Check if a table has any incompatible dependent materialized views
+    pub fn has_incompatible_dependent_views(&self, table_name: &str) -> Vec<String> {
+        let table_name = normalize_ident(table_name);
+
+        // Get all materialized views that depend on this table
+        let dependent_views = self
+            .table_to_materialized_views
+            .get(&table_name)
+            .cloned()
+            .unwrap_or_default();
+
+        // Filter to only incompatible views
+        dependent_views
+            .into_iter()
+            .filter(|view_name| self.incompatible_views.contains(view_name))
+            .collect()
+    }
+
+    pub fn remove_view(&mut self, name: &str) -> Result<()> {
+        let name = normalize_ident(name);
+
+        if self.views.contains_key(&name) {
+            self.views.remove(&name);
+            Ok(())
+        } else if self.materialized_view_names.contains(&name) {
+            // Remove from tables
+            self.tables.remove(&name);
+
+            // Remove from materialized view tracking
+            self.materialized_view_names.remove(&name);
+            self.materialized_view_sql.remove(&name);
+            self.incremental_views.remove(&name);
+
+            // Remove from table_to_materialized_views dependencies
+            for views in self.table_to_materialized_views.values_mut() {
+                views.retain(|v| v != &name);
+            }
+
+            Ok(())
+        } else {
+            Err(crate::LimboError::ParseError(format!(
+                "no such view: {name}"
+            )))
+        }
+    }
+
+    /// Register that a materialized view depends on a table
+    pub fn add_materialized_view_dependency(&mut self, table_name: &str, view_name: &str) {
+        let table_name = normalize_ident(table_name);
+        let view_name = normalize_ident(view_name);
+
+        self.table_to_materialized_views
+            .entry(table_name)
+            .or_default()
+            .push(view_name);
+    }
+
+    /// Get all materialized views that depend on a given table
+    pub fn get_dependent_materialized_views(&self, table_name: &str) -> Vec<String> {
+        if self.table_to_materialized_views.is_empty() {
+            return Vec::new();
+        }
+        let table_name = normalize_ident(table_name);
+        self.table_to_materialized_views
+            .get(&table_name)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// Add a regular (non-materialized) view
+    pub fn add_view(&mut self, view: View) {
+        let name = normalize_ident(&view.name);
+        self.views.insert(name, view);
+    }
+
+    /// Get a regular view by name
+    pub fn get_view(&self, name: &str) -> Option<&View> {
+        let name = normalize_ident(name);
+        self.views.get(&name)
+    }
+
+    pub fn add_btree_table(&mut self, table: Arc<BTreeTable>) {
         let name = normalize_ident(&table.name);
         self.tables.insert(name, Table::BTree(table).into());
     }
 
-    pub fn add_virtual_table(&mut self, table: Rc<VirtualTable>) {
+    pub fn add_virtual_table(&mut self, table: Arc<VirtualTable>) {
         let name = normalize_ident(&table.name);
         self.tables.insert(name, Table::Virtual(table).into());
     }
@@ -85,9 +267,15 @@ impl Schema {
     pub fn remove_table(&mut self, table_name: &str) {
         let name = normalize_ident(table_name);
         self.tables.remove(&name);
+
+        // If this was a materialized view, also clean up the metadata
+        if self.materialized_view_names.remove(&name) {
+            self.incremental_views.remove(&name);
+            self.materialized_view_sql.remove(&name);
+        }
     }
 
-    pub fn get_btree_table(&self, name: &str) -> Option<Rc<BTreeTable>> {
+    pub fn get_btree_table(&self, name: &str) -> Option<Arc<BTreeTable>> {
         let name = normalize_ident(name);
         if let Some(table) = self.tables.get(&name) {
             table.btree()
@@ -98,17 +286,23 @@ impl Schema {
 
     pub fn add_index(&mut self, index: Arc<Index>) {
         let table_name = normalize_ident(&index.table_name);
+        // We must add the new index to the front of the deque, because SQLite stores index definitions as a linked list
+        // where the newest parsed index entry is at the head of list. If we would add it to the back of a regular Vec for example,
+        // then we would evaluate ON CONFLICT DO UPDATE clauses in the wrong index iteration order and UPDATE the wrong row. One might
+        // argue that this is an implementation detail and we should not care about this, but it makes e.g. the fuzz test 'partial_index_mutation_and_upsert_fuzz'
+        // fail, so let's just be compatible.
         self.indexes
             .entry(table_name)
             .or_default()
-            .push(index.clone())
+            .push_front(index.clone())
     }
 
-    pub fn get_indices(&self, table_name: &str) -> &[Arc<Index>] {
+    pub fn get_indices(&self, table_name: &str) -> impl Iterator<Item = &Arc<Index>> {
         let name = normalize_ident(table_name);
         self.indexes
             .get(&name)
-            .map_or_else(|| &[] as &[Arc<Index>], |v| v.as_slice())
+            .map(|v| v.iter())
+            .unwrap_or_default()
     }
 
     pub fn get_index(&self, table_name: &str, index_name: &str) -> Option<&Arc<Index>> {
@@ -133,7 +327,8 @@ impl Schema {
     }
 
     pub fn table_has_indexes(&self, table_name: &str) -> bool {
-        self.has_indexes.contains(table_name)
+        let name = normalize_ident(table_name);
+        self.has_indexes.contains(&name)
     }
 
     pub fn table_set_has_index(&mut self, table_name: &str) {
@@ -147,153 +342,104 @@ impl Schema {
     /// Update [Schema] by scanning the first root page (sqlite_schema)
     pub fn make_from_btree(
         &mut self,
-        mv_cursor: Option<Rc<RefCell<MvCursor>>>,
-        pager: Rc<Pager>,
+        mv_cursor: Option<Arc<RwLock<MvCursor>>>,
+        pager: Arc<Pager>,
         syms: &SymbolTable,
     ) -> Result<()> {
-        let mut cursor = BTreeCursor::new_table(mv_cursor, pager.clone(), 1, 10);
+        assert!(
+            mv_cursor.is_none(),
+            "mvcc not yet supported for make_from_btree"
+        );
+        let mut cursor = BTreeCursor::new_table(mv_cursor, Arc::clone(&pager), 1, 10);
 
         let mut from_sql_indexes = Vec::with_capacity(10);
         let mut automatic_indices: HashMap<String, Vec<(String, usize)>> =
             HashMap::with_capacity(10);
 
-        loop {
-            match pager.begin_read_tx()? {
-                IOResult::Done(v) => {
-                    if matches!(v, LimboResult::Busy) {
-                        return Err(LimboError::Busy);
-                    }
-                    break;
-                }
-                IOResult::IO => pager.io.run_once()?,
-            }
-        }
+        // Store DBSP state table root pages: view_name -> dbsp_state_root_page
+        let mut dbsp_state_roots: HashMap<String, usize> = HashMap::new();
+        // Store DBSP state table index root pages: view_name -> dbsp_state_index_root_page
+        let mut dbsp_state_index_roots: HashMap<String, usize> = HashMap::new();
+        // Store materialized view info (SQL and root page) for later creation
+        let mut materialized_view_info: HashMap<String, (String, usize)> = HashMap::new();
 
-        while let IOResult::IO = cursor.rewind()? {
-            pager.io.run_once()?
-        }
+        pager.begin_read_tx()?;
+
+        pager.io.block(|| cursor.rewind())?;
 
         loop {
-            let Some(row) = (loop {
-                match cursor.record()? {
-                    IOResult::Done(v) => break v,
-                    IOResult::IO => pager.io.run_once()?,
-                }
-            }) else {
+            let Some(row) = pager.io.block(|| cursor.record())? else {
                 break;
             };
 
             let mut record_cursor = cursor.record_cursor.borrow_mut();
+            // sqlite schema table has 5 columns: type, name, tbl_name, rootpage, sql
             let ty_value = record_cursor.get_value(&row, 0)?;
             let RefValue::Text(ty) = ty_value else {
                 return Err(LimboError::ConversionError("Expected text value".into()));
             };
-            match ty.as_str() {
-                "table" => {
-                    let root_page_value = record_cursor.get_value(&row, 3)?;
-                    let RefValue::Integer(root_page) = root_page_value else {
-                        return Err(LimboError::ConversionError("Expected integer value".into()));
-                    };
-                    let sql_value = record_cursor.get_value(&row, 4)?;
-                    let RefValue::Text(sql_text) = sql_value else {
-                        return Err(LimboError::ConversionError("Expected text value".into()));
-                    };
-                    let sql = sql_text.as_str();
-                    let create_virtual = "create virtual";
-                    if root_page == 0
-                        && sql[0..create_virtual.len()].eq_ignore_ascii_case(create_virtual)
-                    {
-                        let name_value = record_cursor.get_value(&row, 1)?;
-                        let RefValue::Text(name_text) = name_value else {
-                            return Err(LimboError::ConversionError("Expected text value".into()));
-                        };
-                        let name = name_text.as_str();
-
-                        // a virtual table is found in the sqlite_schema, but it's no
-                        // longer in the in-memory schema. We need to recreate it if
-                        // the module is loaded in the symbol table.
-                        let vtab = if let Some(vtab) = syms.vtabs.get(name) {
-                            vtab.clone()
-                        } else {
-                            let mod_name = module_name_from_sql(sql)?;
-                            crate::VirtualTable::table(
-                                Some(name),
-                                mod_name,
-                                module_args_from_sql(sql)?,
-                                syms,
-                            )?
-                        };
-                        self.add_virtual_table(vtab);
-                        continue;
-                    }
-
-                    let table = BTreeTable::from_sql(sql, root_page as usize)?;
-                    self.add_btree_table(Rc::new(table));
-                }
-                "index" => {
-                    let root_page_value = record_cursor.get_value(&row, 3)?;
-                    let RefValue::Integer(root_page) = root_page_value else {
-                        return Err(LimboError::ConversionError("Expected integer value".into()));
-                    };
-                    match record_cursor.get_value(&row, 4) {
-                        Ok(RefValue::Text(sql_text)) => {
-                            let table_name_value = record_cursor.get_value(&row, 2)?;
-                            let RefValue::Text(table_name_text) = table_name_value else {
-                                return Err(LimboError::ConversionError(
-                                    "Expected text value".into(),
-                                ));
-                            };
-
-                            from_sql_indexes.push(UnparsedFromSqlIndex {
-                                table_name: table_name_text.as_str().to_string(),
-                                root_page: root_page as usize,
-                                sql: sql_text.as_str().to_string(),
-                            });
-                        }
-                        _ => {
-                            let index_name_value = record_cursor.get_value(&row, 1)?;
-                            let RefValue::Text(index_name_text) = index_name_value else {
-                                return Err(LimboError::ConversionError(
-                                    "Expected text value".into(),
-                                ));
-                            };
-
-                            let table_name_value = record_cursor.get_value(&row, 2)?;
-                            let RefValue::Text(table_name_text) = table_name_value else {
-                                return Err(LimboError::ConversionError(
-                                    "Expected text value".into(),
-                                ));
-                            };
-
-                            match automatic_indices.entry(table_name_text.as_str().to_string()) {
-                                Entry::Vacant(e) => {
-                                    e.insert(vec![(
-                                        index_name_text.as_str().to_string(),
-                                        root_page as usize,
-                                    )]);
-                                }
-                                Entry::Occupied(mut e) => {
-                                    e.get_mut().push((
-                                        index_name_text.as_str().to_string(),
-                                        root_page as usize,
-                                    ));
-                                }
-                            }
-                        }
-                    }
-                }
-                _ => {}
+            let ty = ty.as_str();
+            let RefValue::Text(name) = record_cursor.get_value(&row, 1)? else {
+                return Err(LimboError::ConversionError("Expected text value".into()));
             };
+            let name = name.as_str();
+            let table_name_value = record_cursor.get_value(&row, 2)?;
+            let RefValue::Text(table_name) = table_name_value else {
+                return Err(LimboError::ConversionError("Expected text value".into()));
+            };
+            let table_name = table_name.as_str();
+            let root_page_value = record_cursor.get_value(&row, 3)?;
+            let RefValue::Integer(root_page) = root_page_value else {
+                return Err(LimboError::ConversionError("Expected integer value".into()));
+            };
+            let sql_value = record_cursor.get_value(&row, 4)?;
+            let sql_textref = match sql_value {
+                RefValue::Text(sql) => Some(sql),
+                _ => None,
+            };
+            let sql = sql_textref.as_ref().map(|s| s.as_str());
+
+            self.handle_schema_row(
+                ty,
+                name,
+                table_name,
+                root_page,
+                sql,
+                syms,
+                &mut from_sql_indexes,
+                &mut automatic_indices,
+                &mut dbsp_state_roots,
+                &mut dbsp_state_index_roots,
+                &mut materialized_view_info,
+                None,
+            )?;
             drop(record_cursor);
             drop(row);
 
-            while let IOResult::IO = cursor.next()? {
-                pager.io.run_once()?;
-            }
+            pager.io.block(|| cursor.next())?;
         }
 
         pager.end_read_tx()?;
 
+        self.populate_indices(from_sql_indexes, automatic_indices)?;
+
+        self.populate_materialized_views(
+            materialized_view_info,
+            dbsp_state_roots,
+            dbsp_state_index_roots,
+        )?;
+
+        Ok(())
+    }
+
+    /// Populate indices parsed from the schema.
+    /// from_sql_indexes: indices explicitly created with CREATE INDEX
+    /// automatic_indices: indices created automatically for primary key and unique constraints
+    pub fn populate_indices(
+        &mut self,
+        from_sql_indexes: Vec<UnparsedFromSqlIndex>,
+        automatic_indices: std::collections::HashMap<String, Vec<(String, usize)>>,
+    ) -> Result<()> {
         for unparsed_sql_from_index in from_sql_indexes {
             if !self.indexes_enabled() {
                 self.table_set_has_index(&unparsed_sql_from_index.table_name);
@@ -313,26 +459,419 @@ impl Schema {
         for automatic_index in automatic_indices {
             if !self.indexes_enabled() {
                 self.table_set_has_index(&automatic_index.0);
-            } else {
-                let table = self.get_btree_table(&automatic_index.0).unwrap();
-                let ret_index = Index::automatic_from_primary_key_and_unique(
-                    table.as_ref(),
-                    automatic_index.1,
-                )?;
-                for index in ret_index {
-                    self.add_index(Arc::new(index));
+                continue;
+            }
+            // Autoindexes must be parsed in definition order.
+            // The SQL statement parser enforces that the column definitions come first, and compounds are defined after that,
+            // e.g. CREATE TABLE t (a, b, UNIQUE(a, b)), and you can't do something like CREATE TABLE t (a, b, UNIQUE(a, b), c);
+            // Hence, we can process the singles first (unique_set.columns.len() == 1), and then the compounds (unique_set.columns.len() > 1).
+            let table = self.get_btree_table(&automatic_index.0).unwrap();
+            let mut automatic_indexes = automatic_index.1;
+            automatic_indexes.reverse(); // reverse so we can pop() without shifting array elements, while still processing in left-to-right order
+            let mut pk_index_added = false;
+            for unique_set in table.unique_sets.iter().filter(|us| us.columns.len() == 1) {
+                let col_name = &unique_set.columns.first().unwrap().0;
+                let Some((pos_in_table, column)) = table.get_column(col_name) else {
+                    return Err(LimboError::ParseError(format!(
+                        "Column {col_name} not found in table {}",
+                        table.name
+                    )));
+                };
+                if column.primary_key && unique_set.is_primary_key {
+                    if column.is_rowid_alias {
+                        // rowid alias, no index needed
+                        continue;
+                    }
+                    assert!(table.primary_key_columns.first().unwrap().0 == *col_name, "trying to add a primary key index for column that is not the first column in the primary key: {} != {}", table.primary_key_columns.first().unwrap().0, col_name);
+                    // Add single column primary key index
+                    assert!(
+                        !pk_index_added,
+                        "trying to add a second primary key index for table {}",
+                        table.name
+                    );
+                    pk_index_added = true;
+                    self.add_index(Arc::new(Index::automatic_from_primary_key(
+                        table.as_ref(),
+                        automatic_indexes.pop().unwrap(),
+                        1,
+                    )?));
+                } else {
+                    // Add single column unique index
+                    if let Some(autoidx) = automatic_indexes.pop() {
+                        self.add_index(Arc::new(Index::automatic_from_unique(
+                            table.as_ref(),
+                            autoidx,
+                            vec![(pos_in_table, unique_set.columns.first().unwrap().1)],
+                        )?));
+                    }
                 }
             }
+            for unique_set in table.unique_sets.iter().filter(|us| us.columns.len() > 1) {
+                if unique_set.is_primary_key {
+                    assert!(table.primary_key_columns.len() == unique_set.columns.len(), "trying to add a {}-column primary key index for table {}, but the table has {} primary key columns", unique_set.columns.len(), table.name, table.primary_key_columns.len());
+                    // Add composite primary key index
+                    assert!(
+                        !pk_index_added,
+                        "trying to add a second primary key index for table {}",
+                        table.name
+                    );
+                    pk_index_added = true;
+                    self.add_index(Arc::new(Index::automatic_from_primary_key(
+                        table.as_ref(),
+                        automatic_indexes.pop().unwrap(),
+                        unique_set.columns.len(),
+                    )?));
+                } else {
+                    // Add composite unique index
+                    let mut column_indices_and_sort_orders =
+                        Vec::with_capacity(unique_set.columns.len());
+                    for (col_name, sort_order) in unique_set.columns.iter() {
+                        let Some((pos_in_table, _)) = table.get_column(col_name) else {
+                            return Err(crate::LimboError::ParseError(format!(
+                                "Column {} not found in table {}",
+                                col_name, table.name
+                            )));
+                        };
+                        column_indices_and_sort_orders.push((pos_in_table, *sort_order));
+                    }
+                    self.add_index(Arc::new(Index::automatic_from_unique(
+                        table.as_ref(),
+                        automatic_indexes.pop().unwrap(),
+                        column_indices_and_sort_orders,
+                    )?));
+                }
+            }
+
+            assert!(automatic_indexes.is_empty(), "all automatic indexes parsed from sqlite_schema should have been consumed, but {} remain", automatic_indexes.len());
         }
+        Ok(())
+    }
+
+    /// Populate materialized views parsed from the schema.
+    pub fn populate_materialized_views(
+        &mut self,
+        materialized_view_info: std::collections::HashMap<String, (String, usize)>,
+        dbsp_state_roots: std::collections::HashMap<String, usize>,
+        dbsp_state_index_roots: std::collections::HashMap<String, usize>,
+    ) -> Result<()> {
+        for (view_name, (sql, main_root)) in materialized_view_info {
+            // Look up the DBSP state root for this view
+            // If missing, it means version mismatch - skip this view
+            // Check if we have a compatible DBSP state root
+            let dbsp_state_root = if let Some(&root) = dbsp_state_roots.get(&view_name) {
+                root
+            } else {
+                tracing::warn!(
+                    "Materialized view '{}' has incompatible version or missing DBSP state table",
+                    view_name
+                );
+                // Track this as an incompatible view
+                self.incompatible_views.insert(view_name.clone());
+                // Use a dummy root page - the view won't be usable anyway
+                0
+            };
+
+            // Look up the DBSP state index root (may not exist for older schemas)
+            let dbsp_state_index_root =
+                dbsp_state_index_roots.get(&view_name).copied().unwrap_or(0);
+            // Create the IncrementalView with all root pages
+            let incremental_view = IncrementalView::from_sql(
+                &sql,
+                self,
+                main_root,
+                dbsp_state_root,
+                dbsp_state_index_root,
+            )?;
+            let referenced_tables = incremental_view.get_referenced_table_names();
+
+            // Create a BTreeTable for the materialized view
+            let table = Arc::new(Table::BTree(Arc::new(BTreeTable {
+                name: view_name.clone(),
+                root_page: main_root,
+                columns: incremental_view.column_schema.flat_columns(),
+                primary_key_columns: Vec::new(),
+                has_rowid: true,
+                is_strict: false,
+                has_autoincrement: false,
+
+                unique_sets: vec![],
+            })));
+
+            // Only add to schema if compatible
+            if !self.incompatible_views.contains(&view_name) {
+                self.add_materialized_view(incremental_view, table, sql);
+            }
+
+            // Register dependencies regardless of compatibility
+            for table_name in referenced_tables {
+                self.add_materialized_view_dependency(&table_name, &view_name);
+            }
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn handle_schema_row(
+        &mut self,
+        ty: &str,
+        name: &str,
+        table_name: &str,
+        root_page: i64,
+        maybe_sql: Option<&str>,
+        syms: &SymbolTable,
+        from_sql_indexes: &mut Vec<UnparsedFromSqlIndex>,
+        automatic_indices: &mut std::collections::HashMap<String, Vec<(String, usize)>>,
+        dbsp_state_roots: &mut std::collections::HashMap<String, usize>,
+        dbsp_state_index_roots: &mut std::collections::HashMap<String, usize>,
+        materialized_view_info: &mut std::collections::HashMap<String, (String, usize)>,
+        mv_store: Option<&Arc<MvStore>>,
+    ) -> Result<()> {
+        match ty {
+            "table" => {
+                let sql = maybe_sql.expect("sql should be present for table");
+                let sql_bytes = sql.as_bytes();
+                if root_page == 0 && contains_ignore_ascii_case!(sql_bytes, b"create virtual") {
+                    // a virtual table is found in the sqlite_schema, but it's no
+                    // longer in the in-memory schema. We need to recreate it if
+                    // the module is loaded in the symbol table.
+                    let vtab = if let Some(vtab) = syms.vtabs.get(name) {
+                        vtab.clone()
+                    } else {
+                        let mod_name = module_name_from_sql(sql)?;
+                        crate::VirtualTable::table(
+                            Some(name),
+                            mod_name,
+                            module_args_from_sql(sql)?,
+                            syms,
+                        )?
+                    };
+                    self.add_virtual_table(vtab);
+                    if let Some(mv_store) = mv_store {
+                        mv_store.mark_table_as_loaded(root_page as u64);
+                    }
+                } else {
+                    let table = BTreeTable::from_sql(sql, root_page as usize)?;
+
+                    // Check if this is a DBSP state table
+                    if table.name.starts_with(DBSP_TABLE_PREFIX) {
+                        // Extract version and view name from __turso_internal_dbsp_state_v<version>_<viewname>
+                        let suffix = table.name.strip_prefix(DBSP_TABLE_PREFIX).unwrap();
+
+                        // Parse version and view name (format: "<version>_<viewname>")
+                        if let Some(underscore_pos) = suffix.find('_') {
+                            let version_str = &suffix[..underscore_pos];
+                            let view_name = &suffix[underscore_pos + 1..];
+
+                            // Check version compatibility
+                            if let Ok(stored_version) = version_str.parse::<u32>() {
+                                use crate::incremental::compiler::DBSP_CIRCUIT_VERSION;
+                                if stored_version == DBSP_CIRCUIT_VERSION {
+                                    // Version matches, store the root page
+                                    dbsp_state_roots
+                                        .insert(view_name.to_string(), root_page as usize);
+                                } else {
+                                    // Version mismatch - DO NOT insert into dbsp_state_roots
+                                    // This will cause populate_materialized_views to skip this view
+                                    tracing::warn!(
+                                        "Skipping materialized view '{}' - has version {} but current version is {}. DROP and recreate the view to use it.",
+                                        view_name, stored_version, DBSP_CIRCUIT_VERSION
+                                    );
+                                    // We can't track incompatible views here since we're in handle_schema_row
+                                    // which doesn't have mutable access to self
+                                }
+                            }
+                        }
+                    }
+
+                    if let Some(mv_store) = mv_store {
+                        mv_store.mark_table_as_loaded(root_page as u64);
+                    }
+                    self.add_btree_table(Arc::new(table));
+                }
+            }
+            "index" => {
+                assert!(mv_store.is_none(), "indexes not yet supported for mvcc");
+                match maybe_sql {
+                    Some(sql) => {
+                        from_sql_indexes.push(UnparsedFromSqlIndex {
+                            table_name: table_name.to_string(),
+                            root_page: root_page as usize,
+                            sql: sql.to_string(),
+                        });
+                    }
+                    None => {
+                        // Automatic index on primary key and/or unique constraint, e.g.
+                        // table|foo|foo|2|CREATE TABLE foo (a text PRIMARY KEY, b)
+                        // index|sqlite_autoindex_foo_1|foo|3|
+                        let index_name = name.to_string();
+                        let table_name = table_name.to_string();
+
+                        // Check if this is an index for a DBSP state table
+                        if table_name.starts_with(DBSP_TABLE_PREFIX) {
+                            // Extract version and view name from __turso_internal_dbsp_state_v<version>_<viewname>
+                            let suffix = table_name.strip_prefix(DBSP_TABLE_PREFIX).unwrap();
+
+                            // Parse version and view name (format: "<version>_<viewname>")
+                            if let Some(underscore_pos) = suffix.find('_') {
+                                let version_str = &suffix[..underscore_pos];
+                                let view_name = &suffix[underscore_pos + 1..];
+
+                                // Only store index root if version matches
+                                if let Ok(stored_version) = version_str.parse::<u32>() {
+                                    use crate::incremental::compiler::DBSP_CIRCUIT_VERSION;
+                                    if stored_version == DBSP_CIRCUIT_VERSION {
+                                        dbsp_state_index_roots
+                                            .insert(view_name.to_string(), root_page as usize);
+                                    }
+                                }
+                            }
+                        } else {
+                            match automatic_indices.entry(table_name) {
+                                std::collections::hash_map::Entry::Vacant(e) => {
+                                    e.insert(vec![(index_name, root_page as usize)]);
+                                }
+                                std::collections::hash_map::Entry::Occupied(mut e) => {
+                                    e.get_mut().push((index_name, root_page as usize));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            "view" => {
+                use crate::schema::View;
+                use turso_parser::ast::{Cmd, Stmt};
+                use turso_parser::parser::Parser;
+
+                let sql = maybe_sql.expect("sql should be present for view");
+                let view_name = name.to_string();
+                assert!(mv_store.is_none(), "views not yet supported for mvcc");
+
+                // Parse the SQL to determine if it's a regular or materialized view
+                let mut parser = Parser::new(sql.as_bytes());
+                if let Ok(Some(Cmd::Stmt(stmt))) = parser.next_cmd() {
+                    match stmt {
+                        Stmt::CreateMaterializedView { .. } => {
+                            // Store materialized view info for later creation
+                            // We'll handle reuse logic and create the actual IncrementalView
+                            // in a later pass when we have both the main root page and DBSP state root
+                            materialized_view_info
+                                .insert(view_name.clone(), (sql.to_string(), root_page as usize));
+
+                            // Mark the existing view for potential reuse
+                            if self.incremental_views.contains_key(&view_name) {
+                                // We'll check for reuse in the third pass
+                            }
+                        }
+                        Stmt::CreateView {
+                            view_name: _,
+                            columns: column_names,
+                            select,
+                            ..
+                        } => {
+                            // Extract actual columns from the SELECT statement
+                            let view_column_schema =
+                                crate::util::extract_view_columns(&select, self)?;
+
+                            // If column names were provided in CREATE VIEW (col1, col2, ...),
+                            // use them to rename the columns
+                            let mut final_columns = view_column_schema.flat_columns();
+                            for (i, indexed_col) in column_names.iter().enumerate() {
+                                if let Some(col) = final_columns.get_mut(i) {
+                                    col.name = Some(indexed_col.col_name.to_string());
+                                }
+                            }
+
+                            // Create regular view
+                            let view = View {
+                                name: name.to_string(),
+                                sql: sql.to_string(),
+                                select_stmt: select,
+                                columns: final_columns,
+                            };
+                            self.add_view(view);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            _ => {}
+        };
 
         Ok(())
     }
 }
 
+impl Clone for Schema {
+    /// Cloning a `Schema` requires deep cloning of all internal tables and indexes, even though they are wrapped in `Arc`.
+    /// Simply copying the `Arc` pointers would result in multiple `Schema` instances sharing the same underlying tables and indexes,
+    /// which could lead to panics or data races if any instance attempts to modify them.
+    /// To ensure each `Schema` is independent and safe to modify, we clone the underlying data for all tables and indexes.
+    fn clone(&self) -> Self {
+        let tables = self
+            .tables
+            .iter()
+            .map(|(name, table)| match table.deref() {
+                Table::BTree(table) => {
+                    let table = Arc::deref(table);
+                    (
+                        name.clone(),
+                        Arc::new(Table::BTree(Arc::new(table.clone()))),
+                    )
+                }
+                Table::Virtual(table) => {
+                    let table = Arc::deref(table);
+                    (
+                        name.clone(),
+                        Arc::new(Table::Virtual(Arc::new(table.clone()))),
+                    )
+                }
+                Table::FromClauseSubquery(from_clause_subquery) => (
+                    name.clone(),
+                    Arc::new(Table::FromClauseSubquery(from_clause_subquery.clone())),
+                ),
+            })
+            .collect();
+        let indexes = self
+            .indexes
+            .iter()
+            .map(|(name, indexes)| {
+                let indexes = indexes
+                    .iter()
+                    .map(|index| Arc::new((**index).clone()))
+                    .collect();
+                (name.clone(), indexes)
+            })
+            .collect();
+        let materialized_view_names = self.materialized_view_names.clone();
+        let materialized_view_sql = self.materialized_view_sql.clone();
+        let incremental_views = self
+            .incremental_views
+            .iter()
+            .map(|(name, view)| (name.clone(), view.clone()))
+            .collect();
+        let views = self.views.clone();
+        let incompatible_views = self.incompatible_views.clone();
+        Self {
+            tables,
+            materialized_view_names,
+            materialized_view_sql,
+            incremental_views,
+            views,
+            indexes,
+            has_indexes: self.has_indexes.clone(),
+            indexes_enabled: self.indexes_enabled,
+            schema_version: self.schema_version,
+            table_to_materialized_views: self.table_to_materialized_views.clone(),
+            incompatible_views,
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub enum Table {
-    BTree(Rc<BTreeTable>),
-    Virtual(Rc<VirtualTable>),
+    BTree(Arc<BTreeTable>),
+    Virtual(Arc<VirtualTable>),
     FromClauseSubquery(FromClauseSubquery),
 }
 
@@ -363,6 +902,24 @@ impl Table {
         }
     }
 
+    /// Returns the column position and column for a given column name.
+    pub fn get_column_by_name(&self, name: &str) -> Option<(usize, &Column)> {
+        let name = normalize_ident(name);
+        match self {
+            Self::BTree(table) => table.get_column(name.as_str()),
+            Self::Virtual(table) => table
+                .columns
+                .iter()
+                .enumerate()
+                .find(|(_, col)| col.name.as_ref() == Some(&name)),
+            Self::FromClauseSubquery(from_clause_subquery) => from_clause_subquery
+                .columns
+                .iter()
+                .enumerate()
+                .find(|(_, col)| col.name.as_ref() == Some(&name)),
+        }
+    }
+
     pub fn columns(&self) -> &Vec<Column> {
         match self {
             Self::BTree(table) => &table.columns,
@@ -371,7 +928,7 @@ impl Table {
         }
     }
 
-    pub fn btree(&self) -> Option<Rc<BTreeTable>> {
+    pub fn btree(&self) -> Option<Arc<BTreeTable>> {
         match self {
             Self::BTree(table) => Some(table.clone()),
             Self::Virtual(_) => None,
@@ -379,7 +936,7 @@ impl Table {
         }
     }
 
-    pub fn virtual_table(&self) -> Option<Rc<VirtualTable>> {
+    pub fn virtual_table(&self) -> Option<Arc<VirtualTable>> {
         match self {
             Self::Virtual(table) => Some(table.clone()),
             _ => None,
@@ -390,11 +947,17 @@ impl Table {
 impl PartialEq for Table {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
-            (Self::BTree(a), Self::BTree(b)) => Rc::ptr_eq(a, b),
-            (Self::Virtual(a), Self::Virtual(b)) => Rc::ptr_eq(a, b),
+            (Self::BTree(a), Self::BTree(b)) => Arc::ptr_eq(a, b),
+            (Self::Virtual(a), Self::Virtual(b)) => Arc::ptr_eq(a, b),
             _ => false,
         }
     }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct UniqueSet {
+    pub columns: Vec<(String, SortOrder)>,
+    pub is_primary_key: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -405,7 +968,8 @@ pub struct BTreeTable {
     pub columns: Vec<Column>,
     pub has_rowid: bool,
     pub is_strict: bool,
-    pub unique_sets: Option<Vec<Vec<(String, SortOrder)>>>,
+    pub has_autoincrement: bool,
+    pub unique_sets: Vec<UniqueSet>,
 }
 
 impl BTreeTable {
@@ -425,7 +989,7 @@ impl BTreeTable {
 
     /// Returns the column position and column for a given column name.
     /// Returns None if the column name is not found.
-    /// E.g. if table is CREATE TABLE t(a, b, c)
+    /// E.g. if table is CREATE TABLE t (a, b, c)
     /// then get_column("b") returns (1, &Column { .. })
     pub fn get_column(&self, name: &str) -> Option<(usize, &Column)> {
         let name = normalize_ident(name);
@@ -438,22 +1002,36 @@ impl BTreeTable {
 
     pub fn from_sql(sql: &str, root_page: usize) -> Result<BTreeTable> {
         let mut parser = Parser::new(sql.as_bytes());
-        let cmd = parser.next()?;
+        let cmd = parser.next_cmd()?;
         match cmd {
             Some(Cmd::Stmt(Stmt::CreateTable { tbl_name, body, .. })) => {
-                create_table(tbl_name, *body, root_page)
+                create_table(tbl_name.name.as_str(), &body, root_page)
             }
-            _ => todo!("Expected CREATE TABLE statement"),
+            _ => unreachable!("Expected CREATE TABLE statement"),
         }
     }
 
+    /// Reconstruct the SQL for the table.
+    /// FIXME: this makes us incompatible with SQLite since sqlite stores the user-provided SQL as is in
+    /// `sqlite_schema.sql`
+    /// For example, if a user creates a table like: `CREATE TABLE t              (x)`, we store it as
+    /// `CREATE TABLE t (x)`, whereas sqlite stores it with the original extra whitespace.
     pub fn to_sql(&self) -> String {
         let mut sql = format!("CREATE TABLE {} (", self.name);
         for (i, column) in self.columns.iter().enumerate() {
             if i > 0 {
                 sql.push_str(", ");
             }
-            sql.push_str(column.name.as_ref().expect("column name is None"));
+
+            // we need to wrap the column name in square brackets if it contains special characters
+            let column_name = column.name.as_ref().expect("column name is None");
+            if identifier_contains_special_chars(column_name) {
+                sql.push('[');
+                sql.push_str(column_name);
+                sql.push(']');
+            } else {
+                sql.push_str(column_name);
+            }
 
             if !column.ty_str.is_empty() {
                 sql.push(' ');
@@ -480,6 +1058,10 @@ impl BTreeTable {
     pub fn column_collations(&self) -> Vec<Option<CollationSeq>> {
         self.columns.iter().map(|column| column.collation).collect()
     }
+}
+
+fn identifier_contains_special_chars(name: &str) -> bool {
+    name.chars().any(|c| !c.is_ascii_alphanumeric() && c != '_')
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -513,43 +1095,19 @@ pub struct FromClauseSubquery {
     pub result_columns_start_reg: Option<usize>,
 }
 
-#[derive(Debug, Eq)]
-struct UniqueColumnProps {
-    column_name: String,
-    order: SortOrder,
-}
-
-impl PartialEq for UniqueColumnProps {
-    fn eq(&self, other: &Self) -> bool {
-        self.column_name.eq(&other.column_name)
-    }
-}
-
-impl PartialOrd for UniqueColumnProps {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl Ord for UniqueColumnProps {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.column_name.cmp(&other.column_name)
-    }
-}
-
-fn create_table(
-    tbl_name: QualifiedName,
-    body: CreateTableBody,
+pub fn create_table(
+    tbl_name: &str,
+    body: &CreateTableBody,
     root_page: usize,
 ) -> Result<BTreeTable> {
-    let table_name = normalize_ident(&tbl_name.name.0);
+    let table_name = normalize_ident(tbl_name);
     trace!("Creating table {}", table_name);
     let mut has_rowid = true;
+    let mut has_autoincrement = false;
     let mut primary_key_columns = vec![];
     let mut cols = vec![];
     let is_strict: bool;
-    // BtreeSet here to preserve order of inserted keys
-    let mut unique_sets: Vec<BTreeSet<UniqueColumnProps>> = vec![];
+    let mut unique_sets: Vec<UniqueSet> = vec![];
     match body {
         CreateTableBody::ColumnsAndConstraints {
             columns,
@@ -557,54 +1115,70 @@ fn create_table(
             options,
         } => {
             is_strict = options.contains(TableOptions::STRICT);
-            if let Some(constraints) = constraints {
-                for c in constraints {
-                    if let turso_sqlite3_parser::ast::TableConstraint::PrimaryKey {
-                        columns, ..
-                    } = c.constraint
-                    {
-                        for column in columns {
-                            let col_name = match column.expr {
-                                Expr::Id(id) => normalize_ident(&id.0),
-                                Expr::Literal(Literal::String(value)) => {
-                                    value.trim_matches('\'').to_owned()
-                                }
-                                _ => {
-                                    todo!("Unsupported primary key expression");
-                                }
-                            };
-                            primary_key_columns
-                                .push((col_name, column.order.unwrap_or(SortOrder::Asc)));
-                        }
-                    } else if let turso_sqlite3_parser::ast::TableConstraint::Unique {
-                        columns,
-                        conflict_clause,
-                    } = c.constraint
-                    {
-                        if conflict_clause.is_some() {
-                            unimplemented!("ON CONFLICT not implemented");
-                        }
-                        let unique_set = columns
-                            .into_iter()
-                            .map(|column| {
-                                let column_name = match column.expr {
-                                    Expr::Id(id) => normalize_ident(&id.0),
-                                    _ => {
-                                        todo!("Unsupported unique expression");
-                                    }
-                                };
-                                UniqueColumnProps {
-                                    column_name,
-                                    order: column.order.unwrap_or(SortOrder::Asc),
-                                }
-                            })
-                            .collect();
-                        unique_sets.push(unique_set);
+            for c in constraints {
+                if let ast::TableConstraint::PrimaryKey {
+                    columns,
+                    auto_increment,
+                    ..
+                } = &c.constraint
+                {
+                    if !primary_key_columns.is_empty() {
+                        crate::bail_parse_error!(
+                            "table \"{}\" has more than one primary key",
+                            tbl_name
+                        );
                     }
+                    if *auto_increment {
+                        has_autoincrement = true;
+                    }
+
+                    for column in columns {
+                        let col_name = match column.expr.as_ref() {
+                            Expr::Id(id) => normalize_ident(id.as_str()),
+                            Expr::Literal(Literal::String(value)) => {
+                                value.trim_matches('\'').to_owned()
+                            }
+                            _ => {
+                                todo!("Unsupported primary key expression");
+                            }
+                        };
+                        primary_key_columns
+                            .push((col_name, column.order.unwrap_or(SortOrder::Asc)));
+                    }
+                    unique_sets.push(UniqueSet {
+                        columns: primary_key_columns.clone(),
+                        is_primary_key: true,
+                    });
+                } else if let ast::TableConstraint::Unique {
+                    columns,
+                    conflict_clause,
+                } = &c.constraint
+                {
+                    if conflict_clause.is_some() {
+                        unimplemented!("ON CONFLICT not implemented");
+                    }
+                    let unique_set = UniqueSet {
+                        columns: columns
+                            .iter()
+                            .map(|column| {
+                                (
+                                    column.expr.as_ref().to_string(),
+                                    column.order.unwrap_or(SortOrder::Asc),
+                                )
+                            })
+                            .collect(),
+                        is_primary_key: false,
+                    };
+                    unique_sets.push(unique_set);
                 }
             }
-            for (col_name, col_def) in columns {
-                let name = col_name.0.to_string();
+            for ast::ColumnDefinition {
+                col_name,
+                col_type,
+                constraints,
+            } in columns
+            {
+                let name = col_name.as_str().to_string();
                 // Regular sqlite tables have an integer rowid that uniquely identifies a row.
                 // Even if you create a table with a column e.g. 'id INT PRIMARY KEY', there will still
                 // be a separate hidden rowid, and the 'id' column will have a separate index built for it.
@@ -613,45 +1187,18 @@ fn create_table(
                 // A column defined as exactly INTEGER PRIMARY KEY is a rowid alias, meaning that the rowid
                 // and the value of this column are the same.
                 // https://www.sqlite.org/lang_createtable.html#rowids_and_the_integer_primary_key
-                let ty_str = col_def
-                    .col_type
+                let ty_str = col_type
                     .as_ref()
+                    .cloned()
                     .map(|ast::Type { name, .. }| name.clone())
                     .unwrap_or_default();
 
                 let mut typename_exactly_integer = false;
-                let ty = match col_def.col_type {
-                    Some(data_type) => 'ty: {
-                        // https://www.sqlite.org/datatype3.html
-                        let mut type_name = data_type.name;
-                        type_name.make_ascii_uppercase();
-
-                        if type_name.is_empty() {
-                            break 'ty Type::Blob;
-                        }
-
-                        if type_name == "INTEGER" {
-                            typename_exactly_integer = true;
-                            break 'ty Type::Integer;
-                        }
-
-                        if let Some(ty) = type_name.as_bytes().windows(3).find_map(|s| match s {
-                            b"INT" => Some(Type::Integer),
-                            _ => None,
-                        }) {
-                            break 'ty ty;
-                        }
-
-                        if let Some(ty) = type_name.as_bytes().windows(4).find_map(|s| match s {
-                            b"CHAR" | b"CLOB" | b"TEXT" => Some(Type::Text),
-                            b"BLOB" => Some(Type::Blob),
-                            b"REAL" | b"FLOA" | b"DOUB" => Some(Type::Real),
-                            _ => None,
-                        }) {
-                            break 'ty ty;
-                        }
-
-                        Type::Numeric
+                let ty = match col_type {
+                    Some(data_type) => {
+                        let (ty, ei) = type_from_name(&data_type.name);
+                        typename_exactly_integer = ei;
+                        ty
                     }
                     None => Type::Null,
                 };
@@ -662,32 +1209,48 @@ fn create_table(
                 let mut order = SortOrder::Asc;
                 let mut unique = false;
                 let mut collation = None;
-                for c_def in col_def.constraints {
+                for c_def in constraints {
                     match c_def.constraint {
-                        turso_sqlite3_parser::ast::ColumnConstraint::PrimaryKey {
+                        ast::ColumnConstraint::PrimaryKey {
                             order: o,
+                            auto_increment,
                             ..
                         } => {
+                            if !primary_key_columns.is_empty() {
+                                crate::bail_parse_error!(
+                                    "table \"{}\" has more than one primary key",
+                                    tbl_name
+                                );
+                            }
                             primary_key = true;
+                            if auto_increment {
+                                has_autoincrement = true;
+                            }
                             if let Some(o) = o {
                                 order = o;
                             }
+                            unique_sets.push(UniqueSet {
+                                columns: vec![(name.clone(), order)],
+                                is_primary_key: true,
+                            });
                         }
-                        turso_sqlite3_parser::ast::ColumnConstraint::NotNull { .. } => {
-                            notnull = true;
+                        ast::ColumnConstraint::NotNull { nullable, .. } => {
+                            notnull = !nullable;
                         }
-                        turso_sqlite3_parser::ast::ColumnConstraint::Default(expr) => {
-                            default = Some(expr)
-                        }
+                        ast::ColumnConstraint::Default(ref expr) => default = Some(expr),
                         // TODO: for now we don't check Resolve type of unique
-                        turso_sqlite3_parser::ast::ColumnConstraint::Unique(on_conflict) => {
+                        ast::ColumnConstraint::Unique(on_conflict) => {
                             if on_conflict.is_some() {
                                 unimplemented!("ON CONFLICT not implemented");
                             }
                             unique = true;
+                            unique_sets.push(UniqueSet {
+                                columns: vec![(name.clone(), order)],
+                                is_primary_key: false,
+                            });
                         }
-                        turso_sqlite3_parser::ast::ColumnConstraint::Collate { collation_name } => {
-                            collation = Some(CollationSeq::new(collation_name.0.as_str())?);
+                        ast::ColumnConstraint::Collate { ref collation_name } => {
+                            collation = Some(CollationSeq::new(collation_name.as_str())?);
                         }
                         _ => {}
                     }
@@ -709,7 +1272,7 @@ fn create_table(
                     primary_key,
                     is_rowid_alias: typename_exactly_integer && primary_key,
                     notnull,
-                    default,
+                    default: default.cloned(),
                     unique,
                     collation,
                     hidden: false,
@@ -721,35 +1284,81 @@ fn create_table(
         }
         CreateTableBody::AsSelect(_) => todo!(),
     };
-    // flip is_rowid_alias back to false if the table has multiple primary keys
+
+    // flip is_rowid_alias back to false if the table has multiple primary key columns
     // or if the table has no rowid
     if !has_rowid || primary_key_columns.len() > 1 {
         for col in cols.iter_mut() {
             col.is_rowid_alias = false;
         }
     }
+
+    if has_autoincrement {
+        // only allow integers
+        if primary_key_columns.len() != 1 {
+            crate::bail_parse_error!("AUTOINCREMENT is only allowed on an INTEGER PRIMARY KEY");
+        }
+        let pk_col_name = &primary_key_columns[0].0;
+        let pk_col = cols.iter().find(|c| c.name.as_deref() == Some(pk_col_name));
+
+        if let Some(col) = pk_col {
+            if col.ty != Type::Integer {
+                crate::bail_parse_error!("AUTOINCREMENT is only allowed on an INTEGER PRIMARY KEY");
+            }
+        }
+    }
+
+    for col in cols.iter() {
+        if col.is_rowid_alias {
+            // Unique sets are used for creating automatic indexes. An index is not created for a rowid alias PRIMARY KEY.
+            // However, an index IS created for a rowid alias UNIQUE, e.g. CREATE TABLE t(x INTEGER PRIMARY KEY, UNIQUE(x))
+            let unique_set_w_only_rowid_alias = unique_sets.iter().position(|us| {
+                us.is_primary_key
+                    && us.columns.len() == 1
+                    && &us.columns.first().unwrap().0 == col.name.as_ref().unwrap()
+            });
+            if let Some(u) = unique_set_w_only_rowid_alias {
+                unique_sets.remove(u);
+            }
+        }
+    }
+
     Ok(BTreeTable {
         root_page,
         name: table_name,
         has_rowid,
         primary_key_columns,
+        has_autoincrement,
         columns: cols,
         is_strict,
-        unique_sets: if unique_sets.is_empty() {
-            None
-        } else {
-            // Sort first so that dedup operation removes all duplicates
-            unique_sets.dedup();
-            Some(
-                unique_sets
-                    .into_iter()
-                    .map(|set| {
-                        set.into_iter()
-                            .map(|UniqueColumnProps { column_name, order }| (column_name, order))
-                            .collect()
-                    })
-                    .collect(),
-            )
+        unique_sets: {
+            // If there are any unique sets that have identical column names in the same order (even if they are PRIMARY KEY and UNIQUE and have different sort orders), remove the duplicates.
+            // Examples:
+            // PRIMARY KEY (a, b) and UNIQUE (a desc, b) are the same
+            // PRIMARY KEY (a, b) and UNIQUE (b, a) are not the same
+            // Using a n^2 monkey algorithm here because n is small, CPUs are fast, life is short, and most importantly:
+            // we want to preserve the order of the sets -- automatic index names in sqlite_schema must be in definition order.
+            let mut i = 0;
+            while i < unique_sets.len() {
+                let mut j = i + 1;
+                while j < unique_sets.len() {
+                    let lengths_equal =
+                        unique_sets[i].columns.len() == unique_sets[j].columns.len();
+                    if lengths_equal
+                        && unique_sets[i]
+                            .columns
+                            .iter()
+                            .zip(unique_sets[j].columns.iter())
+                            .all(|((a_name, _), (b_name, _))| a_name == b_name)
+                    {
+                        unique_sets.remove(j);
+                    } else {
+                        j += 1;
+                    }
+                }
+                i += 1;
+            }
+            unique_sets
         },
     })
 }
@@ -781,7 +1390,7 @@ pub struct Column {
     pub primary_key: bool,
     pub is_rowid_alias: bool,
     pub notnull: bool,
-    pub default: Option<Expr>,
+    pub default: Option<Box<Expr>>,
     pub unique: bool,
     pub collation: Option<CollationSeq>,
     pub hidden: bool,
@@ -794,9 +1403,9 @@ impl Column {
 }
 
 // TODO: This might replace some of util::columns_from_create_table_body
-impl From<ColumnDefinition> for Column {
-    fn from(value: ColumnDefinition) -> Self {
-        let ast::Name(name) = value.col_name;
+impl From<&ColumnDefinition> for Column {
+    fn from(value: &ColumnDefinition) -> Self {
+        let name = value.col_name.as_str();
 
         let mut default = None;
         let mut notnull = false;
@@ -804,17 +1413,17 @@ impl From<ColumnDefinition> for Column {
         let mut unique = false;
         let mut collation = None;
 
-        for ast::NamedColumnConstraint { constraint, .. } in value.constraints {
+        for ast::NamedColumnConstraint { constraint, .. } in &value.constraints {
             match constraint {
                 ast::ColumnConstraint::PrimaryKey { .. } => primary_key = true,
                 ast::ColumnConstraint::NotNull { .. } => notnull = true,
                 ast::ColumnConstraint::Unique(..) => unique = true,
                 ast::ColumnConstraint::Default(expr) => {
-                    default.replace(expr);
+                    default.replace(expr.clone());
                 }
                 ast::ColumnConstraint::Collate { collation_name } => {
                     collation.replace(
-                        CollationSeq::new(&collation_name.0)
+                        CollationSeq::new(collation_name.as_str())
                             .expect("collation should have been set correctly in create table"),
                     );
                 }
@@ -823,38 +1432,20 @@ impl From<ColumnDefinition> for Column {
         }
 
         let ty = match value.col_type {
-            Some(ref data_type) => {
-                // https://www.sqlite.org/datatype3.html
-                let type_name = data_type.name.clone().to_uppercase();
-
-                if type_name.contains("INT") {
-                    Type::Integer
-                } else if type_name.contains("CHAR")
-                    || type_name.contains("CLOB")
-                    || type_name.contains("TEXT")
-                {
-                    Type::Text
-                } else if type_name.contains("BLOB") || type_name.is_empty() {
-                    Type::Blob
-                } else if type_name.contains("REAL")
-                    || type_name.contains("FLOA")
-                    || type_name.contains("DOUB")
-                {
-                    Type::Real
-                } else {
-                    Type::Numeric
-                }
-            }
+            Some(ref data_type) => type_from_name(&data_type.name).0,
             None => Type::Null,
         };
 
         let ty_str = value
             .col_type
+            .as_ref()
             .map(|t| t.name.to_string())
             .unwrap_or_default();
 
+        let hidden = ty_str.contains("HIDDEN");
+
         Column {
-            name: Some(name),
+            name: Some(normalize_ident(name)),
             ty,
             default,
             notnull,
@@ -863,7 +1454,7 @@ impl From<ColumnDefinition> for Column {
             is_rowid_alias: primary_key && matches!(ty, Type::Integer),
             unique,
             collation,
-            hidden: false,
+            hidden,
         }
     }
 }
@@ -883,7 +1474,8 @@ impl From<ColumnDefinition> for Column {
 ///
 /// Note that the order of the rules for determining column affinity is important. A column whose declared type is "CHARINT" will match both rules 1 and 2 but the first rule takes precedence and so the column affinity will be INTEGER.
 pub fn affinity(datatype: &str) -> Affinity {
-    // Note: callers of this function must ensure that the datatype is uppercase.
+    let datatype = datatype.to_ascii_uppercase();
+
     // Rule 1: INT -> INTEGER affinity
     if datatype.contains("INT") {
         return Affinity::Integer;
@@ -1017,16 +1609,14 @@ impl Affinity {
         }
     }
 
-    pub fn from_char(char: char) -> Result<Self> {
+    pub fn from_char(char: char) -> Self {
         match char {
-            SQLITE_AFF_INTEGER => Ok(Affinity::Integer),
-            SQLITE_AFF_TEXT => Ok(Affinity::Text),
-            SQLITE_AFF_NONE => Ok(Affinity::Blob),
-            SQLITE_AFF_REAL => Ok(Affinity::Real),
-            SQLITE_AFF_NUMERIC => Ok(Affinity::Numeric),
-            _ => Err(LimboError::InternalError(format!(
-                "Invalid affinity character: {char}"
-            ))),
+            SQLITE_AFF_INTEGER => Affinity::Integer,
+            SQLITE_AFF_TEXT => Affinity::Text,
+            SQLITE_AFF_NONE => Affinity::Blob,
+            SQLITE_AFF_REAL => Affinity::Real,
+            SQLITE_AFF_NUMERIC => Affinity::Numeric,
+            _ => Affinity::Blob,
         }
     }
 
@@ -1034,7 +1624,7 @@ impl Affinity {
         self.aff_mask() as u8
     }
 
-    pub fn from_char_code(code: u8) -> Result<Self, LimboError> {
+    pub fn from_char_code(code: u8) -> Self {
         Self::from_char(code as char)
     }
 
@@ -1067,6 +1657,7 @@ pub fn sqlite_schema_table() -> BTreeTable {
         name: "sqlite_schema".to_string(),
         has_rowid: true,
         is_strict: false,
+        has_autoincrement: false,
         primary_key_columns: vec![],
         columns: vec![
             Column {
@@ -1130,12 +1721,12 @@ pub fn sqlite_schema_table() -> BTreeTable {
                 hidden: false,
             },
         ],
-        unique_sets: None,
+        unique_sets: vec![],
     }
 }
 
 #[allow(dead_code)]
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Index {
     pub name: String,
     pub table_name: String,
@@ -1149,6 +1740,7 @@ pub struct Index {
     /// For example, WITHOUT ROWID tables (not supported in Limbo yet),
     /// and  SELECT DISTINCT ephemeral indexes will not have a rowid.
     pub has_rowid: bool,
+    pub where_clause: Option<Box<Expr>>,
 }
 
 #[allow(dead_code)]
@@ -1158,27 +1750,28 @@ pub struct IndexColumn {
     pub order: SortOrder,
     /// the position of the column in the source table.
     /// for example:
-    /// CREATE TABLE t(a,b,c)
+    /// CREATE TABLE t (a,b,c)
     /// CREATE INDEX idx ON t(b)
     /// b.pos_in_table == 1
     pub pos_in_table: usize,
     pub collation: Option<CollationSeq>,
-    pub default: Option<Expr>,
+    pub default: Option<Box<Expr>>,
 }
 
 impl Index {
     pub fn from_sql(sql: &str, root_page: usize, table: &BTreeTable) -> Result<Index> {
         let mut parser = Parser::new(sql.as_bytes());
-        let cmd = parser.next()?;
+        let cmd = parser.next_cmd()?;
         match cmd {
             Some(Cmd::Stmt(Stmt::CreateIndex {
                 idx_name,
                 tbl_name,
                 columns,
                 unique,
+                where_clause,
                 ..
             })) => {
-                let index_name = normalize_ident(&idx_name.name.0);
+                let index_name = normalize_ident(idx_name.name.as_str());
                 let mut index_columns = Vec::with_capacity(columns.len());
                 for col in columns.into_iter() {
                     let name = normalize_ident(&col.expr.to_string());
@@ -1199,202 +1792,102 @@ impl Index {
                 }
                 Ok(Index {
                     name: index_name,
-                    table_name: normalize_ident(&tbl_name.0),
+                    table_name: normalize_ident(tbl_name.as_str()),
                     root_page,
                     columns: index_columns,
                     unique,
                     ephemeral: false,
                     has_rowid: table.has_rowid,
+                    where_clause,
                 })
             }
             _ => todo!("Expected create index statement"),
         }
     }
 
-    /// The order of index returned should be kept the same
-    ///
-    /// If the order of the index returned changes, this is a breaking change
-    ///
-    /// In the future when we support Alter Column, we should revisit a way to make this less dependent on ordering
-    pub fn automatic_from_primary_key_and_unique(
+    pub fn automatic_from_primary_key(
         table: &BTreeTable,
-        auto_indices: Vec<(String, usize)>,
-    ) -> Result<Vec<Index>> {
-        assert!(!auto_indices.is_empty());
-
-        let mut indices = Vec::with_capacity(auto_indices.len());
-
-        // The number of auto_indices in create table should match in the number of indices we calculate in this function
-        let mut auto_indices = auto_indices.into_iter();
-
-        // TODO: see a better way to please Rust type system with iterators here
-        // I wanted to just chain the iterator above but Rust type system get's messy with Iterators.
-        // It would not allow me chain them even by using a core::iter::empty()
-        // To circumvent this, I'm having to allocate a second Vec, and extend the other from it.
+        auto_index: (String, usize), // name, root_page
+        column_count: usize,
+    ) -> Result<Index> {
         let has_primary_key_index =
             table.get_rowid_alias_column().is_none() && !table.primary_key_columns.is_empty();
-        if has_primary_key_index {
-            let (index_name, root_page) = auto_indices.next().expect(
-                "number of auto_indices in schema should be same number of indices calculated",
-            );
+        assert!(has_primary_key_index);
+        let (index_name, root_page) = auto_index;
 
-            let primary_keys = table
-                .primary_key_columns
-                .iter()
-                .map(|(col_name, order)| {
-                    // Verify that each primary key column exists in the table
-                    let Some((pos_in_table, _)) = table.get_column(col_name) else {
-                        // This is clearly an invariant that should be maintained, so a panic seems more correct here
-                        panic!(
-                            "Column {} is in index {} but not found in table {}",
-                            col_name, index_name, table.name
-                        );
-                    };
-
-                    let (_, column) = table.get_column(col_name).unwrap();
-
-                    IndexColumn {
-                        name: normalize_ident(col_name),
-                        order: *order,
-                        pos_in_table,
-                        collation: column.collation,
-                        default: column.default.clone(),
-                    }
-                })
-                .collect::<Vec<_>>();
-
-            indices.push(Index {
-                name: normalize_ident(index_name.as_str()),
-                table_name: table.name.clone(),
-                root_page,
-                columns: primary_keys,
-                unique: true,
-                ephemeral: false,
-                has_rowid: table.has_rowid,
+        let mut primary_keys = Vec::with_capacity(column_count);
+        for (col_name, order) in table.primary_key_columns.iter() {
+            let Some((pos_in_table, _)) = table.get_column(col_name) else {
+                return Err(crate::LimboError::ParseError(format!(
+                    "Column {} not found in table {}",
+                    col_name, table.name
+                )));
+            };
+            let (_, column) = table.get_column(col_name).unwrap();
+            primary_keys.push(IndexColumn {
+                name: normalize_ident(col_name),
+                order: *order,
+                pos_in_table,
+                collation: column.collation,
+                default: column.default.clone(),
             });
         }
 
-        // Each unique col needs its own index
-        let unique_indices = table
+        assert!(primary_keys.len() == column_count);
+
+        Ok(Index {
+            name: normalize_ident(index_name.as_str()),
+            table_name: table.name.clone(),
+            root_page,
+            columns: primary_keys,
+            unique: true,
+            ephemeral: false,
+            has_rowid: table.has_rowid,
+            where_clause: None,
+        })
+    }
+
+    pub fn automatic_from_unique(
+        table: &BTreeTable,
+        auto_index: (String, usize), // name, root_page
+        column_indices_and_sort_orders: Vec<(usize, SortOrder)>,
+    ) -> Result<Index> {
+        let (index_name, root_page) = auto_index;
+
+        let unique_cols = table
             .columns
             .iter()
             .enumerate()
             .filter_map(|(pos_in_table, col)| {
-                if col.unique {
-                    // Unique columns in Table should always be named
-                    let col_name = col.name.as_ref().unwrap();
-                    if has_primary_key_index
-                        && table.primary_key_columns.len() == 1
-                        && &table.primary_key_columns.first().as_ref().unwrap().0 == col_name {
-                            // skip unique columns that are satisfied with pk constraint
-                            return None;
-                    }
-                    let (index_name, root_page) = auto_indices.next().expect("number of auto_indices in schema should be same number of indices calculated");
-                    let (_, column) = table.get_column(col_name).unwrap();
-                    Some(Index {
-                        name: normalize_ident(index_name.as_str()),
-                        table_name: table.name.clone(),
-                        root_page,
-                        columns: vec![IndexColumn {
-                            name: normalize_ident(col_name),
-                            order: SortOrder::Asc, // Default Sort Order
-                            pos_in_table,
-                            collation: column.collation,
-                            default: column.default.clone(),
-                        }],
-                        unique: true,
-                        ephemeral: false,
-                        has_rowid: table.has_rowid,
-                    })
-                } else {
-                    None
-                }
-            });
-
-        indices.extend(unique_indices);
-
-        if table.primary_key_columns.is_empty() && indices.is_empty() && table.unique_sets.is_none()
-        {
-            return Err(crate::LimboError::InternalError(
-                "Cannot create automatic index for table without primary key or unique constraint"
-                    .to_string(),
-            ));
-        }
-
-        // Invariant: We should not create an automatic index on table with a single column as rowid_alias
-        // and no Unique columns.
-        // e.g CREATE TABLE t1 (a INTEGER PRIMARY KEY, b TEXT);
-        // If this happens, the caller incorrectly called this function
-        if table.get_rowid_alias_column().is_some()
-            && indices.is_empty()
-            && table.unique_sets.is_none()
-        {
-            panic!("should not create an automatic index on table with a single column as rowid_alias and no UNIQUE columns");
-        }
-
-        if let Some(unique_sets) = table.unique_sets.as_ref() {
-            let unique_set_indices = unique_sets
-                .iter()
-                .filter(|set| {
-                    if has_primary_key_index
-                        && table.primary_key_columns.len() == set.len()
-                        && table
-                            .primary_key_columns
-                            .iter()
-                            .all(|col| set.contains(col))
-                    {
-                        // skip unique columns that are satisfied with pk constraint
-                        false
-                    } else {
-                        true
-                    }
+                let (pos_in_table, sort_order) = column_indices_and_sort_orders
+                    .iter()
+                    .find(|(pos, _)| *pos == pos_in_table)?;
+                Some(IndexColumn {
+                    name: normalize_ident(col.name.as_ref().unwrap()),
+                    order: *sort_order,
+                    pos_in_table: *pos_in_table,
+                    collation: col.collation,
+                    default: col.default.clone(),
                 })
-                .map(|set| {
-                    let (index_name, root_page) = auto_indices.next().expect(
-                    "number of auto_indices in schema should be same number of indices calculated",
-                );
+            })
+            .collect::<Vec<_>>();
 
-                    let index_cols = set.iter().map(|(col_name, order)| {
-                        let Some((pos_in_table, _)) = table.get_column(col_name) else {
-                            // This is clearly an invariant that should be maintained, so a panic seems more correct here
-                            panic!(
-                                "Column {} is in index {} but not found in table {}",
-                                col_name, index_name, table.name
-                            );
-                        };
-                        let (_, column) = table.get_column(col_name).unwrap();
-                        IndexColumn {
-                            name: normalize_ident(col_name),
-                            order: *order,
-                            pos_in_table,
-                            collation: column.collation,
-                            default: column.default.clone(),
-                        }
-                    });
-                    Index {
-                        name: normalize_ident(index_name.as_str()),
-                        table_name: table.name.clone(),
-                        root_page,
-                        columns: index_cols.collect(),
-                        unique: true,
-                        ephemeral: false,
-                        has_rowid: table.has_rowid,
-                    }
-                });
-            indices.extend(unique_set_indices);
-        }
-
-        if auto_indices.next().is_some() {
-            panic!("number of auto_indices in schema should be same number of indices calculated");
-        }
-
-        Ok(indices)
+        Ok(Index {
+            name: normalize_ident(index_name.as_str()),
+            table_name: table.name.clone(),
+            root_page,
+            columns: unique_cols,
+            unique: true,
+            ephemeral: false,
+            has_rowid: table.has_rowid,
+            where_clause: None,
+        })
     }
 
     /// Given a column position in the table, return the position in the index.
     /// Returns None if the column is not found in the index.
     /// For example, given:
-    /// CREATE TABLE t(a, b, c)
+    /// CREATE TABLE t (a, b, c)
     /// CREATE INDEX idx ON t(b)
     /// then column_table_pos_to_index_pos(1) returns Some(0)
     pub fn column_table_pos_to_index_pos(&self, table_pos: usize) -> Option<usize> {
@@ -1402,12 +1895,115 @@ impl Index {
             .iter()
             .position(|c| c.pos_in_table == table_pos)
     }
+
+    /// Walk the where_clause Expr of a partial index and validate that it doesn't reference any other
+    /// tables or use any disallowed constructs.
+    pub fn validate_where_expr(&self, table: &Table) -> bool {
+        let Some(where_clause) = &self.where_clause else {
+            return true;
+        };
+
+        let tbl_norm = normalize_ident(self.table_name.as_str());
+        let has_col = |name: &str| {
+            let n = normalize_ident(name);
+            table
+                .columns()
+                .iter()
+                .any(|c| c.name.as_ref().is_some_and(|cn| normalize_ident(cn) == n))
+        };
+        let is_tbl = |ns: &str| normalize_ident(ns).eq_ignore_ascii_case(&tbl_norm);
+        let is_deterministic_fn = |name: &str, argc: usize| {
+            let n = normalize_ident(name);
+            Func::resolve_function(&n, argc).is_ok_and(|f| f.is_deterministic())
+        };
+
+        let mut ok = true;
+        let _ = walk_expr(where_clause.as_ref(), &mut |e: &Expr| -> crate::Result<
+            WalkControl,
+        > {
+            if !ok {
+                return Ok(WalkControl::SkipChildren);
+            }
+            match e {
+                Expr::Literal(_) | Expr::RowId { .. } => {}
+                // Unqualified identifier: must be a column of the target table or ROWID
+                Expr::Id(Name::Ident(n)) | Expr::Id(Name::Quoted(n)) => {
+                    let n = n.as_str();
+                    if !ROWID_STRS.iter().any(|s| s.eq_ignore_ascii_case(n)) && !has_col(n) {
+                        ok = false;
+                    }
+                }
+                // Qualified: qualifier must match this index's table; column must exist
+                Expr::Qualified(ns, col) | Expr::DoublyQualified(_, ns, col) => {
+                    if !is_tbl(ns.as_str()) || !has_col(col.as_str()) {
+                        ok = false;
+                    }
+                }
+                Expr::FunctionCall {
+                    name, filter_over, ..
+                }
+                | Expr::FunctionCallStar {
+                    name, filter_over, ..
+                } => {
+                    // reject windowed
+                    if filter_over.over_clause.is_some() {
+                        ok = false;
+                    } else {
+                        let argc = match e {
+                            Expr::FunctionCall { args, .. } => args.len(),
+                            Expr::FunctionCallStar { .. } => 0,
+                            _ => unreachable!(),
+                        };
+                        if !is_deterministic_fn(name.as_str(), argc) {
+                            ok = false;
+                        }
+                    }
+                }
+                // Explicitly disallowed constructs
+                Expr::Exists(_)
+                | Expr::InSelect { .. }
+                | Expr::Subquery(_)
+                | Expr::Raise { .. }
+                | Expr::Variable(_) => {
+                    ok = false;
+                }
+                _ => {}
+            }
+            Ok(if ok {
+                WalkControl::Continue
+            } else {
+                WalkControl::SkipChildren
+            })
+        });
+        ok
+    }
+
+    pub fn bind_where_expr(
+        &self,
+        table_refs: Option<&mut TableReferences>,
+        connection: &Arc<Connection>,
+    ) -> Option<ast::Expr> {
+        let Some(where_clause) = &self.where_clause else {
+            return None;
+        };
+        let mut params = ParamState::disallow();
+        let mut expr = where_clause.clone();
+        bind_and_rewrite_expr(
+            &mut expr,
+            table_refs,
+            None,
+            connection,
+            &mut params,
+            BindingBehavior::ResultColumnsNotAllowed,
+        )
+        .ok()?;
+        Some(*expr)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::LimboError;
 
     #[test]
     pub fn test_has_rowid_true() -> Result<()> {
@@ -1488,13 +2084,12 @@ mod tests {
     }
 
     #[test]
-    pub fn test_column_is_rowid_alias_inline_composite_primary_key() -> Result<()> {
+    pub fn test_multiple_pk_forbidden() -> Result<()> {
         let sql = r#"CREATE TABLE t1 (a INTEGER PRIMARY KEY, b TEXT PRIMARY KEY);"#;
-        let table = BTreeTable::from_sql(sql, 0)?;
-        let column = table.get_column("a").unwrap().1;
+        let table = BTreeTable::from_sql(sql, 0);
+        let error = table.unwrap_err();
         assert!(
-            !table.column_is_rowid_alias(column),
-            "column 'a´ shouldn't be a rowid alias because table has composite primary key"
+            matches!(error, LimboError::ParseError(e) if e.contains("table \"t1\" has more than one primary key"))
         );
         Ok(())
     }
@@ -1530,22 +2125,12 @@ mod tests {
     }
 
     #[test]
-    pub fn test_primary_key_inline_multiple() -> Result<()> {
+    pub fn test_primary_key_inline_multiple_forbidden() -> Result<()> {
         let sql = r#"CREATE TABLE t1 (a INTEGER PRIMARY KEY, b TEXT PRIMARY KEY, c REAL);"#;
-        let table = BTreeTable::from_sql(sql, 0)?;
-        let column = table.get_column("a").unwrap().1;
-        assert!(column.primary_key, "column 'a' should be a primary key");
-        let column = table.get_column("b").unwrap().1;
-        assert!(column.primary_key, "column 'b' shouldn be a primary key");
-        let column = table.get_column("c").unwrap().1;
-        assert!(!column.primary_key, "column 'c' shouldn't be a primary key");
-        assert_eq!(
-            vec![
-                ("a".to_string(), SortOrder::Asc),
-                ("b".to_string(), SortOrder::Asc)
-            ],
-            table.primary_key_columns,
-            "primary key column names should be ['a', 'b']"
+        let table = BTreeTable::from_sql(sql, 0);
+        let error = table.unwrap_err();
+        assert!(
+            matches!(error, LimboError::ParseError(e) if e.contains("table \"t1\" has more than one primary key"))
         );
         Ok(())
     }
@@ -1669,29 +2254,42 @@ mod tests {
     }
 
     #[test]
+    pub fn test_special_column_names() -> Result<()> {
+        let tests = [
+            ("foobar", "CREATE TABLE t (foobar TEXT)"),
+            ("_table_name3", "CREATE TABLE t (_table_name3 TEXT)"),
+            ("special name", "CREATE TABLE t ([special name] TEXT)"),
+            ("foo&bar", "CREATE TABLE t ([foo&bar] TEXT)"),
+            (" name", "CREATE TABLE t ([ name] TEXT)"),
+        ];
+
+        for (input_column_name, expected_sql) in tests {
+            let sql = format!("CREATE TABLE t ([{input_column_name}] TEXT)");
+            let actual = BTreeTable::from_sql(&sql, 0)?.to_sql();
+            assert_eq!(expected_sql, actual);
+        }
+
+        Ok(())
+    }
+
+    #[test]
     #[should_panic]
     fn test_automatic_index_single_column() {
         // Without composite primary keys, we should not have an automatic index on a primary key that is a rowid alias
         let sql = r#"CREATE TABLE t1 (a INTEGER PRIMARY KEY, b TEXT);"#;
         let table = BTreeTable::from_sql(sql, 0).unwrap();
-        let _index = Index::automatic_from_primary_key_and_unique(
-            &table,
-            vec![("sqlite_autoindex_t1_1".to_string(), 2)],
-        )
-        .unwrap();
+        let _index =
+            Index::automatic_from_primary_key(&table, ("sqlite_autoindex_t1_1".to_string(), 2), 1)
+                .unwrap();
     }
 
     #[test]
     fn test_automatic_index_composite_key() -> Result<()> {
         let sql = r#"CREATE TABLE t1 (a INTEGER, b TEXT, PRIMARY KEY(a, b));"#;
         let table = BTreeTable::from_sql(sql, 0)?;
-        let mut index = Index::automatic_from_primary_key_and_unique(
-            &table,
-            vec![("sqlite_autoindex_t1_1".to_string(), 2)],
-        )?;
+        let index =
+            Index::automatic_from_primary_key(&table, ("sqlite_autoindex_t1_1".to_string(), 2), 2)?;
 
-        assert!(index.len() == 1);
-        let index = index.pop().unwrap();
         assert_eq!(index.name, "sqlite_autoindex_t1_1");
         assert_eq!(index.table_name, "t1");
         assert_eq!(index.root_page, 2);
@@ -1705,24 +2303,15 @@ mod tests {
     }
 
     #[test]
-    fn test_automatic_index_no_primary_key() -> Result<()> {
+    #[should_panic]
+    fn test_automatic_index_no_primary_key() {
         let sql = r#"CREATE TABLE t1 (a INTEGER, b TEXT);"#;
-        let table = BTreeTable::from_sql(sql, 0)?;
-        let result = Index::automatic_from_primary_key_and_unique(
-            &table,
-            vec![("sqlite_autoindex_t1_1".to_string(), 2)],
-        );
-
-        assert!(result.is_err());
-        assert!(matches!(
-            result.unwrap_err(),
-            LimboError::InternalError(msg) if msg.contains("without primary key")
-        ));
-        Ok(())
+        let table = BTreeTable::from_sql(sql, 0).unwrap();
+        Index::automatic_from_primary_key(&table, ("sqlite_autoindex_t1_1".to_string(), 2), 1)
+            .unwrap();
     }
 
     #[test]
-    #[should_panic]
     fn test_automatic_index_nonexistent_column() {
         // Create a table with a primary key column that doesn't exist in the table
         let table = BTreeTable {
@@ -1730,6 +2319,7 @@ mod tests {
             name: "t1".to_string(),
             has_rowid: true,
             is_strict: false,
+            has_autoincrement: false,
             primary_key_columns: vec![("nonexistent".to_string(), SortOrder::Asc)],
             columns: vec![Column {
                 name: Some("a".to_string()),
@@ -1743,26 +2333,23 @@ mod tests {
                 collation: None,
                 hidden: false,
             }],
-            unique_sets: None,
+            unique_sets: vec![],
         };
 
-        let _result = Index::automatic_from_primary_key_and_unique(
-            &table,
-            vec![("sqlite_autoindex_t1_1".to_string(), 2)],
-        );
+        let result =
+            Index::automatic_from_primary_key(&table, ("sqlite_autoindex_t1_1".to_string(), 2), 1);
+        assert!(result.is_err());
     }
 
     #[test]
     fn test_automatic_index_unique_column() -> Result<()> {
         let sql = r#"CREATE table t1 (x INTEGER, y INTEGER UNIQUE);"#;
         let table = BTreeTable::from_sql(sql, 0)?;
-        let mut index = Index::automatic_from_primary_key_and_unique(
+        let index = Index::automatic_from_unique(
             &table,
-            vec![("sqlite_autoindex_t1_1".to_string(), 2)],
+            ("sqlite_autoindex_t1_1".to_string(), 2),
+            vec![(1, SortOrder::Asc)],
         )?;
-
-        assert!(index.len() == 1);
-        let index = index.pop().unwrap();
 
         assert_eq!(index.name, "sqlite_autoindex_t1_1");
         assert_eq!(index.table_name, "t1");
@@ -1778,29 +2365,30 @@ mod tests {
     fn test_automatic_index_pkey_unique_column() -> Result<()> {
         let sql = r#"CREATE TABLE t1 (x PRIMARY KEY, y UNIQUE);"#;
         let table = BTreeTable::from_sql(sql, 0)?;
-        let auto_indices = vec![
-            ("sqlite_autoindex_t1_1".to_string(), 2),
-            ("sqlite_autoindex_t1_2".to_string(), 3),
+        let indices = [
+            Index::automatic_from_primary_key(&table, ("sqlite_autoindex_t1_1".to_string(), 2), 1)?,
+            Index::automatic_from_unique(
+                &table,
+                ("sqlite_autoindex_t1_2".to_string(), 3),
+                vec![(1, SortOrder::Asc)],
+            )?,
         ];
-        let indices = Index::automatic_from_primary_key_and_unique(&table, auto_indices.clone())?;
 
-        assert!(indices.len() == auto_indices.len());
+        assert_eq!(indices[0].name, "sqlite_autoindex_t1_1");
+        assert_eq!(indices[0].table_name, "t1");
+        assert_eq!(indices[0].root_page, 2);
+        assert!(indices[0].unique);
+        assert_eq!(indices[0].columns.len(), 1);
+        assert_eq!(indices[0].columns[0].name, "x");
+        assert!(matches!(indices[0].columns[0].order, SortOrder::Asc));
 
-        for (pos, index) in indices.iter().enumerate() {
-            let (index_name, root_page) = &auto_indices[pos];
-            assert_eq!(index.name, *index_name);
-            assert_eq!(index.table_name, "t1");
-            assert_eq!(index.root_page, *root_page);
-            assert!(index.unique);
-            assert_eq!(index.columns.len(), 1);
-            if pos == 0 {
-                assert_eq!(index.columns[0].name, "x");
-            } else if pos == 1 {
-                assert_eq!(index.columns[0].name, "y");
-            }
-
-            assert!(matches!(index.columns[0].order, SortOrder::Asc));
-        }
+        assert_eq!(indices[1].name, "sqlite_autoindex_t1_2");
+        assert_eq!(indices[1].table_name, "t1");
+        assert_eq!(indices[1].root_page, 3);
+        assert!(indices[1].unique);
+        assert_eq!(indices[1].columns.len(), 1);
+        assert_eq!(indices[1].columns[0].name, "y");
+        assert!(matches!(indices[1].columns[0].order, SortOrder::Asc));
 
         Ok(())
     }
@@ -1809,12 +2397,24 @@ mod tests {
     fn test_automatic_index_pkey_many_unique_columns() -> Result<()> {
         let sql = r#"CREATE TABLE t1 (a PRIMARY KEY, b UNIQUE, c, d, UNIQUE(c, d));"#;
         let table = BTreeTable::from_sql(sql, 0)?;
-        let auto_indices = vec![
+        let auto_indices = [
             ("sqlite_autoindex_t1_1".to_string(), 2),
             ("sqlite_autoindex_t1_2".to_string(), 3),
-            ("sqlite_autoindex_t1_2".to_string(), 4),
+            ("sqlite_autoindex_t1_3".to_string(), 4),
         ];
-        let indices = Index::automatic_from_primary_key_and_unique(&table, auto_indices.clone())?;
+        let indices = vec![
+            Index::automatic_from_primary_key(&table, ("sqlite_autoindex_t1_1".to_string(), 2), 1)?,
+            Index::automatic_from_unique(
+                &table,
+                ("sqlite_autoindex_t1_2".to_string(), 3),
+                vec![(1, SortOrder::Asc)],
+            )?,
+            Index::automatic_from_unique(
+                &table,
+                ("sqlite_autoindex_t1_3".to_string(), 4),
+                vec![(2, SortOrder::Asc), (3, SortOrder::Asc)],
+            )?,
+        ];
 
         assert!(indices.len() == auto_indices.len());
 
@@ -1847,13 +2447,11 @@ mod tests {
     fn test_automatic_index_unique_set_dedup() -> Result<()> {
         let sql = r#"CREATE TABLE t1 (a, b, UNIQUE(a, b), UNIQUE(a, b));"#;
         let table = BTreeTable::from_sql(sql, 0)?;
-        let mut index = Index::automatic_from_primary_key_and_unique(
+        let index = Index::automatic_from_unique(
             &table,
-            vec![("sqlite_autoindex_t1_1".to_string(), 2)],
+            ("sqlite_autoindex_t1_1".to_string(), 2),
+            vec![(0, SortOrder::Asc), (1, SortOrder::Asc)],
         )?;
-
-        assert!(index.len() == 1);
-        let index = index.pop().unwrap();
 
         assert_eq!(index.name, "sqlite_autoindex_t1_1");
         assert_eq!(index.table_name, "t1");
@@ -1872,13 +2470,8 @@ mod tests {
     fn test_automatic_index_primary_key_is_unique() -> Result<()> {
         let sql = r#"CREATE TABLE t1 (a primary key unique);"#;
         let table = BTreeTable::from_sql(sql, 0)?;
-        let mut index = Index::automatic_from_primary_key_and_unique(
-            &table,
-            vec![("sqlite_autoindex_t1_1".to_string(), 2)],
-        )?;
-
-        assert!(index.len() == 1);
-        let index = index.pop().unwrap();
+        let index =
+            Index::automatic_from_primary_key(&table, ("sqlite_autoindex_t1_1".to_string(), 2), 1)?;
 
         assert_eq!(index.name, "sqlite_autoindex_t1_1");
         assert_eq!(index.table_name, "t1");
@@ -1895,13 +2488,8 @@ mod tests {
     fn test_automatic_index_primary_key_is_unique_and_composite() -> Result<()> {
         let sql = r#"CREATE TABLE t1 (a, b, PRIMARY KEY(a, b), UNIQUE(a, b));"#;
         let table = BTreeTable::from_sql(sql, 0)?;
-        let mut index = Index::automatic_from_primary_key_and_unique(
-            &table,
-            vec![("sqlite_autoindex_t1_1".to_string(), 2)],
-        )?;
-
-        assert!(index.len() == 1);
-        let index = index.pop().unwrap();
+        let index =
+            Index::automatic_from_primary_key(&table, ("sqlite_autoindex_t1_1".to_string(), 2), 2)?;
 
         assert_eq!(index.name, "sqlite_autoindex_t1_1");
         assert_eq!(index.table_name, "t1");
@@ -1919,13 +2507,14 @@ mod tests {
     fn test_automatic_index_unique_and_a_pk() -> Result<()> {
         let sql = r#"CREATE TABLE t1 (a NUMERIC UNIQUE UNIQUE,  b TEXT PRIMARY KEY)"#;
         let table = BTreeTable::from_sql(sql, 0)?;
-        let mut indexes = Index::automatic_from_primary_key_and_unique(
-            &table,
-            vec![
+        let mut indexes = vec![
+            Index::automatic_from_unique(
+                &table,
                 ("sqlite_autoindex_t1_1".to_string(), 2),
-                ("sqlite_autoindex_t1_2".to_string(), 3),
-            ],
-        )?;
+                vec![(0, SortOrder::Asc)],
+            )?,
+            Index::automatic_from_primary_key(&table, ("sqlite_autoindex_t1_2".to_string(), 3), 1)?,
+        ];
 
         assert!(indexes.len() == 2);
         let index = indexes.pop().unwrap();
@@ -1934,7 +2523,7 @@ mod tests {
         assert_eq!(index.root_page, 3);
         assert!(index.unique);
         assert_eq!(index.columns.len(), 1);
-        assert_eq!(index.columns[0].name, "a");
+        assert_eq!(index.columns[0].name, "b");
         assert!(matches!(index.columns[0].order, SortOrder::Asc));
 
         let index = indexes.pop().unwrap();
@@ -1943,7 +2532,7 @@ mod tests {
         assert_eq!(index.root_page, 2);
         assert!(index.unique);
         assert_eq!(index.columns.len(), 1);
-        assert_eq!(index.columns[0].name, "b");
+        assert_eq!(index.columns[0].name, "a");
         assert!(matches!(index.columns[0].order, SortOrder::Asc));
 
         Ok(())

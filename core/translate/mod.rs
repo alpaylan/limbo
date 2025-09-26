@@ -9,6 +9,8 @@
 
 pub(crate) mod aggregation;
 pub(crate) mod alter;
+pub(crate) mod analyze;
+pub(crate) mod attach;
 pub(crate) mod collate;
 mod compound_select;
 pub(crate) mod delete;
@@ -19,6 +21,7 @@ pub(crate) mod group_by;
 pub(crate) mod index;
 pub(crate) mod insert;
 pub(crate) mod integrity_check;
+pub(crate) mod logical;
 pub(crate) mod main_loop;
 pub(crate) mod optimizer;
 pub(crate) mod order_by;
@@ -32,25 +35,29 @@ pub(crate) mod select;
 pub(crate) mod subquery;
 pub(crate) mod transaction;
 pub(crate) mod update;
+pub(crate) mod upsert;
 mod values;
+pub(crate) mod view;
+mod window;
 
 use crate::schema::Schema;
 use crate::storage::pager::Pager;
 use crate::translate::delete::translate_delete;
+use crate::translate::emitter::Resolver;
 use crate::vdbe::builder::{ProgramBuilder, ProgramBuilderOpts, QueryMode};
 use crate::vdbe::Program;
 use crate::{bail_parse_error, Connection, Result, SymbolTable};
 use alter::translate_alter_table;
+use analyze::translate_analyze;
 use index::{translate_create_index, translate_drop_index};
 use insert::translate_insert;
 use rollback::translate_rollback;
 use schema::{translate_create_table, translate_create_virtual_table, translate_drop_table};
 use select::translate_select;
-use std::rc::Rc;
 use std::sync::Arc;
 use tracing::{instrument, Level};
 use transaction::{translate_tx_begin, translate_tx_commit};
-use turso_sqlite3_parser::ast::{self, Delete, Insert};
+use turso_parser::ast::{self, Indexed};
 use update::translate_update;
 
 #[instrument(skip_all, level = Level::DEBUG)]
@@ -58,19 +65,19 @@ use update::translate_update;
 pub fn translate(
     schema: &Schema,
     stmt: ast::Stmt,
-    pager: Rc<Pager>,
+    pager: Arc<Pager>,
     connection: Arc<Connection>,
     syms: &SymbolTable,
     query_mode: QueryMode,
-    _input: &str, // TODO: going to be used for CREATE VIEW
+    input: &str,
 ) -> Result<Program> {
-    tracing::trace!("querying {}", _input);
+    tracing::trace!("querying {}", input);
     let change_cnt_on = matches!(
         stmt,
         ast::Stmt::CreateIndex { .. }
-            | ast::Stmt::Delete(..)
-            | ast::Stmt::Insert(..)
-            | ast::Stmt::Update(..)
+            | ast::Stmt::Delete { .. }
+            | ast::Stmt::Insert { .. }
+            | ast::Stmt::Update { .. }
     );
 
     let mut program = ProgramBuilder::new(
@@ -79,136 +86,225 @@ pub fn translate(
         // These options will be extended whithin each translate program
         ProgramBuilderOpts {
             num_cursors: 1,
-            approx_num_insns: 2,
+            approx_num_insns: 32,
             approx_num_labels: 2,
         },
     );
 
     program.prologue();
+    let resolver = Resolver::new(schema, syms);
 
     program = match stmt {
         // There can be no nesting with pragma, so lift it up here
-        ast::Stmt::Pragma(name, body) => pragma::translate_pragma(
-            schema,
-            &name,
-            body.map(|b| *b),
-            pager,
-            connection.clone(),
-            program,
-        )?,
-        stmt => translate_inner(schema, stmt, syms, program)?,
+        ast::Stmt::Pragma { name, body } => {
+            pragma::translate_pragma(&resolver, &name, body, pager, connection.clone(), program)?
+        }
+        stmt => translate_inner(stmt, &resolver, program, &connection, input)?,
     };
 
-    // TODO: bring epilogue here when I can sort out what instructions correspond to a Write or a Read transaction
+    program.epilogue(schema);
 
-    Ok(program.build(connection, change_cnt_on))
+    Ok(program.build(connection, change_cnt_on, input))
 }
 
 // TODO: for now leaving the return value as a Program. But ideally to support nested parsing of arbitraty
 // statements, we would have to return a program builder instead
 /// Translate SQL statement into bytecode program.
 pub fn translate_inner(
-    schema: &Schema,
     stmt: ast::Stmt,
-    syms: &SymbolTable,
+    resolver: &Resolver,
     program: ProgramBuilder,
+    connection: &Arc<Connection>,
+    input: &str,
 ) -> Result<ProgramBuilder> {
-    let program = match stmt {
-        ast::Stmt::AlterTable(alter) => translate_alter_table(*alter, syms, schema, program)?,
-        ast::Stmt::Analyze(_) => bail_parse_error!("ANALYZE not supported yet"),
-        ast::Stmt::Attach { .. } => bail_parse_error!("ATTACH not supported yet"),
-        ast::Stmt::Begin(tx_type, tx_name) => translate_tx_begin(tx_type, tx_name, program)?,
-        ast::Stmt::Commit(tx_name) => translate_tx_commit(tx_name, program)?,
+    let is_write = matches!(
+        stmt,
+        ast::Stmt::AlterTable { .. }
+            | ast::Stmt::CreateIndex { .. }
+            | ast::Stmt::CreateTable { .. }
+            | ast::Stmt::CreateTrigger { .. }
+            | ast::Stmt::CreateView { .. }
+            | ast::Stmt::CreateMaterializedView { .. }
+            | ast::Stmt::CreateVirtualTable(..)
+            | ast::Stmt::Delete { .. }
+            | ast::Stmt::DropIndex { .. }
+            | ast::Stmt::DropTable { .. }
+            | ast::Stmt::DropView { .. }
+            | ast::Stmt::Reindex { .. }
+            | ast::Stmt::Update { .. }
+            | ast::Stmt::Insert { .. }
+    );
+
+    if is_write && connection.get_query_only() {
+        bail_parse_error!("Cannot execute write statement in query_only mode")
+    }
+
+    let is_select = matches!(stmt, ast::Stmt::Select { .. });
+
+    let mut program = match stmt {
+        ast::Stmt::AlterTable(alter) => {
+            translate_alter_table(alter, resolver, program, connection, input)?
+        }
+        ast::Stmt::Analyze { name } => translate_analyze(name, resolver, program)?,
+        ast::Stmt::Attach { expr, db_name, key } => {
+            attach::translate_attach(&expr, resolver, &db_name, &key, program)?
+        }
+        ast::Stmt::Begin { typ, name } => translate_tx_begin(typ, name, resolver.schema, program)?,
+        ast::Stmt::Commit { name } => translate_tx_commit(name, program)?,
         ast::Stmt::CreateIndex {
             unique,
             if_not_exists,
             idx_name,
             tbl_name,
             columns,
-            ..
+            where_clause,
         } => translate_create_index(
             (unique, if_not_exists),
-            &idx_name.name.0,
-            &tbl_name.0,
+            resolver,
+            idx_name.name.as_str(),
+            tbl_name.as_str(),
             &columns,
-            schema,
             program,
+            connection,
+            where_clause,
         )?,
         ast::Stmt::CreateTable {
             temporary,
             if_not_exists,
             tbl_name,
             body,
-        } => translate_create_table(tbl_name, temporary, *body, if_not_exists, schema, program)?,
+        } => translate_create_table(
+            tbl_name,
+            resolver,
+            temporary,
+            if_not_exists,
+            body,
+            program,
+            connection,
+        )?,
         ast::Stmt::CreateTrigger { .. } => bail_parse_error!("CREATE TRIGGER not supported yet"),
-        ast::Stmt::CreateView { .. } => bail_parse_error!("CREATE VIEW not supported yet"),
+        ast::Stmt::CreateView {
+            view_name,
+            select,
+            columns,
+            ..
+        } => view::translate_create_view(
+            view_name.name.as_str(),
+            resolver,
+            &select,
+            &columns,
+            connection.clone(),
+            program,
+        )?,
+        ast::Stmt::CreateMaterializedView {
+            view_name, select, ..
+        } => view::translate_create_materialized_view(
+            view_name.name.as_str(),
+            resolver,
+            &select,
+            connection.clone(),
+            program,
+        )?,
         ast::Stmt::CreateVirtualTable(vtab) => {
-            translate_create_virtual_table(*vtab, schema, syms, program)?
+            translate_create_virtual_table(vtab, resolver, program)?
         }
-        ast::Stmt::Delete(delete) => {
-            let Delete {
-                tbl_name,
+        ast::Stmt::Delete {
+            tbl_name,
+            where_clause,
+            limit,
+            returning,
+            indexed,
+            order_by,
+            with,
+        } => {
+            if with.is_some() {
+                bail_parse_error!("WITH clause is not supported in DELETE");
+            }
+            if indexed.is_some_and(|i| matches!(i, Indexed::IndexedBy(_))) {
+                bail_parse_error!("INDEXED BY clause is not supported in DELETE");
+            }
+            if !order_by.is_empty() {
+                bail_parse_error!("ORDER BY clause is not supported in DELETE");
+            }
+            translate_delete(
+                &tbl_name,
+                resolver,
                 where_clause,
                 limit,
-                ..
-            } = *delete;
-            translate_delete(schema, &tbl_name, where_clause, limit, syms, program)?
+                returning,
+                program,
+                connection,
+            )?
         }
-        ast::Stmt::Detach(_) => bail_parse_error!("DETACH not supported yet"),
+        ast::Stmt::Detach { name } => attach::translate_detach(&name, resolver, program)?,
         ast::Stmt::DropIndex {
             if_exists,
             idx_name,
-        } => translate_drop_index(&idx_name.name.0, if_exists, schema, program)?,
+        } => translate_drop_index(idx_name.name.as_str(), resolver, if_exists, program)?,
         ast::Stmt::DropTable {
             if_exists,
             tbl_name,
-        } => translate_drop_table(tbl_name, if_exists, schema, program)?,
+        } => translate_drop_table(tbl_name, resolver, if_exists, program)?,
         ast::Stmt::DropTrigger { .. } => bail_parse_error!("DROP TRIGGER not supported yet"),
-        ast::Stmt::DropView { .. } => bail_parse_error!("DROP VIEW not supported yet"),
-        ast::Stmt::Pragma(..) => {
+        ast::Stmt::DropView {
+            if_exists,
+            view_name,
+        } => {
+            view::translate_drop_view(resolver.schema, view_name.name.as_str(), if_exists, program)?
+        }
+        ast::Stmt::Pragma { .. } => {
             bail_parse_error!("PRAGMA statement cannot be evaluated in a nested context")
         }
         ast::Stmt::Reindex { .. } => bail_parse_error!("REINDEX not supported yet"),
-        ast::Stmt::Release(_) => bail_parse_error!("RELEASE not supported yet"),
+        ast::Stmt::Release { .. } => bail_parse_error!("RELEASE not supported yet"),
         ast::Stmt::Rollback {
             tx_name,
             savepoint_name,
-        } => translate_rollback(schema, syms, program, tx_name, savepoint_name)?,
-        ast::Stmt::Savepoint(_) => bail_parse_error!("SAVEPOINT not supported yet"),
+        } => translate_rollback(program, tx_name, savepoint_name)?,
+        ast::Stmt::Savepoint { .. } => bail_parse_error!("SAVEPOINT not supported yet"),
         ast::Stmt::Select(select) => {
             translate_select(
-                schema,
-                *select,
-                syms,
+                select,
+                resolver,
                 program,
                 plan::QueryDestination::ResultRows,
+                connection,
             )?
             .program
         }
-        ast::Stmt::Update(mut update) => translate_update(schema, &mut update, syms, program)?,
-        ast::Stmt::Vacuum(_, _) => bail_parse_error!("VACUUM not supported yet"),
-        ast::Stmt::Insert(insert) => {
-            let Insert {
-                with,
-                or_conflict,
-                tbl_name,
-                columns,
-                body,
-                returning,
-            } = *insert;
-            translate_insert(
-                schema,
-                with,
-                or_conflict,
-                tbl_name,
-                columns,
-                body,
-                returning,
-                syms,
-                program,
-            )?
+        ast::Stmt::Update(mut update) => {
+            translate_update(&mut update, resolver, program, connection)?
         }
+        ast::Stmt::Vacuum { .. } => bail_parse_error!("VACUUM not supported yet"),
+        ast::Stmt::Insert {
+            with,
+            or_conflict,
+            tbl_name,
+            columns,
+            body,
+            returning,
+        } => translate_insert(
+            with,
+            resolver,
+            or_conflict,
+            tbl_name,
+            columns,
+            body,
+            returning,
+            program,
+            connection,
+        )?,
     };
+
+    // Indicate write operations so that in the epilogue we can emit the correct type of transaction
+    if is_write {
+        program.begin_write_operation();
+    }
+
+    // Indicate read operations so that in the epilogue we can emit the correct type of transaction
+    if is_select && !program.table_references.is_empty() {
+        program.begin_read_operation();
+    }
 
     Ok(program)
 }

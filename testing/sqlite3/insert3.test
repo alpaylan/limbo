@@ -25,8 +25,8 @@ ifcapable {trigger} {
 #
 do_test insert3-1.0 {
   execsql {
-    CREATE TABLE t1(a,b);
-    CREATE TABLE log(x UNIQUE, y);
+    CREATE TABLE t1 (a,b);
+    CREATE TABLE log (x UNIQUE, y);
     CREATE TRIGGER r1 AFTER INSERT ON t1 BEGIN
       UPDATE log SET y=y+1 WHERE x=new.a;
       INSERT OR IGNORE INTO log VALUES(new.a, 1);
@@ -44,7 +44,7 @@ do_test insert3-1.1 {
 } {5 2 hello 2}
 do_test insert3-1.2 {
   execsql {
-    CREATE TABLE log2(x PRIMARY KEY,y);
+    CREATE TABLE log2 (x PRIMARY KEY,y);
     CREATE TRIGGER r2 BEFORE INSERT ON t1 BEGIN
       UPDATE log2 SET y=y+1 WHERE x=new.b;
       INSERT OR IGNORE INTO log2 VALUES(new.b,1);
@@ -82,12 +82,12 @@ ifcapable compound {
 
 do_test insert3-2.1 {
   execsql {
-    CREATE TABLE t2(
+    CREATE TABLE t2 (
       a INTEGER PRIMARY KEY,
       b DEFAULT 'b',
       c DEFAULT 'c'
     );
-    CREATE TABLE t2dup(a,b,c);
+    CREATE TABLE t2dup (a,b,c);
     CREATE TRIGGER t2r1 BEFORE INSERT ON t2 BEGIN
       INSERT INTO t2dup(a,b,c) VALUES(new.a,new.b,new.c);
     END;
@@ -111,7 +111,7 @@ do_test insert3-2.2 {
 #
 do_test insert3-3.1 {
   execsql {
-    CREATE TABLE t3(a,b,c);
+    CREATE TABLE t3 (a,b,c);
     CREATE TRIGGER t3r1 BEFORE INSERT on t3 WHEN nosuchcol BEGIN
       SELECT 'illegal WHEN clause';
     END;
@@ -124,7 +124,7 @@ do_test insert3-3.2 {
 } {1 {no such column: nosuchcol}}
 do_test insert3-3.3 {
   execsql {
-    CREATE TABLE t4(a,b,c);
+    CREATE TABLE t4 (a,b,c);
     CREATE TRIGGER t4r1 AFTER INSERT on t4 WHEN nosuchcol BEGIN
       SELECT 'illegal WHEN clause';
     END;
@@ -142,7 +142,7 @@ do_test insert3-3.4 {
 #
 do_test insert3-3.5 {
   execsql {
-    CREATE TABLE t5(
+    CREATE TABLE t5 (
       a INTEGER PRIMARY KEY,
       b DEFAULT 'xyz'
     );
@@ -160,7 +160,7 @@ do_test insert3-3.6 {
 ifcapable bloblit {
   do_test insert3-3.7 {
     execsql {
-      CREATE TABLE t6(x,y DEFAULT 4.3, z DEFAULT x'6869');
+      CREATE TABLE t6 (x,y DEFAULT 4.3, z DEFAULT x'6869');
       INSERT INTO t6 DEFAULT VALUES;
       SELECT * FROM t6;
     }
@@ -180,7 +180,7 @@ sqlite3 db test.db
 #
 do_test insert3-4.1 {
   execsql { 
-    CREATE TABLE t1(a, b, c);
+    CREATE TABLE t1 (a, b, c);
     CREATE INDEX i1 ON t1(a, b);
     BEGIN;
     INSERT INTO t1 VALUES(randstr(10,400),randstr(10,400),randstr(10,400));

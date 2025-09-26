@@ -18,7 +18,7 @@ source $testdir/tester.tcl
 
 # Create a table with some data
 #
-execsql {CREATE TABLE tbl1(f1 int, f2 int)}
+execsql {CREATE TABLE tbl1 (f1 int, f2 int)}
 execsql {BEGIN}
 for {set i 0} {$i<=30} {incr i} {
   execsql "INSERT INTO tbl1 VALUES([expr {$i%9}],[expr {$i%10}])"
@@ -65,7 +65,7 @@ unset data
 #ifcapable tclvar {
 #  do_test select2-2.0.1 {
 #    set t1 [time {
-#      execsql {CREATE TABLE tbl2(f1 int, f2 int, f3 int); BEGIN;}
+#      execsql {CREATE TABLE tbl2 (f1 int, f2 int, f3 int); BEGIN;}
 #      for {set i 1} {$i<=30000} {incr i} {
 #        set i2 [expr {$i*2}]
 #        set i3 [expr {$i*3}]
@@ -80,7 +80,7 @@ unset data
 #catch {execsql {DROP TABLE tbl2}}
 #do_test select2-2.0.2 {
 #  set t2 [time {
-#    execsql {CREATE TABLE tbl2(f1 int, f2 int, f3 int); BEGIN;}
+#    execsql {CREATE TABLE tbl2 (f1 int, f2 int, f3 int); BEGIN;}
 #    for {set i 1} {$i<=30000} {incr i} {
 #      set i2 [expr {$i*2}]
 #      set i3 [expr {$i*3}]
@@ -142,8 +142,8 @@ do_test select2-3.3 {
 #
 do_test select2-4.1 {
   execsql {
-    CREATE TABLE aa(a);
-    CREATE TABLE bb(b);
+    CREATE TABLE aa (a);
+    CREATE TABLE bb (b);
     INSERT INTO aa VALUES(1);
     INSERT INTO aa VALUES(3);
     INSERT INTO bb VALUES(2);

@@ -1,6 +1,6 @@
 use std::{cell::RefCell, collections::HashMap};
 
-use turso_sqlite3_parser::ast::TableInternalId;
+use turso_parser::ast::TableInternalId;
 
 use crate::{
     translate::{
@@ -8,7 +8,7 @@ use crate::{
         plan::{JoinOrderMember, JoinedTable},
         planner::TableMask,
     },
-    Result,
+    LimboError, Result,
 };
 
 use super::{
@@ -42,7 +42,7 @@ impl JoinN {
 }
 
 /// Join n-1 tables with the n'th table.
-/// Returns None if the plan is worse than the provided cost upper bound.
+/// Returns None if the plan is worse than the provided cost upper bound or if no valid access method is found.
 pub fn join_lhs_and_rhs<'a>(
     lhs: Option<&JoinN>,
     rhs_table_reference: &JoinedTable,
@@ -64,6 +64,10 @@ pub fn join_lhs_and_rhs<'a>(
         maybe_order_target,
         input_cardinality as f64,
     )?;
+
+    let Some(best_access_method) = best_access_method else {
+        return Ok(None);
+    };
 
     let lhs_cost = lhs.map_or(Cost(0.0), |l| l.cost);
     let cost = lhs_cost + best_access_method.cost;
@@ -142,23 +146,24 @@ pub fn compute_best_join_order<'a>(
     // We assign Some Cost (tm) to any required sort operation, so the best ordered plan may end up being
     // the one we choose, if the cost reduction from avoiding sorting brings it below the cost of the overall best one.
     let mut best_ordered_plan: Option<JoinN> = None;
-    let mut best_plan_is_also_ordered = if let Some(order_target) = maybe_order_target {
-        plan_satisfies_order_target(
-            &naive_plan,
-            access_methods_arena,
-            joined_tables,
-            order_target,
-        )
-    } else {
-        false
+    let mut best_plan_is_also_ordered = match (naive_plan.as_ref(), maybe_order_target) {
+        (Some(plan), Some(order_target)) => {
+            plan_satisfies_order_target(plan, access_methods_arena, joined_tables, order_target)
+        }
+        _ => false,
     };
 
     // If we have one table, then the "naive left-to-right plan" is always the best.
     if joined_tables.len() == 1 {
-        return Ok(Some(BestJoinOrderResult {
-            best_plan: naive_plan,
-            best_ordered_plan: None,
-        }));
+        return match naive_plan {
+            Some(plan) => Ok(Some(BestJoinOrderResult {
+                best_plan: plan,
+                best_ordered_plan: None,
+            })),
+            None => Err(LimboError::PlanningError(
+                "No valid query plan found".to_string(),
+            )),
+        };
     }
     let mut best_plan = naive_plan;
 
@@ -172,8 +177,7 @@ pub fn compute_best_join_order<'a>(
 
     // Keep track of the current best cost so we can short-circuit planning for subplans
     // that already exceed the cost of the current best plan.
-    let cost_upper_bound = best_plan.cost;
-    let cost_upper_bound_ordered = best_plan.cost;
+    let cost_upper_bound = best_plan.as_ref().map_or(Cost(f64::MAX), |plan| plan.cost);
 
     // Keep track of the best plan for a given subset of tables.
     // Consider this example: we have tables a,b,c,d to join.
@@ -202,7 +206,7 @@ pub fn compute_best_join_order<'a>(
             &join_order,
             maybe_order_target,
             access_methods_arena,
-            cost_upper_bound_ordered,
+            cost_upper_bound,
         )?;
         if let Some(rel) = rel {
             best_plan_memo.insert(mask, rel);
@@ -317,7 +321,7 @@ pub fn compute_best_join_order<'a>(
                     &join_order,
                     maybe_order_target,
                     access_methods_arena,
-                    cost_upper_bound_ordered,
+                    cost_upper_bound,
                 )?;
                 join_order.clear();
 
@@ -358,7 +362,7 @@ pub fn compute_best_join_order<'a>(
             if let Some(rel) = best_ordered_for_mask.take() {
                 let cost = rel.cost;
                 let has_all_tables = mask.table_count() == num_tables;
-                if has_all_tables && cost_upper_bound_ordered > cost {
+                if has_all_tables && cost_upper_bound > cost {
                     best_ordered_plan = Some(rel);
                 }
             }
@@ -368,7 +372,7 @@ pub fn compute_best_join_order<'a>(
                 let has_all_tables = mask.table_count() == num_tables;
                 if has_all_tables {
                     if cost_upper_bound > cost {
-                        best_plan = rel;
+                        best_plan = Some(rel);
                         best_plan_is_also_ordered = best_for_mask_is_also_ordered;
                     }
                 } else {
@@ -378,14 +382,19 @@ pub fn compute_best_join_order<'a>(
         }
     }
 
-    Ok(Some(BestJoinOrderResult {
-        best_plan,
-        best_ordered_plan: if best_plan_is_also_ordered {
-            None
-        } else {
-            best_ordered_plan
-        },
-    }))
+    match best_plan {
+        Some(best_plan) => Ok(Some(BestJoinOrderResult {
+            best_plan,
+            best_ordered_plan: if best_plan_is_also_ordered {
+                None
+            } else {
+                best_ordered_plan
+            },
+        })),
+        None => Err(LimboError::PlanningError(
+            "No valid query plan found".to_string(),
+        )),
+    }
 }
 
 /// Specialized version of [compute_best_join_order] that just joins tables in the order they are given
@@ -396,7 +405,7 @@ pub fn compute_naive_left_deep_plan<'a>(
     maybe_order_target: Option<&OrderTarget>,
     access_methods_arena: &'a RefCell<Vec<AccessMethod<'a>>>,
     constraints: &'a [TableConstraints],
-) -> Result<JoinN> {
+) -> Result<Option<JoinN>> {
     let n = joined_tables.len();
     assert!(n > 0);
 
@@ -419,23 +428,25 @@ pub fn compute_naive_left_deep_plan<'a>(
         maybe_order_target,
         access_methods_arena,
         Cost(f64::MAX),
-    )?
-    .expect("call to join_lhs_and_rhs in compute_naive_left_deep_plan always returns Some(JoinN)");
+    )?;
+    if best_plan.is_none() {
+        return Ok(None);
+    }
 
     // Add remaining tables one at a time from left to right
     for i in 1..n {
         best_plan = join_lhs_and_rhs(
-            Some(&best_plan),
+            best_plan.as_ref(),
             &joined_tables[i],
             &constraints[i],
             &join_order[..=i],
             maybe_order_target,
             access_methods_arena,
             Cost(f64::MAX),
-        )?
-        .expect(
-            "call to join_lhs_and_rhs in compute_naive_left_deep_plan always returns Some(JoinN)",
-        );
+        )?;
+        if best_plan.is_none() {
+            return Ok(None);
+        }
     }
 
     Ok(best_plan)
@@ -490,15 +501,18 @@ fn generate_join_bitmasks(table_number_max_exclusive: usize, how_many: usize) ->
 
 #[cfg(test)]
 mod tests {
-    use std::{cell::Cell, rc::Rc, sync::Arc};
+    use std::{collections::VecDeque, sync::Arc};
 
-    use turso_sqlite3_parser::ast::{self, Expr, Operator, SortOrder, TableInternalId};
+    use turso_parser::ast::{self, Expr, Operator, SortOrder, TableInternalId};
 
     use super::*;
     use crate::{
         schema::{BTreeTable, Column, Index, IndexColumn, Table, Type},
         translate::{
-            optimizer::constraints::{constraints_from_where_clause, BinaryExprSide},
+            optimizer::access_method::AccessMethodParams,
+            optimizer::constraints::{
+                constraints_from_where_clause, BinaryExprSide, ConstraintRef,
+            },
             plan::{
                 ColumnUsedMask, IterationDirection, JoinInfo, Operation, TableReferences, WhereTerm,
             },
@@ -571,8 +585,9 @@ mod tests {
         .unwrap();
         // Should just be a table scan access method
         let access_method = &access_methods_arena.borrow()[best_plan.data[0].1];
-        assert!(access_method.is_scan());
-        assert!(access_method.iter_dir == IterationDirection::Forwards);
+        let (iter_dir, _, constraint_refs) = _as_btree(access_method);
+        assert!(constraint_refs.is_empty());
+        assert!(iter_dir == IterationDirection::Forwards);
     }
 
     #[test]
@@ -612,11 +627,12 @@ mod tests {
         let BestJoinOrderResult { best_plan, .. } = result.unwrap();
         assert_eq!(best_plan.table_numbers().collect::<Vec<_>>(), vec![0]);
         let access_method = &access_methods_arena.borrow()[best_plan.data[0].1];
-        assert!(!access_method.is_scan());
-        assert!(access_method.iter_dir == IterationDirection::Forwards);
-        assert!(access_method.constraint_refs.len() == 1);
+        let (iter_dir, _, constraint_refs) = _as_btree(access_method);
+        assert!(!constraint_refs.is_empty());
+        assert!(iter_dir == IterationDirection::Forwards);
+        assert!(constraint_refs.len() == 1);
         assert!(
-            table_constraints[0].constraints[access_method.constraint_refs[0].constraint_vec_pos]
+            table_constraints[0].constraints[constraint_refs[0].constraint_vec_pos]
                 .where_clause_pos
                 == (0, BinaryExprSide::Rhs)
         );
@@ -648,6 +664,7 @@ mod tests {
         let index = Arc::new(Index {
             name: "sqlite_autoindex_test_table_1".to_string(),
             table_name: "test_table".to_string(),
+            where_clause: None,
             columns: vec![IndexColumn {
                 name: "id".to_string(),
                 order: SortOrder::Asc,
@@ -660,7 +677,7 @@ mod tests {
             root_page: 1,
             has_rowid: true,
         });
-        available_indexes.insert("test_table".to_string(), vec![index]);
+        available_indexes.insert("test_table".to_string(), VecDeque::from([index]));
 
         let table_constraints =
             constraints_from_where_clause(&where_clause, &table_references, &available_indexes)
@@ -678,12 +695,13 @@ mod tests {
         let BestJoinOrderResult { best_plan, .. } = result.unwrap();
         assert_eq!(best_plan.table_numbers().collect::<Vec<_>>(), vec![0]);
         let access_method = &access_methods_arena.borrow()[best_plan.data[0].1];
-        assert!(!access_method.is_scan());
-        assert!(access_method.iter_dir == IterationDirection::Forwards);
-        assert!(access_method.index.as_ref().unwrap().name == "sqlite_autoindex_test_table_1");
-        assert!(access_method.constraint_refs.len() == 1);
+        let (iter_dir, index, constraint_refs) = _as_btree(access_method);
+        assert!(!constraint_refs.is_empty());
+        assert!(iter_dir == IterationDirection::Forwards);
+        assert!(index.as_ref().unwrap().name == "sqlite_autoindex_test_table_1");
+        assert!(constraint_refs.len() == 1);
         assert!(
-            table_constraints[0].constraints[access_method.constraint_refs[0].constraint_vec_pos]
+            table_constraints[0].constraints[constraint_refs[0].constraint_vec_pos]
                 .where_clause_pos
                 == (0, BinaryExprSide::Rhs)
         );
@@ -702,7 +720,7 @@ mod tests {
                 t2.clone(),
                 Some(JoinInfo {
                     outer: false,
-                    using: None,
+                    using: vec![],
                 }),
                 table_id_counter.next(),
             ),
@@ -716,6 +734,7 @@ mod tests {
         let index1 = Arc::new(Index {
             name: "index1".to_string(),
             table_name: "table1".to_string(),
+            where_clause: None,
             columns: vec![IndexColumn {
                 name: "id".to_string(),
                 order: SortOrder::Asc,
@@ -728,7 +747,7 @@ mod tests {
             root_page: 1,
             has_rowid: true,
         });
-        available_indexes.insert("table1".to_string(), vec![index1]);
+        available_indexes.insert("table1".to_string(), VecDeque::from([index1]));
 
         // SELECT * FROM table1 JOIN table2 WHERE table1.id = table2.id
         // expecting table2 to be chosen first due to the index on table1.id
@@ -755,16 +774,17 @@ mod tests {
         let BestJoinOrderResult { best_plan, .. } = result.unwrap();
         assert_eq!(best_plan.table_numbers().collect::<Vec<_>>(), vec![1, 0]);
         let access_method = &access_methods_arena.borrow()[best_plan.data[0].1];
-        assert!(access_method.is_scan());
-        assert!(access_method.iter_dir == IterationDirection::Forwards);
+        let (iter_dir, _, constraint_refs) = _as_btree(access_method);
+        assert!(constraint_refs.is_empty());
+        assert!(iter_dir == IterationDirection::Forwards);
         let access_method = &access_methods_arena.borrow()[best_plan.data[1].1];
-        assert!(!access_method.is_scan());
-        assert!(access_method.iter_dir == IterationDirection::Forwards);
-        assert!(access_method.index.as_ref().unwrap().name == "index1");
-        assert!(access_method.constraint_refs.len() == 1);
+        let (iter_dir, index, constraint_refs) = _as_btree(access_method);
+        assert!(!constraint_refs.is_empty());
+        assert!(iter_dir == IterationDirection::Forwards);
+        assert!(index.as_ref().unwrap().name == "index1");
+        assert!(constraint_refs.len() == 1);
         assert!(
-            table_constraints[TABLE1].constraints
-                [access_method.constraint_refs[0].constraint_vec_pos]
+            table_constraints[TABLE1].constraints[constraint_refs[0].constraint_vec_pos]
                 .where_clause_pos
                 == (0, BinaryExprSide::Rhs)
         );
@@ -805,7 +825,7 @@ mod tests {
                 table_customers.clone(),
                 Some(JoinInfo {
                     outer: false,
-                    using: None,
+                    using: vec![],
                 }),
                 table_id_counter.next(),
             ),
@@ -813,7 +833,7 @@ mod tests {
                 table_order_items.clone(),
                 Some(JoinInfo {
                     outer: false,
-                    using: None,
+                    using: vec![],
                 }),
                 table_id_counter.next(),
             ),
@@ -831,6 +851,7 @@ mod tests {
                 let index_name = format!("sqlite_autoindex_{table_name}_1");
                 let index = Arc::new(Index {
                     name: index_name,
+                    where_clause: None,
                     table_name: table_name.to_string(),
                     columns: vec![IndexColumn {
                         name: "id".to_string(),
@@ -844,11 +865,12 @@ mod tests {
                     root_page: 1,
                     has_rowid: true,
                 });
-                available_indexes.insert(table_name.to_string(), vec![index]);
+                available_indexes.insert(table_name.to_string(), VecDeque::from([index]));
             });
         let customer_id_idx = Arc::new(Index {
             name: "orders_customer_id_idx".to_string(),
             table_name: "orders".to_string(),
+            where_clause: None,
             columns: vec![IndexColumn {
                 name: "customer_id".to_string(),
                 order: SortOrder::Asc,
@@ -864,6 +886,7 @@ mod tests {
         let order_id_idx = Arc::new(Index {
             name: "order_items_order_id_idx".to_string(),
             table_name: "order_items".to_string(),
+            where_clause: None,
             columns: vec![IndexColumn {
                 name: "order_id".to_string(),
                 order: SortOrder::Asc,
@@ -879,10 +902,10 @@ mod tests {
 
         available_indexes
             .entry("orders".to_string())
-            .and_modify(|v| v.push(customer_id_idx));
+            .and_modify(|v| v.push_front(customer_id_idx));
         available_indexes
             .entry("order_items".to_string())
-            .and_modify(|v| v.push(order_id_idx));
+            .and_modify(|v| v.push_front(order_id_idx));
 
         // SELECT * FROM orders JOIN customers JOIN order_items
         // WHERE orders.customer_id = customers.id AND orders.id = order_items.order_id AND customers.id = 42
@@ -933,30 +956,30 @@ mod tests {
         );
 
         let access_method = &access_methods_arena.borrow()[best_plan.data[0].1];
-        assert!(!access_method.is_scan());
-        assert!(access_method.iter_dir == IterationDirection::Forwards);
-        assert!(access_method.index.as_ref().unwrap().name == "sqlite_autoindex_customers_1");
-        assert!(access_method.constraint_refs.len() == 1);
+        let (iter_dir, index, constraint_refs) = _as_btree(access_method);
+        assert!(iter_dir == IterationDirection::Forwards);
+        assert!(index.as_ref().unwrap().name == "sqlite_autoindex_customers_1");
+        assert!(constraint_refs.len() == 1);
         let constraint = &table_constraints[TABLE_NO_CUSTOMERS].constraints
-            [access_method.constraint_refs[0].constraint_vec_pos];
+            [constraint_refs[0].constraint_vec_pos];
         assert!(constraint.lhs_mask.is_empty());
 
         let access_method = &access_methods_arena.borrow()[best_plan.data[1].1];
-        assert!(!access_method.is_scan());
-        assert!(access_method.iter_dir == IterationDirection::Forwards);
-        assert!(access_method.index.as_ref().unwrap().name == "orders_customer_id_idx");
-        assert!(access_method.constraint_refs.len() == 1);
-        let constraint = &table_constraints[TABLE_NO_ORDERS].constraints
-            [access_method.constraint_refs[0].constraint_vec_pos];
+        let (iter_dir, index, constraint_refs) = _as_btree(access_method);
+        assert!(iter_dir == IterationDirection::Forwards);
+        assert!(index.as_ref().unwrap().name == "orders_customer_id_idx");
+        assert!(constraint_refs.len() == 1);
+        let constraint =
+            &table_constraints[TABLE_NO_ORDERS].constraints[constraint_refs[0].constraint_vec_pos];
         assert!(constraint.lhs_mask.contains_table(TABLE_NO_CUSTOMERS));
 
         let access_method = &access_methods_arena.borrow()[best_plan.data[2].1];
-        assert!(!access_method.is_scan());
-        assert!(access_method.iter_dir == IterationDirection::Forwards);
-        assert!(access_method.index.as_ref().unwrap().name == "order_items_order_id_idx");
-        assert!(access_method.constraint_refs.len() == 1);
+        let (iter_dir, index, constraint_refs) = _as_btree(access_method);
+        assert!(iter_dir == IterationDirection::Forwards);
+        assert!(index.as_ref().unwrap().name == "order_items_order_id_idx");
+        assert!(constraint_refs.len() == 1);
         let constraint = &table_constraints[TABLE_NO_ORDER_ITEMS].constraints
-            [access_method.constraint_refs[0].constraint_vec_pos];
+            [constraint_refs[0].constraint_vec_pos];
         assert!(constraint.lhs_mask.contains_table(TABLE_NO_ORDERS));
     }
 
@@ -989,7 +1012,7 @@ mod tests {
                 t2.clone(),
                 Some(JoinInfo {
                     outer: false,
-                    using: None,
+                    using: vec![],
                 }),
                 table_id_counter.next(),
             ),
@@ -997,7 +1020,7 @@ mod tests {
                 t3.clone(),
                 Some(JoinInfo {
                     outer: false,
-                    using: None,
+                    using: vec![],
                 }),
                 table_id_counter.next(),
             ),
@@ -1038,19 +1061,22 @@ mod tests {
         assert_eq!(best_plan.table_numbers().next().unwrap(), 1);
         // Verify table scan is used since there are no indexes
         let access_method = &access_methods_arena.borrow()[best_plan.data[0].1];
-        assert!(access_method.is_scan());
-        assert!(access_method.iter_dir == IterationDirection::Forwards);
-        assert!(access_method.index.is_none());
+        let (iter_dir, index, constraint_refs) = _as_btree(access_method);
+        assert!(constraint_refs.is_empty());
+        assert!(iter_dir == IterationDirection::Forwards);
+        assert!(index.is_none());
         // Verify that t1 is chosen next due to its inequality filter
         let access_method = &access_methods_arena.borrow()[best_plan.data[1].1];
-        assert!(access_method.is_scan());
-        assert!(access_method.iter_dir == IterationDirection::Forwards);
-        assert!(access_method.index.is_none());
+        let (iter_dir, index, constraint_refs) = _as_btree(access_method);
+        assert!(constraint_refs.is_empty());
+        assert!(iter_dir == IterationDirection::Forwards);
+        assert!(index.is_none());
         // Verify that t3 is chosen last due to no filters
         let access_method = &access_methods_arena.borrow()[best_plan.data[2].1];
-        assert!(access_method.is_scan());
-        assert!(access_method.iter_dir == IterationDirection::Forwards);
-        assert!(access_method.index.is_none());
+        let (iter_dir, index, constraint_refs) = _as_btree(access_method);
+        assert!(constraint_refs.is_empty());
+        assert!(iter_dir == IterationDirection::Forwards);
+        assert!(index.is_none());
     }
 
     #[test]
@@ -1092,7 +1118,7 @@ mod tests {
                     t.clone(),
                     Some(JoinInfo {
                         outer: false,
-                        using: None,
+                        using: vec![],
                     }),
                     table_id_counter.next(),
                 )
@@ -1101,7 +1127,7 @@ mod tests {
                 fact_table.clone(),
                 Some(JoinInfo {
                     outer: false,
-                    using: None,
+                    using: vec![],
                 }),
                 table_id_counter.next(),
             ));
@@ -1150,19 +1176,19 @@ mod tests {
 
         // Verify access methods
         let access_method = &access_methods_arena.borrow()[best_plan.data[0].1];
-        assert!(access_method.is_scan());
-        assert!(access_method.iter_dir == IterationDirection::Forwards);
-        assert!(access_method.index.is_none());
-        assert!(access_method.constraint_refs.is_empty());
+        let (iter_dir, index, constraint_refs) = _as_btree(access_method);
+        assert!(iter_dir == IterationDirection::Forwards);
+        assert!(index.is_none());
+        assert!(constraint_refs.is_empty());
 
         for (table_number, access_method_index) in best_plan.data.iter().skip(1) {
             let access_method = &access_methods_arena.borrow()[*access_method_index];
-            assert!(!access_method.is_scan());
-            assert!(access_method.iter_dir == IterationDirection::Forwards);
-            assert!(access_method.index.is_none());
-            assert!(access_method.constraint_refs.len() == 1);
+            let (iter_dir, index, constraint_refs) = _as_btree(access_method);
+            assert!(iter_dir == IterationDirection::Forwards);
+            assert!(index.is_none());
+            assert!(constraint_refs.len() == 1);
             let constraint = &table_constraints[*table_number].constraints
-                [access_method.constraint_refs[0].constraint_vec_pos];
+                [constraint_refs[0].constraint_vec_pos];
             assert!(constraint.lhs_mask.contains_table(FACT_TABLE_IDX));
             assert!(constraint.operator == ast::Operator::Equals);
         }
@@ -1237,10 +1263,10 @@ mod tests {
         // Verify access methods:
         // - First table should use Table scan
         let access_method = &access_methods_arena.borrow()[best_plan.data[0].1];
-        assert!(access_method.is_scan());
-        assert!(access_method.iter_dir == IterationDirection::Forwards);
-        assert!(access_method.index.is_none());
-        assert!(access_method.constraint_refs.is_empty());
+        let (iter_dir, index, constraint_refs) = _as_btree(access_method);
+        assert!(iter_dir == IterationDirection::Forwards);
+        assert!(index.is_none());
+        assert!(constraint_refs.is_empty());
 
         // all of the rest should use rowid equality
         for (i, table_constraints) in table_constraints
@@ -1250,12 +1276,11 @@ mod tests {
             .skip(1)
         {
             let access_method = &access_methods_arena.borrow()[best_plan.data[i].1];
-            assert!(!access_method.is_scan());
-            assert!(access_method.iter_dir == IterationDirection::Forwards);
-            assert!(access_method.index.is_none());
-            assert!(access_method.constraint_refs.len() == 1);
-            let constraint =
-                &table_constraints.constraints[access_method.constraint_refs[0].constraint_vec_pos];
+            let (iter_dir, index, constraint_refs) = _as_btree(access_method);
+            assert!(iter_dir == IterationDirection::Forwards);
+            assert!(index.is_none());
+            assert!(constraint_refs.len() == 1);
+            let constraint = &table_constraints.constraints[constraint_refs[0].constraint_vec_pos];
             assert!(constraint.lhs_mask.contains_table(i - 1));
             assert!(constraint.operator == ast::Operator::Equals);
         }
@@ -1275,6 +1300,7 @@ mod tests {
         let index = Arc::new(Index {
             name: "idx_xy".to_string(),
             table_name: "t1".to_string(),
+            where_clause: None,
             columns: vec![
                 IndexColumn {
                     name: "x".to_string(),
@@ -1298,18 +1324,17 @@ mod tests {
         });
 
         let mut available_indexes = HashMap::new();
-        available_indexes.insert("t1".to_string(), vec![index]);
+        available_indexes.insert("t1".to_string(), VecDeque::from([index]));
 
+        let table = Table::BTree(table);
         joined_tables.push(JoinedTable {
-            table: Table::BTree(table),
+            op: Operation::default_scan_for(&table),
+            table,
             internal_id: table_id_counter.next(),
-            op: Operation::Scan {
-                iter_dir: IterationDirection::Forwards,
-                index: None,
-            },
             identifier: "t1".to_string(),
             join_info: None,
             col_used_mask: ColumnUsedMask::default(),
+            database_id: 0,
         });
 
         // Create where clause that only references second column
@@ -1325,7 +1350,7 @@ mod tests {
                 Box::new(Expr::Literal(ast::Literal::Numeric(5.to_string()))),
             ),
             from_outer_join: None,
-            consumed: Cell::new(false),
+            consumed: false,
         }];
 
         let table_references = TableReferences::new(joined_tables, vec![]);
@@ -1345,7 +1370,8 @@ mod tests {
 
         // Verify access method is a scan, not a seek, because the index can't be used when only the second column is referenced
         let access_method = &access_methods_arena.borrow()[best_plan.data[0].1];
-        assert!(access_method.is_scan());
+        let (_, _, constraint_refs) = _as_btree(access_method);
+        assert!(constraint_refs.is_empty());
     }
 
     #[test]
@@ -1361,6 +1387,7 @@ mod tests {
         let index = Arc::new(Index {
             name: "idx1".to_string(),
             table_name: "t1".to_string(),
+            where_clause: None,
             columns: vec![
                 IndexColumn {
                     name: "c1".to_string(),
@@ -1389,18 +1416,17 @@ mod tests {
             ephemeral: false,
             has_rowid: true,
         });
-        available_indexes.insert("t1".to_string(), vec![index]);
+        available_indexes.insert("t1".to_string(), VecDeque::from([index]));
 
+        let table = Table::BTree(table);
         joined_tables.push(JoinedTable {
-            table: Table::BTree(table),
+            op: Operation::default_scan_for(&table),
+            table,
             internal_id: table_id_counter.next(),
-            op: Operation::Scan {
-                iter_dir: IterationDirection::Forwards,
-                index: None,
-            },
             identifier: "t1".to_string(),
             join_info: None,
             col_used_mask: ColumnUsedMask::default(),
+            database_id: 0,
         });
 
         // Create where clause that references first and third columns
@@ -1417,7 +1443,7 @@ mod tests {
                     Box::new(Expr::Literal(ast::Literal::Numeric(5.to_string()))),
                 ),
                 from_outer_join: None,
-                consumed: Cell::new(false),
+                consumed: false,
             },
             WhereTerm {
                 expr: Expr::Binary(
@@ -1431,7 +1457,7 @@ mod tests {
                     Box::new(Expr::Literal(ast::Literal::Numeric(7.to_string()))),
                 ),
                 from_outer_join: None,
-                consumed: Cell::new(false),
+                consumed: false,
             },
         ];
 
@@ -1452,14 +1478,10 @@ mod tests {
 
         // Verify access method is a seek, and only uses the first column of the index
         let access_method = &access_methods_arena.borrow()[best_plan.data[0].1];
-        assert!(!access_method.is_scan());
-        assert!(access_method
-            .index
-            .as_ref()
-            .is_some_and(|i| i.name == "idx1"));
-        assert!(access_method.constraint_refs.len() == 1);
-        let constraint =
-            &table_constraints[0].constraints[access_method.constraint_refs[0].constraint_vec_pos];
+        let (_, index, constraint_refs) = _as_btree(access_method);
+        assert!(index.as_ref().is_some_and(|i| i.name == "idx1"));
+        assert!(constraint_refs.len() == 1);
+        let constraint = &table_constraints[0].constraints[constraint_refs[0].constraint_vec_pos];
         assert!(constraint.operator == ast::Operator::Equals);
         assert!(constraint.table_col_pos == 0); // c1
     }
@@ -1477,6 +1499,7 @@ mod tests {
         let index = Arc::new(Index {
             name: "idx1".to_string(),
             table_name: "t1".to_string(),
+            where_clause: None,
             columns: vec![
                 IndexColumn {
                     name: "c1".to_string(),
@@ -1505,18 +1528,17 @@ mod tests {
             has_rowid: true,
             unique: false,
         });
-        available_indexes.insert("t1".to_string(), vec![index]);
+        available_indexes.insert("t1".to_string(), VecDeque::from([index]));
 
+        let table = Table::BTree(table);
         joined_tables.push(JoinedTable {
-            table: Table::BTree(table),
+            op: Operation::default_scan_for(&table),
+            table,
             internal_id: table_id_counter.next(),
-            op: Operation::Scan {
-                iter_dir: IterationDirection::Forwards,
-                index: None,
-            },
             identifier: "t1".to_string(),
             join_info: None,
             col_used_mask: ColumnUsedMask::default(),
+            database_id: 0,
         });
 
         // Create where clause: c1 = 5 AND c2 > 10 AND c3 = 7
@@ -1533,7 +1555,7 @@ mod tests {
                     Box::new(Expr::Literal(ast::Literal::Numeric(5.to_string()))),
                 ),
                 from_outer_join: None,
-                consumed: Cell::new(false),
+                consumed: false,
             },
             WhereTerm {
                 expr: Expr::Binary(
@@ -1547,7 +1569,7 @@ mod tests {
                     Box::new(Expr::Literal(ast::Literal::Numeric(10.to_string()))),
                 ),
                 from_outer_join: None,
-                consumed: Cell::new(false),
+                consumed: false,
             },
             WhereTerm {
                 expr: Expr::Binary(
@@ -1561,7 +1583,7 @@ mod tests {
                     Box::new(Expr::Literal(ast::Literal::Numeric(7.to_string()))),
                 ),
                 from_outer_join: None,
-                consumed: Cell::new(false),
+                consumed: false,
             },
         ];
 
@@ -1583,18 +1605,13 @@ mod tests {
         // Verify access method is a seek, and uses the first two columns of the index.
         // The third column can't be used because the second is a range query.
         let access_method = &access_methods_arena.borrow()[best_plan.data[0].1];
-        assert!(!access_method.is_scan());
-        assert!(access_method
-            .index
-            .as_ref()
-            .is_some_and(|i| i.name == "idx1"));
-        assert!(access_method.constraint_refs.len() == 2);
-        let constraint =
-            &table_constraints[0].constraints[access_method.constraint_refs[0].constraint_vec_pos];
+        let (_, index, constraint_refs) = _as_btree(access_method);
+        assert!(index.as_ref().is_some_and(|i| i.name == "idx1"));
+        assert!(constraint_refs.len() == 2);
+        let constraint = &table_constraints[0].constraints[constraint_refs[0].constraint_vec_pos];
         assert!(constraint.operator == ast::Operator::Equals);
         assert!(constraint.table_col_pos == 0); // c1
-        let constraint =
-            &table_constraints[0].constraints[access_method.constraint_refs[1].constraint_vec_pos];
+        let constraint = &table_constraints[0].constraints[constraint_refs[1].constraint_vec_pos];
         assert!(constraint.operator == ast::Operator::Greater);
         assert!(constraint.table_col_pos == 1); // c2
     }
@@ -1637,35 +1654,35 @@ mod tests {
     }
 
     /// Creates a BTreeTable with the given name and columns
-    fn _create_btree_table(name: &str, columns: Vec<Column>) -> Rc<BTreeTable> {
-        Rc::new(BTreeTable {
+    fn _create_btree_table(name: &str, columns: Vec<Column>) -> Arc<BTreeTable> {
+        Arc::new(BTreeTable {
             root_page: 1, // Page number doesn't matter for tests
             name: name.to_string(),
+            has_autoincrement: false,
             primary_key_columns: vec![],
             columns,
             has_rowid: true,
             is_strict: false,
-            unique_sets: None,
+            unique_sets: vec![],
         })
     }
 
     /// Creates a TableReference for a BTreeTable
     fn _create_table_reference(
-        table: Rc<BTreeTable>,
+        table: Arc<BTreeTable>,
         join_info: Option<JoinInfo>,
         internal_id: TableInternalId,
     ) -> JoinedTable {
         let name = table.name.clone();
+        let table = Table::BTree(table);
         JoinedTable {
-            table: Table::BTree(table),
-            op: Operation::Scan {
-                iter_dir: IterationDirection::Forwards,
-                index: None,
-            },
+            op: Operation::default_scan_for(&table),
+            table,
             identifier: name,
             internal_id,
             join_info,
             col_used_mask: ColumnUsedMask::default(),
+            database_id: 0,
         }
     }
 
@@ -1684,12 +1701,25 @@ mod tests {
         WhereTerm {
             expr: Expr::Binary(Box::new(lhs), op, Box::new(rhs)),
             from_outer_join: None,
-            consumed: Cell::new(false),
+            consumed: false,
         }
     }
 
     /// Creates a numeric literal expression
     fn _create_numeric_literal(value: &str) -> Expr {
         Expr::Literal(ast::Literal::Numeric(value.to_string()))
+    }
+
+    fn _as_btree<'a>(
+        access_method: &AccessMethod<'a>,
+    ) -> (IterationDirection, Option<Arc<Index>>, &'a [ConstraintRef]) {
+        match &access_method.params {
+            AccessMethodParams::BTreeTable {
+                iter_dir,
+                index,
+                constraint_refs,
+            } => (*iter_dir, index.clone(), constraint_refs),
+            _ => panic!("expected BTreeTable access method"),
+        }
     }
 }
